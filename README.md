@@ -21,10 +21,10 @@ Oracle Database
 - [Setup](#setup)
     - [Prerequisites — Database Configuration](#prerequisites--database-configuration)
     - [Imports & Connection](#imports--connection)
-- [🟢 Basic — Your First Queries](#-basic--your-first-queries)
-- [🟡 Medium — Filtering, Updating & Chaining](#-medium--filtering-updating--chaining)
-- [🔴 Hard — Aggregation, Transactions & Joins](#-hard--aggregation-transactions--joins)
-- [⚫ Advanced — Window Functions, CTEs, Hierarchies & More](#-advanced--window-functions-ctes-hierarchies--more)
+- [Basic — Your First Queries](#-basic--your-first-queries)
+- [Medium — Filtering, Updating & Chaining](#-medium--filtering-updating--chaining)
+- [Hard — Aggregation, Transactions & Joins](#-hard--aggregation-transactions--joins)
+- [Advanced — Window Functions, CTEs, Hierarchies & More](#-advanced--window-functions-ctes-hierarchies--more)
 - [Operator Reference](#operator-reference)
 
 ---
