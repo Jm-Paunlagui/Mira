@@ -19,6 +19,8 @@ Oracle Database
 ## Table of Contents
 
 - [Setup](#setup)
+    - [Prerequisites — Database Configuration](#prerequisites--database-configuration)
+    - [Imports & Connection](#imports--connection)
 - [🟢 Basic — Your First Queries](#-basic--your-first-queries)
 - [🟡 Medium — Filtering, Updating & Chaining](#-medium--filtering-updating--chaining)
 - [🔴 Hard — Aggregation, Transactions & Joins](#-hard--aggregation-transactions--joins)
@@ -32,6 +34,128 @@ Oracle Database
 ```bash
 npm install oracledb  # peer dependency — should already be in parent project
 ```
+
+### Prerequisites — Database Configuration
+
+Before using `oracle-mongo-wrapper`, you need 3 config files and a `.env` file. These handle connection pooling, credentials, and adapter selection so the wrapper can talk to Oracle.
+
+```
+src/config/
+├── adapters/
+│   └── oracle.js       ← Pool management: creates/reuses connection pools,
+│                          withConnection(), withTransaction(), health monitoring
+├── database.js          ← Connection registry: maps names like "userAccount"
+│                          to { user, password, connectString } credentials
+└── index.js             ← Adapter factory: exports everything from the active
+                           adapter + database.js as one unified import
+```
+
+**How it flows:**
+
+```
+.env  →  database.js (reads credentials)  →  oracle.js (creates pools)  →  config/index.js (exports API)
+                                                                                    ↓
+                                                                           oracle-mongo-wrapper/db.js
+                                                                           createDb("userAccount")
+```
+
+#### Step 1 — Set Up Your `.env` File
+
+Create a `.env` file in your project root with your Oracle database credentials:
+
+```env
+# ── Database connection ──────────────────────────────────────
+NODE_ENV=development
+DB_TYPE=oracle
+
+# Connection details (used by database.js to build connect strings)
+DB_HOST=your-oracle-host.example.com
+DB_PORT=1521
+DB_SERVICE_NAME=ORCL
+
+# "userAccount" connection credentials
+UA_DB_USERNAME=your_username
+UA_DB_PASSWORD=your_password
+
+# Add more connections as needed — just follow the pattern
+# for environment-specific configs, you can do:
+SI_DB_USERNAME=inventory_user
+SI_DB_PASSWORD=inventory_pass
+SI_TEST_DB_USERNAME=test_user
+SI_TEST_DB_PASSWORD=test_pass
+DB_TEST_HOST=test-oracle-host.example.com
+DB_TEST_PORT=1521
+DB_TEST_SID=TESTDB
+
+# ── Oracle Instant Client (optional) ────────────────────────
+# Path to Oracle Instant Client directory. If not set, the system PATH is used.
+ORACLE_INSTANT_CLIENT=C:\oracle\instantclient_23_0
+```
+
+#### Step 2 — Register Connections in `database.js`
+
+Each connection gets a name (like `"userAccount"`) and its credentials from `.env`. You never hardcode passwords here — only `process.env` references.
+
+```js
+// src/config/database.js (already set up — add new connections as needed)
+
+const connections = {
+    // This is called with: createDb("userAccount")
+    userAccount: {
+        user: process.env.UA_DB_USERNAME,
+        password: process.env.UA_DB_PASSWORD,
+        connectString: `${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_SERVICE_NAME}`,
+    },
+
+    // Add more connections as needed:
+    // reportingDb: {
+    //     user:          process.env.RPT_DB_USERNAME,
+    //     password:      process.env.RPT_DB_PASSWORD,
+    //     connectString: `${process.env.RPT_DB_HOST}:${process.env.RPT_DB_PORT}/${process.env.RPT_DB_SERVICE}`,
+    //     poolMax:       10,   // optional — override default pool size
+    // },
+};
+```
+
+> **To add a new connection:** Add env vars to `.env`, add one entry to `connections`, then use `createDb("yourNewName")`. No other file needs to change.
+
+#### Step 3 — The Adapter (`oracle.js`) Handles the Rest
+
+You don't need to edit `oracle.js` — it automatically:
+
+- Creates connection pools on first use (lazy initialization)
+- Retries failed connections up to 3 times with exponential backoff
+- Monitors pool health in the background
+- Releases connections automatically after each operation
+- Handles graceful shutdown
+
+**Key pool defaults** (configurable per-connection in `database.js`):
+
+| Setting          | Default | What it means                          |
+| ---------------- | ------- | -------------------------------------- |
+| `poolMin`        | 10      | Minimum connections kept open          |
+| `poolMax`        | 50      | Maximum connections allowed            |
+| `poolIncrement`  | 5       | How many to add when pool is exhausted |
+| `poolTimeout`    | 30s     | Idle connection timeout                |
+| `connectTimeout` | 15s     | Max wait to establish a connection     |
+| `callTimeout`    | 60s     | Max wait for a query to return         |
+| `stmtCacheSize`  | 50      | Cached prepared statements per conn    |
+
+#### Step 4 — `config/index.js` Ties It Together
+
+This file auto-detects the adapter from `DB_TYPE` env var (defaults to `"oracle"`) and exports everything:
+
+```js
+// src/config/index.js — you usually don't need to edit this
+// It exports: withConnection, withTransaction, withBatchConnection,
+//             closeAll, getPoolStats, isPoolHealthy, getConnectionConfig,
+//             oracledb, and more.
+```
+
+The wrapper's `db.js` imports from this file, so when you call `createDb("userAccount")`, it flows through:
+`createDb() → config/index.js → config/adapters/oracle.js → database.js credentials → Oracle pool`
+
+### Imports & Connection
 
 ```js
 // Import what you need
@@ -1048,5 +1172,3 @@ await employees.merge(
 ```
 
 ## Apache License 2.0 © 2026 John Moises Paunlagui. All rights reserved. See LICENSE.txt for details.
-
-

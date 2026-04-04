@@ -47,25 +47,26 @@ const connections = {
         ),
     },
 
-    unitInventory: isDevelopment
-        ? {
-              user: process.env.UI_TEST_DB_USERNAME,
-              password: process.env.UI_TEST_DB_PASSWORD,
-              connectString: buildTNSConnectString(
-                  process.env.DB_TEST_HOST,
-                  process.env.DB_TEST_PORT,
-                  process.env.DB_TEST_SID,
-              ),
-          }
-        : {
-              user: process.env.UI_DB_USERNAME,
-              password: process.env.UI_DB_PASSWORD,
-              connectString: buildSimpleConnectString(
-                  process.env.DB_HOST,
-                  process.env.DB_PORT,
-                  process.env.DB_SERVICE_NAME,
-              ),
-          },
+    // ── Connection Sample for environment-specific configs ──────────────────────────────────────────
+    // sampleInventory: isDevelopment
+    //     ? {
+    //           user: process.env.SI_TEST_DB_USERNAME,
+    //           password: process.env.SI_TEST_DB_PASSWORD,
+    //           connectString: buildTNSConnectString(
+    //               process.env.DB_TEST_HOST,
+    //               process.env.DB_TEST_PORT,
+    //               process.env.DB_TEST_SID,
+    //           ),
+    //       }
+    //     : {
+    //           user: process.env.SI_DB_USERNAME,
+    //           password: process.env.SI_DB_PASSWORD,
+    //           connectString: buildSimpleConnectString(
+    //               process.env.DB_HOST,
+    //               process.env.DB_PORT,
+    //               process.env.DB_SERVICE_NAME,
+    //           ),
+    //       },
 
     // ── Add new connections below ──────────────────────────────────────────
     // reportingDb: {
