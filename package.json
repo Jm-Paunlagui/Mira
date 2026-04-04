@@ -1,0 +1,33 @@
+{
+  "name": "mira",
+  "version": "1.0.0",
+  "description": "A production-grade OracleDB wrapper that mirrors MongoDB's core API while leveraging the full power of Oracle SQL.",
+  "keywords": [
+    "MongoDB",
+    "Oracle",
+    "Wrapper",
+    "MongoDB-Style",
+    "Query-Builder"
+  ],
+  "homepage": "https://github.com/Jm-Paunlagui/Mira#readme",
+  "bugs": {
+    "url": "https://github.com/Jm-Paunlagui/Mira/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jm-Paunlagui/Mira.git"
+  },
+  "license": "Apache-2.0",
+  "author": "John Moises Paunlagui",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "chai": "^6.2.2",
+    "dotenv": "^17.4.0",
+    "mocha": "^11.7.5",
+    "oracledb": "^6.10.0"
+  }
+}
