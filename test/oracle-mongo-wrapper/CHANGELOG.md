@@ -1,0 +1,64 @@
+# Changelog
+
+## [1.0.0] — 2025-01-01
+
+### Added
+
+- **db.js** — Thin adapter factory (`createDb`) binding named connections from `src/config/database.js`
+- **utils.js** — Shared helpers: `quoteIdentifier`, `convertTypes`, `rowToDoc`, `mergeBinds`, `buildOrderBy`, `buildProjection`
+- **filterParser.js** — MongoDB filter → Oracle WHERE clause translator
+    - Supports: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$between`, `$notBetween`, `$exists`, `$regex`, `$like`, `$any`, `$all`, `$and`, `$or`, `$nor`, `$not`, `$case`, `$coalesce`, `$nullif`
+    - Subquery operators: `$exists` (collection), `$notExists`, `$inSelect`, `$subquery`, `$gtAny`, `$gtAll`, `$ltAny`, `$ltAll`
+- **updateParser.js** — MongoDB update operators → Oracle SET clause translator
+    - Supports: `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename` (throws with guidance)
+- **QueryBuilder.js** — Chainable cursor with lazy SQL execution
+    - Builder: `.sort()`, `.limit()`, `.skip()`, `.project()`, `.forUpdate()`
+    - Terminal: `.toArray()`, `.forEach()`, `.next()`, `.hasNext()`, `.count()`, `.explain()`
+    - Oracle features: AS OF SCN/timestamp flashback, TABLESAMPLE, FOR UPDATE modes
+- **Transaction.js** — Transaction manager with Session class
+    - `withTransaction(fn)` delegates to `db.withTransaction()`
+    - Session: `collection()`, `savepoint()`, `rollbackTo()`, `releaseSavepoint()`
+- **OracleCollection.js** — Core CRUD + all query methods
+    - Read: `find()`, `findOne()`, `findOneAndUpdate()`, `findOneAndDelete()`, `findOneAndReplace()`, `countDocuments()`, `estimatedDocumentCount()`, `distinct()`
+    - Insert: `insertOne()` (with RETURNING), `insertMany()` (executeMany, atomic)
+    - Update: `updateOne()` (with upsert, RETURNING), `updateMany()`, `replaceOne()`, `bulkWrite()`
+    - Delete: `deleteOne()` (with RETURNING), `deleteMany()`, `drop()`
+    - Index: `createIndex()`, `createIndexes()`, `dropIndex()`, `dropIndexes()`, `getIndexes()`, `reIndex()`
+    - Merge: `merge()`, `mergeFrom()`
+    - Advanced: `connectBy()`, `pivot()`, `unpivot()`, `aggregate()`, `insertFromQuery()`, `updateFromJoin()`
+    - Static set ops: `union()`, `intersect()`, `minus()`
+- **aggregatePipeline.js** — MongoDB pipeline → Oracle SQL with CTE chaining
+    - Stages: `$match`, `$group`, `$sort`, `$limit`, `$skip`, `$count`, `$project`, `$addFields`, `$lookup`, `$lateralJoin`, `$out`, `$merge`, `$bucket`, `$facet`, `$replaceRoot`, `$unwind`, `$having`
+    - Advanced grouping: `$rollup`, `$cube`, `$groupingSets`
+    - Expression operators: `$sum`, `$avg`, `$min`, `$max`, `$count`, `$first`, `$last`, `$concat`, `$toUpper`, `$toLower`, `$substr`, `$dateToString`, `$cond`, `$ifNull`, `$size`
+- **windowFunctions.js** — Oracle analytic function builder
+    - Functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, `SUM`, `AVG`, `COUNT`, `MIN`, `MAX`
+    - Frame clause support: `ROWS BETWEEN`, `RANGE BETWEEN`
+- **joinBuilder.js** — `$lookup` → Oracle JOIN clauses
+    - Types: LEFT, RIGHT, FULL, INNER, CROSS, SELF, NATURAL
+    - Multi-condition joins
+- **setOperations.js** — UNION, UNION ALL, INTERSECT, MINUS
+    - `SetResultBuilder` with `.sort()`, `.limit()`, `.skip()`, `.toArray()`
+- **cteBuilder.js** — CTE builders
+    - `withCTE(db, cteDefs)` — regular CTEs from named QueryBuilders
+    - `withRecursiveCTE(db, name, def)` — recursive CTEs for hierarchies
+- **subqueryBuilder.js** — Subquery utilities
+    - Scalar, correlated, EXISTS, NOT EXISTS, IN (SELECT), ANY, ALL
+- **oracleAdvanced.js** — Oracle-specific features
+    - `buildConnectBy()` — hierarchical queries with NOCYCLE, SYS_CONNECT_BY_PATH
+    - `buildPivot()` — PIVOT aggregation
+    - `buildUnpivot()` — UNPIVOT with null handling
+- **performanceUtils.js** — Performance utilities via `createPerformance(db)`
+    - `explainPlan()` — EXPLAIN PLAN + DBMS_XPLAN.DISPLAY
+    - `analyze()` — DBMS_STATS.GATHER_TABLE_STATS
+    - `createMaterializedView()` — with refresh modes
+    - `refreshMaterializedView()` — DBMS_MVIEW.REFRESH
+    - `dropMaterializedView()`
+- **OracleSchema.js** — DDL operations
+    - `createTable()`, `alterTable()`, `dropTable()`, `truncateTable()`, `renameTable()`
+    - `createView()`, `dropView()`, `createSequence()`, `createSchema()`
+- **OracleDCL.js** — DCL operations
+    - `grant()`, `revoke()`
+- **index.js** — Barrel file re-exporting everything
+- **test.js** — End-to-end test suite with 24 sections
+- **README.md** — Usage examples for every category
