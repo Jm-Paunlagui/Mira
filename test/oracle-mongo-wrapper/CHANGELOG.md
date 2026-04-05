@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.0.5] — 2026-04-05
+
+### Security
+
+- **utils.js** — `quoteIdentifier()` now escapes embedded double-quote characters (`"` → `""`) before wrapping, preventing identifier injection (CWE-116). Previously, a malicious identifier containing `"` could break out of the quoted context.
+- **filterParser.js** — `$gtAny`/`$ltAny`/`$gteAny`/`$lteAny` and `$gtAll`/`$ltAll`/`$gteAll`/`$lteAll` operator parsing now uses regex with the global flag (`/Any/g`, `/All/g`, `/\$/g`) instead of `String.replace()` which only replaces the first occurrence (CWE-20, CWE-116).
+
+### Bug Fixes
+
+- **oracle.js** — Removed useless `committed` flag and redundant `if (!committed)` guard in `withTransaction()`. If execution reaches the `catch` block, `conn.commit()` never succeeded, so `rollback()` is always needed.
+- **test.js** — Fixed useless type test: `"plain object" === typeof doc ? "object" : "object"` (both branches identical, `typeof` never returns `"plain object"`) replaced with `expect(doc).to.be.an("object")`.
+- **test.js** — Removed unused first `scn` assignment in AS OF SCN test (value was always overwritten after the wait).
+
+### Code Quality
+
+- Removed 7 unused variables flagged by CodeQL static analysis:
+    - `parseFilter` import in **subqueryBuilder.js**
+    - `rowToDoc` import in **OracleCollection.js** and **QueryBuilder.js**
+    - `joinType` variable in **OracleCollection.js** `updateFromJoin()`
+    - `pathCol` variable in **oracleAdvanced.js** `buildConnectBy()`
+    - `exact` variable in **test.js** `estimatedDocumentCount` test
+    - `orig` variable in **test.js** `replaceOne` test
+
+### CI/CD
+
+- Added CodeQL workflow for automated code scanning on push/PR
+- Added dependency-review workflow for PR dependency auditing
+- Configured Dependabot for npm and GitHub Actions version updates
+- Bumped `actions/checkout` from v4 to v6 (via Dependabot)
+- Added `sample.js` and `test.dev.js` to `.gitignore`
+
+### Tests
+
+- Total: **236 passing**, 3 pending (privilege-dependent DCL only), 0 failing
+
 ## [1.0.4] — 2026-04-05
 
 ### Bug Fixes
