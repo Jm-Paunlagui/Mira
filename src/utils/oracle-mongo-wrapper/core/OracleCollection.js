@@ -397,7 +397,8 @@ class OracleCollection {
     async findOneAndDelete(filter) {
         return this._execute(async (conn) => {
             const { whereClause, binds } = parseFilter(filter);
-            const selectSql = `SELECT * FROM ${quoteIdentifier(this.tableName)} ${whereClause} FETCH FIRST 1 ROW ONLY`;
+            // Include ROWID so we can delete by exact row address
+            const selectSql = `SELECT t0.*, t0.ROWID AS "MIRA_RID_" FROM ${quoteIdentifier(this.tableName)} t0 ${whereClause} FETCH FIRST 1 ROW ONLY`;
 
             const found = await conn.execute(selectSql, binds, {
                 outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
@@ -405,9 +406,12 @@ class OracleCollection {
             const doc = found.rows[0] ?? null;
             if (!doc) return null;
 
-            const deleteSql = `DELETE FROM ${quoteIdentifier(this.tableName)} WHERE ROWID = (SELECT ROWID FROM ${quoteIdentifier(this.tableName)} ${whereClause} AND ROWNUM = 1)`;
+            // Delete by exact ROWID — no subquery needed
+            const rid = doc["MIRA_RID_"];
+            delete doc["MIRA_RID_"];
+            const deleteSql = `DELETE FROM ${quoteIdentifier(this.tableName)} WHERE ROWID = :rid`;
             try {
-                await conn.execute(deleteSql, binds, {
+                await conn.execute(deleteSql, { rid }, {
                     autoCommit: !this._conn,
                 });
             } catch (err) {
