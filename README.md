@@ -178,7 +178,7 @@ That's it. `db` is your gateway to everything.
 
 ---
 
-## 🟢 Basic — Your First Queries
+## Basic — Your First Queries
 
 > Things you'll use every day: creating tables, inserting data, finding rows, simple updates, and deletes.
 
@@ -273,7 +273,7 @@ await users.drop(); // ⚠️ Permanent! Deletes the table and all its data
 
 ---
 
-## 🟡 Medium — Filtering, Updating & Chaining
+## Medium — Filtering, Updating & Chaining
 
 > Comparison operators, chaining find queries, pagination, projections, and advanced update operators.
 
@@ -454,7 +454,7 @@ await users.dropIndex("IDX_users_email");
 
 ---
 
-## 🔴 Hard — Aggregation, Transactions & Joins
+## Hard — Aggregation, Transactions & Joins
 
 > Aggregation pipelines, grouping, joining tables, transactions with savepoints, MERGE/UPSERT, and set operations.
 
