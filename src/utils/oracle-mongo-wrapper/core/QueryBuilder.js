@@ -65,12 +65,7 @@
  * ============================================================================
  */
 
-const {
-    quoteIdentifier,
-    buildOrderBy,
-    buildProjection,
-    rowToDoc,
-} = require("../utils");
+const { quoteIdentifier, buildOrderBy, buildProjection } = require("../utils");
 const { parseFilter } = require("../parsers/filterParser");
 const {
     oracleMongoWrapperMessages: MSG,
