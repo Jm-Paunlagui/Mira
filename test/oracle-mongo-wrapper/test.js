@@ -1930,13 +1930,12 @@ describe("19. Oracle Advanced Features", function () {
         // Get current SCN — requires access to V$DATABASE (DBA privilege)
         let scn;
         try {
-            scn = await db.withConnection(async (conn) => {
-                const r = await conn.execute(
+            await db.withConnection(async (conn) => {
+                await conn.execute(
                     `SELECT CURRENT_SCN FROM V$DATABASE`,
                     {},
                     { outFormat: db.oracledb.OUT_FORMAT_OBJECT },
                 );
-                return r.rows[0].CURRENT_SCN;
             });
         } catch (e) {
             if (
@@ -2248,9 +2247,7 @@ describe("23. utils helpers", function () {
     it("rowToDoc converts an Oracle row to a plain object", function () {
         const row = { ID: "1", NAME: "Juan", AMOUNT: "500.00" };
         const doc = rowToDoc(row);
-        expect(doc).to.be.a(
-            "plain object" === typeof doc ? "object" : "object",
-        );
+        expect(doc).to.be.an("object");
         expect(doc.ID).to.equal(1);
     });
 });
@@ -3145,7 +3142,6 @@ describe("31. Edge Cases, Streaming, and Additional Coverage", function () {
             }
         }
         const est = await users.estimatedDocumentCount();
-        const exact = await users.countDocuments({});
         // Estimated can differ slightly but should be in ballpark
         expect(est).to.be.a("number");
         expect(est).to.be.at.least(0);
@@ -3396,7 +3392,7 @@ describe("31. Edge Cases, Streaming, and Additional Coverage", function () {
             STATUS: "active",
             AGE: 99,
         });
-        const orig = await users.findOne({ NAME: "ReplaceTest" });
+        await users.findOne({ NAME: "ReplaceTest" });
         await users.replaceOne(
             { NAME: "ReplaceTest" },
             {

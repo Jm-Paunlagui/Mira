@@ -39,7 +39,9 @@ const { oracleMongoWrapperMessages: MSG } = require("../../constants/messages");
  *   quoteIdentifier("ORDER")   // → '"ORDER"'   (ORDER is a reserved word)
  */
 function quoteIdentifier(name) {
-    return `"${name}"`;
+    // Escape embedded double-quotes to prevent identifier injection (CWE-116)
+    const sanitized = String(name).replace(/"/g, '""');
+    return `"${sanitized}"`;
 }
 
 // ─── convertTypes ───────────────────────────────────────────────
