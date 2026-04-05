@@ -215,20 +215,107 @@ class OracleCollection {
     async findOneAndUpdate(filter, update, options = {}) {
         return this._execute(async (conn) => {
             const { whereClause, binds: filterBinds } = parseFilter(filter);
-
-            // Find current doc
             const selectSql = `SELECT * FROM ${quoteIdentifier(this.tableName)} ${whereClause} FETCH FIRST 1 ROW ONLY`;
+
+            // Fast path: MERGE-based atomic upsert (saves one round-trip)
+            // Applies when: upsert + returnDocument:"after" + simple equality filter
+            if (options.upsert && options.returnDocument === "after") {
+                const filterEntries = Object.entries(filter);
+                const isSimpleEquality =
+                    filterEntries.length > 0 &&
+                    filterEntries.every(
+                        ([, v]) =>
+                            v !== null &&
+                            v !== undefined &&
+                            typeof v !== "object",
+                    );
+
+                if (isSimpleEquality) {
+                    const { setClause, binds: updateBinds } =
+                        parseUpdate(update);
+                    const mergeBinds = {};
+
+                    // Source row from filter equality values
+                    const srcParts = [];
+                    filterEntries.forEach(([col, val], i) => {
+                        const bname = `src_${i}`;
+                        srcParts.push(`:${bname} AS ${quoteIdentifier(col)}`);
+                        mergeBinds[bname] = val;
+                    });
+
+                    // ON clause: target.col = source.col for each filter key
+                    const onParts = filterEntries.map(
+                        ([col]) =>
+                            `tgt.${quoteIdentifier(col)} = src.${quoteIdentifier(col)}`,
+                    );
+
+                    // WHEN MATCHED: apply update operators
+                    Object.assign(mergeBinds, updateBinds);
+
+                    // WHEN NOT MATCHED: insert filter scalars + $set values
+                    const insertFields = {};
+                    filterEntries.forEach(([k, v]) => {
+                        insertFields[k] = v;
+                    });
+                    if (update.$set) Object.assign(insertFields, update.$set);
+
+                    const filterColSet = new Set(filterEntries.map(([k]) => k));
+                    const insertCols = [];
+                    const insertVals = [];
+                    for (const [col, val] of Object.entries(insertFields)) {
+                        insertCols.push(quoteIdentifier(col));
+                        if (filterColSet.has(col)) {
+                            insertVals.push(`src.${quoteIdentifier(col)}`);
+                        } else {
+                            const bname = `ins_${col}`;
+                            mergeBinds[bname] = val;
+                            insertVals.push(`:${bname}`);
+                        }
+                    }
+
+                    const mergeSql =
+                        `MERGE INTO ${quoteIdentifier(this.tableName)} tgt ` +
+                        `USING (SELECT ${srcParts.join(", ")} FROM DUAL) src ` +
+                        `ON (${onParts.join(" AND ")}) ` +
+                        `WHEN MATCHED THEN UPDATE ${setClause} ` +
+                        `WHEN NOT MATCHED THEN INSERT (${insertCols.join(", ")}) VALUES (${insertVals.join(", ")})`;
+
+                    try {
+                        await conn.execute(mergeSql, mergeBinds, {
+                            autoCommit: !this._conn,
+                        });
+                    } catch (err) {
+                        throw new Error(
+                            MSG.wrapError(
+                                "OracleCollection.findOneAndUpdate",
+                                err,
+                                mergeSql,
+                                mergeBinds,
+                            ),
+                        );
+                    }
+
+                    const afterResult = await conn.execute(
+                        selectSql,
+                        filterBinds,
+                        {
+                            outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                        },
+                    );
+                    return afterResult.rows[0] ?? null;
+                }
+            }
+
+            // Standard path: SELECT first to get the before-document
             const found = await conn.execute(selectSql, filterBinds, {
                 outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
             });
-
             const beforeDoc = found.rows[0] ?? null;
 
             if (!beforeDoc && options.upsert) {
                 // Upsert: insert
                 const fields = {};
                 if (update.$set) Object.assign(fields, update.$set);
-                // Also include filter as fields for the insert
                 for (const [k, v] of Object.entries(filter)) {
                     if (typeof v !== "object") fields[k] = v;
                 }
