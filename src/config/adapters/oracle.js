@@ -379,7 +379,6 @@ async function withConnection(connectionName, callback) {
                 `Timed out getting connection from "${connectionName}"`,
             ),
         ]);
-        await conn.ping();
 
         const result = await callback(conn);
         const elapsed = Date.now() - start;
