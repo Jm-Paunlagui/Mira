@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.0.2] — 2026-04-05
+
+### Performance
+
+- **oracle.js** — Removed redundant `await conn.ping()` from `withConnection()` hot path; pool-level `poolPingInterval: 30` already validates connections
+- **oracle.js** — Set `oracledb.fetchArraySize = 1000` globally (up from default 100), reducing internal driver round-trips for bulk reads; also added to `EXECUTE_OPTIONS` for visibility
+- **OracleCollection.js** — `findOneAndUpdate()` upsert path now uses Oracle MERGE for atomic INSERT-or-UPDATE when `upsert:true`, `returnDocument:"after"`, and simple equality filter, reducing from 3 round-trips to 2 and eliminating TOCTOU race
+- **OracleCollection.js** — `findOneAndDelete()` fetches ROWID in the initial SELECT and uses it directly in the DELETE, eliminating the redundant subquery table scan
+- **aggregatePipeline.js** — Adjacent `$match` stages are coalesced into a single `$match` via `$and` before CTE generation, reducing optimizer overhead for multi-predicate pipelines
+
+## [1.0.1] — 2026-04-05
+
+### Security
+
+- **aggregatePipeline.js** — Replaced raw interpolation with bind variables or `Number()` coercion:
+    - `$limit` / `$skip` values: wrapped with `Number()` to prevent injection
+    - `$count` alias: routed through `quoteIdentifier()` (with `.toUpperCase()` for Oracle convention)
+    - `$facet` facet names: escaped single quotes via `.replace(/'/g, "''")`; quoted identifiers
+    - `$replaceRoot` field reference: routed through `quoteIdentifier()`
+    - `$substr` positional arguments: wrapped with `Number()`
+    - `$dateToString` format string: escaped single quotes; added fallback default
+    - `$group` / `$project` / `$addFields` aggregate aliases: routed through `quoteIdentifier()`
+    - `_buildBucket` boundary and default values: converted from interpolation to bind variables
+    - `_buildAddFieldsCols` literal values: converted from interpolation to bind variables
+- **Transaction.js** — Added `_validateSavepointName()` regex guard (`/^[A-Za-z_][A-Za-z0-9_]*$/`) to `savepoint()` and `rollbackTo()` to prevent SQL injection via savepoint names
+- **cteBuilder.js** — Wrapped `_skipVal` and `_limitVal` in `Number()` in both `CTEResult` and `RecursiveCTEResult` to prevent injection through limit/skip values
+- **OracleSchema.js** — Wrapped all numeric sequence DDL options (`startWith`, `incrementBy`, `maxValue`, `minValue`, `cache`) in `Number()` to prevent injection
+- **filterParser.js** — Added SECURITY WARNING comment on `$inSelect` raw SQL string fallback path documenting the risk and recommending the object form
+
 ## [1.0.0] — 2025-01-01
 
 ### Added
