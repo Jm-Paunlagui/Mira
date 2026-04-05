@@ -289,9 +289,10 @@ function buildAggregateSQL(tableName, pipeline, db) {
             case "$replaceRoot": {
                 // Use the expression as the new root
                 const newRoot = stage.$replaceRoot.newRoot;
-                const fieldName = typeof newRoot === "string" && newRoot.startsWith("$")
-                    ? newRoot.substring(1)
-                    : null;
+                const fieldName =
+                    typeof newRoot === "string" && newRoot.startsWith("$")
+                        ? newRoot.substring(1)
+                        : null;
                 if (fieldName) {
                     ctes.push({
                         alias: stageAlias,
@@ -780,9 +781,10 @@ function _buildBucket(bucket, source, counter) {
         binds[lo] = boundaries[i];
         binds[hi] = boundaries[i + 1];
         const thenBind = counter.next("bkt");
-        binds[thenBind] = numericBoundaries && defaultBucket
-            ? String(boundaries[i])
-            : boundaries[i];
+        binds[thenBind] =
+            numericBoundaries && defaultBucket
+                ? String(boundaries[i])
+                : boundaries[i];
         cases.push(
             `WHEN ${quoteIdentifier(col)} >= :${lo} AND ${quoteIdentifier(col)} < :${hi} THEN :${thenBind}`,
         );
