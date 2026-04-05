@@ -77,7 +77,7 @@
  * ============================================================================
  */
 
-const { quoteIdentifier, mergeBinds, rowToDoc } = require("../utils");
+const { quoteIdentifier, mergeBinds } = require("../utils");
 const { parseFilter } = require("../parsers/filterParser");
 const { parseUpdate } = require("../parsers/updateParser");
 const { QueryBuilder } = require("./QueryBuilder");
@@ -1887,7 +1887,6 @@ class OracleCollection {
     async updateFromJoin(spec) {
         return this._execute(async (conn) => {
             const { target, join: joinSpec, set, where } = spec;
-            const joinType = (joinSpec.type || "inner").toUpperCase();
 
             // Build correlated UPDATE subquery approach (more reliable in Oracle)
             const setParts = [];

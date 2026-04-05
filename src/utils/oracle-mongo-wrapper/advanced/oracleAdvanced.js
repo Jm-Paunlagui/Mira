@@ -73,8 +73,6 @@ function buildConnectBy(tableName, spec) {
     const selectParts = [];
     if (includeLevel) selectParts.push("LEVEL");
     if (includePath) {
-        // Try to find the first field from connectBy keys for SYS_CONNECT_BY_PATH
-        const pathCol = Object.keys(connectBy || {})[0] || "NAME";
         selectParts.push(
             `SYS_CONNECT_BY_PATH(${quoteIdentifier(_getNameColumn(spec))}, '/') AS "PATH"`,
         );

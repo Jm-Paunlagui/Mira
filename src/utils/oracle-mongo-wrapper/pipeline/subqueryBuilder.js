@@ -32,7 +32,6 @@
  */
 
 const { quoteIdentifier } = require("../utils");
-const { parseFilter } = require("../parsers/filterParser");
 
 /**
  * Build a scalar subquery for use in SELECT projections.

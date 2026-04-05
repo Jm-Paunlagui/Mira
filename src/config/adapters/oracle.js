@@ -424,24 +424,17 @@ async function withConnection(connectionName, callback) {
  */
 async function withTransaction(connectionName, callback) {
     return withConnection(connectionName, async (conn) => {
-        let committed = false;
         try {
             const result = await callback(conn);
             await conn.commit();
-            committed = true;
             return result;
         } catch (err) {
-            if (!committed) {
-                try {
-                    await conn.rollback();
-                } catch (e) {
-                    logger.error(
-                        oracleMessages.ROLLBACK_FAILED(
-                            connectionName,
-                            e.message,
-                        ),
-                    );
-                }
+            try {
+                await conn.rollback();
+            } catch (e) {
+                logger.error(
+                    oracleMessages.ROLLBACK_FAILED(connectionName, e.message),
+                );
             }
             throw err;
         }
