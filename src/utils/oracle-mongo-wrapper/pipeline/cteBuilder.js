@@ -185,10 +185,10 @@ class CTEResult {
         }
 
         if (this._skipVal != null) {
-            selectSql += ` OFFSET ${this._skipVal} ROWS`;
+            selectSql += ` OFFSET ${Number(this._skipVal)} ROWS`;
         }
         if (this._limitVal != null) {
-            selectSql += ` FETCH FIRST ${this._limitVal} ROWS ONLY`;
+            selectSql += ` FETCH FIRST ${Number(this._limitVal)} ROWS ONLY`;
         }
 
         const sql = `WITH ${withParts.join(",\n     ")}\n${selectSql}`;
@@ -315,10 +315,10 @@ class RecursiveCTEResult {
             selectSql += ` ORDER BY ${orderBy}`;
         }
         if (this._skipVal != null) {
-            selectSql += ` OFFSET ${this._skipVal} ROWS`;
+            selectSql += ` OFFSET ${Number(this._skipVal)} ROWS`;
         }
         if (this._limitVal != null) {
-            selectSql += ` FETCH FIRST ${this._limitVal} ROWS ONLY`;
+            selectSql += ` FETCH FIRST ${Number(this._limitVal)} ROWS ONLY`;
         }
 
         // Oracle requires a column alias list for recursive CTEs

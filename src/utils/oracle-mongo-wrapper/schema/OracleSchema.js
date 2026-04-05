@@ -371,15 +371,16 @@ class OracleSchema {
             const parts = [`CREATE SEQUENCE ${quoteIdentifier(name)}`];
 
             if (options.startWith != null)
-                parts.push(`START WITH ${options.startWith}`);
+                parts.push(`START WITH ${Number(options.startWith)}`);
             if (options.incrementBy != null)
-                parts.push(`INCREMENT BY ${options.incrementBy}`);
+                parts.push(`INCREMENT BY ${Number(options.incrementBy)}`);
             if (options.maxValue != null)
-                parts.push(`MAXVALUE ${options.maxValue}`);
+                parts.push(`MAXVALUE ${Number(options.maxValue)}`);
             if (options.minValue != null)
-                parts.push(`MINVALUE ${options.minValue}`);
+                parts.push(`MINVALUE ${Number(options.minValue)}`);
             parts.push(options.cycle ? "CYCLE" : "NOCYCLE");
-            if (options.cache != null) parts.push(`CACHE ${options.cache}`);
+            if (options.cache != null)
+                parts.push(`CACHE ${Number(options.cache)}`);
 
             const sql = parts.join(" ");
 

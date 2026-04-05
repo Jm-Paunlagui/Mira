@@ -47,6 +47,18 @@
 const { OracleCollection } = require("./core/OracleCollection");
 
 /**
+ * Validate a savepoint name — must be a safe Oracle identifier.
+ * Only allows letters, digits, and underscores to prevent SQL injection.
+ */
+function _validateSavepointName(name) {
+    if (typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+        throw new Error(
+            `Invalid savepoint name "${name}": must match /^[A-Za-z_][A-Za-z0-9_]*$/`,
+        );
+    }
+}
+
+/**
  * Session — Holds a reference to the raw database connection.
  *
  * You don't create Sessions directly. They are created by Transaction.withTransaction()
@@ -101,6 +113,7 @@ class Session {
      *   await session.rollbackTo("step_1_done"); // undo work after step_1
      */
     async savepoint(name) {
+        _validateSavepointName(name);
         await this._conn.execute(`SAVEPOINT ${name}`);
     }
 
@@ -120,6 +133,7 @@ class Session {
      *   // The order INSERT is kept, but the payment INSERT is undone
      */
     async rollbackTo(name) {
+        _validateSavepointName(name);
         await this._conn.execute(`ROLLBACK TO SAVEPOINT ${name}`);
     }
 

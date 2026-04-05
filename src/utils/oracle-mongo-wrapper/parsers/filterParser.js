@@ -336,6 +336,10 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
                 Object.assign(binds, subBinds);
                 conditions.push(`${qField} IN (${subSql.sql || subSql})`);
             } else {
+                // SECURITY WARNING: Raw SQL string fallback — caller is responsible
+                // for ensuring `val` is safe. This path exists for power-user escape
+                // hatches (e.g. hand-written subqueries). Never pass unsanitized
+                // user input through this path.
                 conditions.push(`${qField} IN (${val})`);
             }
         } else if (

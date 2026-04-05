@@ -411,9 +411,13 @@ class OracleCollection {
             delete doc["MIRA_RID_"];
             const deleteSql = `DELETE FROM ${quoteIdentifier(this.tableName)} WHERE ROWID = :rid`;
             try {
-                await conn.execute(deleteSql, { rid }, {
-                    autoCommit: !this._conn,
-                });
+                await conn.execute(
+                    deleteSql,
+                    { rid },
+                    {
+                        autoCommit: !this._conn,
+                    },
+                );
             } catch (err) {
                 throw new Error(
                     MSG.wrapError(
