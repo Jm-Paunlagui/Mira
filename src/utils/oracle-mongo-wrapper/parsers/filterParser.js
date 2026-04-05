@@ -348,7 +348,7 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
             op === "$gteAny" ||
             op === "$lteAny"
         ) {
-            const cmpOp = op.replace("Any", "").replace("$", "");
+            const cmpOp = op.replace(/Any/g, "").replace(/\$/g, "");
             const cmpMap = { gt: ">", lt: "<", gte: ">=", lte: "<=" };
             const subCollection = quoteIdentifier(val.collection);
             const subField = quoteIdentifier(val.field);
@@ -361,7 +361,7 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
             op === "$gteAll" ||
             op === "$lteAll"
         ) {
-            const cmpOp = op.replace("All", "").replace("$", "");
+            const cmpOp = op.replace(/All/g, "").replace(/\$/g, "");
             const cmpMap = { gt: ">", lt: "<", gte: ">=", lte: "<=" };
             const subCollection = quoteIdentifier(val.collection);
             const subField = quoteIdentifier(val.field);
