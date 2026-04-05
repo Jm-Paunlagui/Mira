@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.0.3] — 2026-04-05
+
+### Tests
+
+- **test.js** — Added 64 new tests across 7 new sections (25–31), covering previously untested APIs:
+  - **Section 25 — SQL Injection & Security**: bind-variable safety for filter/update payloads (`$in`, `$regex`, `$like`, `$set`), UNIQUE constraint violations, NOT NULL constraint violations
+  - **Section 26 — mergeFrom, UNPIVOT, buildAnyAllSubquery**: `mergeFrom()` integration, `unpivot()` integration, `buildAnyAllSubquery()` unit tests for ANY/ALL
+  - **Section 27 — Additional JOINs**: RIGHT OUTER, FULL OUTER, CROSS, NATURAL join types via `$lookup`
+  - **Section 28 — Additional Window Functions**: LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, window AVG, COUNT, MIN, MAX
+  - **Section 29 — Additional Filter Operators**: `$notBetween`, `$case`, `$coalesce`, `$nullif`, `$not`, `$nor`, `$gtAny`, `$ltAll`, `$gteAny`, `$lteAll`, `$inSelect` (array & empty array), nested `$and`/`$or`
+  - **Section 30 — Pipeline Stages & Aggregate Expressions**: `$first`, `$last`, `$concat`, `$toUpper`, `$toLower`, `$substr`, `$cond`, `$ifNull`, `$dateToString`, `$mul`, `$subtract`, `$divide`; `$out`, `$bucket`, `$replaceRoot` marked pending (known CTE/type limitations)
+  - **Section 31 — Edge Cases & Streaming**: `forEach` streaming, `estimatedDocumentCount`, `distinct` (with/without filter), combined `$set`/`$inc`/`$mul`, `$unset`, `$currentDate`, `$rename` error, `skip`/`count`/chained cursor, `findOneAndUpdate`, `findOneAndDelete`, `buildWindowExpr` unit, `buildJoinSQL` unit (all 7 join types), adjacent `$match` merge, `drop()`, `replaceOne`, `updateMany`
+- Total: **233 passing**, 6 pending (3 privilege-dependent DCL + 3 known pipeline limitations)
+
 ## [1.0.2] — 2026-04-05
 
 ### Performance

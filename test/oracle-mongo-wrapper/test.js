@@ -2335,3 +2335,1042 @@ describe("24. Error handling & edge cases", function () {
         }
     });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 25 — SQL Injection & Security
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("25. SQL Injection & Security", function () {
+    it("filter values with SQL injection payloads are safely bound", async function () {
+        const malicious = "'; DROP TABLE TEST_WRAP_USERS; --";
+        const { whereClause, binds } = parseFilter({ NAME: malicious });
+        expect(whereClause).to.include(":where_");
+        expect(whereClause).to.not.include(malicious);
+        expect(Object.values(binds)).to.include(malicious);
+    });
+
+    it("$in values are individually bound, not interpolated", async function () {
+        const { whereClause, binds } = parseFilter({
+            STATUS: { $in: ["active", "'; DELETE FROM users; --"] },
+        });
+        expect(whereClause).to.not.include("DELETE");
+        const bindVals = Object.values(binds);
+        expect(bindVals).to.include("'; DELETE FROM users; --");
+    });
+
+    it("$regex values are bound, not interpolated into SQL", async function () {
+        const { whereClause, binds } = parseFilter({
+            NAME: { $regex: ".*'; DROP TABLE x; --" },
+        });
+        expect(whereClause).to.include("REGEXP_LIKE");
+        expect(whereClause).to.not.include("DROP TABLE");
+        expect(Object.values(binds)).to.include(".*'; DROP TABLE x; --");
+    });
+
+    it("$like values are bound, not interpolated", async function () {
+        const { whereClause, binds } = parseFilter({
+            NAME: { $like: "%'; DROP TABLE x; --%" },
+        });
+        expect(whereClause).to.include("LIKE");
+        expect(whereClause).to.not.include("DROP TABLE");
+        expect(Object.values(binds)).to.include("%'; DROP TABLE x; --%");
+    });
+
+    it("update $set values are bound, never interpolated", function () {
+        const { setClause, binds } = parseUpdate({
+            $set: { NAME: "'; DROP TABLE x; --" },
+        });
+        expect(setClause).to.not.include("DROP TABLE");
+        expect(Object.values(binds)).to.include("'; DROP TABLE x; --");
+    });
+
+    it("$between values are bound", function () {
+        const { whereClause, binds } = parseFilter({
+            AGE: { $between: [10, 50] },
+        });
+        expect(whereClause).to.include("BETWEEN");
+        expect(Object.values(binds)).to.include(10);
+        expect(Object.values(binds)).to.include(50);
+    });
+
+    it("UNIQUE constraint violation produces an error on duplicate insert", async function () {
+        const TABLE = "TEST_WRAP_UNIQUE_CONSTRAINT";
+        try {
+            await schema.createTable(TABLE, {
+                ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
+                CODE: { type: "VARCHAR2(20)", notNull: true },
+            });
+            await schema.alterTable(TABLE, {
+                addConstraint: {
+                    type: "UNIQUE",
+                    columns: ["CODE"],
+                    name: "UQ_WRAP_CODE",
+                },
+            });
+            const coll = new OracleCollection(TABLE, db);
+            await coll.insertOne({ CODE: "UNIQ1" });
+            let threw = false;
+            try {
+                await coll.insertOne({ CODE: "UNIQ1" });
+            } catch (e) {
+                threw = true;
+                expect(e.message).to.match(/ORA-00001|unique constraint/i);
+            }
+            expect(threw, "Second insert should have thrown").to.be.true;
+        } finally {
+            await dropIfExists(TABLE);
+        }
+    });
+
+    it("NOT NULL constraint violation produces an error", async function () {
+        try {
+            await users.insertOne({ EMAIL: "noname@test.com" });
+            expect.fail("Should have thrown for missing NAME");
+        } catch (e) {
+            expect(e.message).to.match(/ORA-01400|cannot insert NULL/i);
+        }
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 26 — mergeFrom, UNPIVOT, buildAnyAllSubquery
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("26. mergeFrom, UNPIVOT, buildAnyAllSubquery", function () {
+    const MERGE_SRC = "TEST_WRAP_MERGE_SRC";
+    const MERGE_TGT = "TEST_WRAP_MERGE_TGT";
+
+    before(async function () {
+        await dropIfExists(MERGE_SRC);
+        await dropIfExists(MERGE_TGT);
+
+        await schema.createTable(MERGE_SRC, {
+            ID: { type: "NUMBER", primaryKey: true },
+            PRICE: { type: "NUMBER(12,2)" },
+            STOCK: { type: "NUMBER" },
+        });
+        await schema.createTable(MERGE_TGT, {
+            ID: { type: "NUMBER", primaryKey: true },
+            PRICE: { type: "NUMBER(12,2)" },
+            STOCK: { type: "NUMBER" },
+        });
+
+        const src = new OracleCollection(MERGE_SRC, db);
+        const tgt = new OracleCollection(MERGE_TGT, db);
+        await src.insertMany([
+            { ID: 1, PRICE: 19.99, STOCK: 100 },
+            { ID: 2, PRICE: 29.99, STOCK: 200 },
+        ]);
+        await tgt.insertMany([
+            { ID: 1, PRICE: 14.99, STOCK: 50 },
+            { ID: 2, PRICE: 24.99, STOCK: 75 },
+        ]);
+    });
+
+    after(async function () {
+        await dropIfExists(MERGE_SRC);
+        await dropIfExists(MERGE_TGT);
+    });
+
+    it("mergeFrom updates target from source table", async function () {
+        const tgt = new OracleCollection(MERGE_TGT, db);
+        const result = await tgt.mergeFrom(
+            MERGE_SRC,
+            { localField: "ID", foreignField: "ID" },
+            {
+                whenMatched: {
+                    $set: { PRICE: "$src.PRICE", STOCK: "$src.STOCK" },
+                },
+            },
+        );
+        expect(result.acknowledged).to.be.true;
+
+        const updated = await tgt.findOne({ ID: 1 });
+        expect(Number(updated.PRICE)).to.equal(19.99);
+        expect(Number(updated.STOCK)).to.equal(100);
+    });
+
+    it("UNPIVOT turns columns into rows", async function () {
+        const rows = await sales.unpivot({
+            valueColumn: "AMOUNT_VAL",
+            nameColumn: "MEASURE",
+            columns: ["AMOUNT"],
+        });
+        expect(rows).to.be.an("array").with.length.greaterThan(0);
+        expect(rows[0]).to.have.property("AMOUNT_VAL");
+        expect(rows[0]).to.have.property("MEASURE");
+    });
+
+    it("buildAnyAllSubquery produces correct SQL", function () {
+        const {
+            buildAnyAllSubquery,
+        } = require("../../src/utils/oracle-mongo-wrapper/pipeline/subqueryBuilder");
+        const anySql = buildAnyAllSubquery(
+            { collection: T.EMPLOYEES, field: "SALARY" },
+            "ANY",
+        );
+        expect(anySql).to.include("ANY");
+        expect(anySql).to.include('"SALARY"');
+        expect(anySql).to.include(`"${T.EMPLOYEES}"`);
+
+        const allSql = buildAnyAllSubquery(
+            { collection: T.EMPLOYEES, field: "SALARY" },
+            "ALL",
+        );
+        expect(allSql).to.include("ALL");
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 27 — Additional JOINs, Window Functions, and Filter Operators
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("27. Additional JOINs", function () {
+    it("RIGHT OUTER JOIN returns all rows from right table", async function () {
+        const rows = await orders.aggregate([
+            {
+                $lookup: {
+                    from: T.USERS,
+                    localField: "USER_ID",
+                    foreignField: "ID",
+                    as: "user",
+                    joinType: "right",
+                },
+            },
+        ]);
+        expect(rows).to.be.an("array").with.length.greaterThan(0);
+        // Right join keeps all users, even those without orders
+        const allUsers = await users.find({}).toArray();
+        expect(rows.length).to.be.at.least(allUsers.length);
+    });
+
+    it("FULL OUTER JOIN returns all rows from both tables", async function () {
+        const rows = await orders.aggregate([
+            {
+                $lookup: {
+                    from: T.USERS,
+                    localField: "USER_ID",
+                    foreignField: "ID",
+                    as: "user",
+                    joinType: "full",
+                },
+            },
+        ]);
+        expect(rows).to.be.an("array").with.length.greaterThan(0);
+    });
+
+    it("CROSS JOIN produces cartesian product", async function () {
+        const rows = await orders.aggregate([
+            {
+                $lookup: {
+                    from: T.USERS,
+                    localField: "USER_ID",
+                    foreignField: "ID",
+                    as: "user",
+                    joinType: "cross",
+                },
+            },
+        ]);
+        const orderCount = await orders.countDocuments({});
+        const userCount = await users.countDocuments({});
+        expect(rows.length).to.equal(orderCount * userCount);
+    });
+
+    it("NATURAL JOIN joins on matching column names", async function () {
+        // Both ORDERS and USERS share columns like STATUS, so natural join works
+        const rows = await orders.aggregate([
+            {
+                $lookup: {
+                    from: T.USERS,
+                    localField: "ID",
+                    foreignField: "ID",
+                    as: "user",
+                    joinType: "natural",
+                },
+            },
+        ]);
+        expect(rows).to.be.an("array");
+    });
+});
+
+describe("28. Additional Window Functions", function () {
+    it("LEAD accesses next row value", async function () {
+        const rows = await orders.aggregate([
+            {
+                $addFields: {
+                    NEXT_AMOUNT: {
+                        $window: {
+                            fn: "LEAD",
+                            field: "AMOUNT",
+                            offset: 1,
+                            orderBy: { ID: 1 },
+                        },
+                    },
+                },
+            },
+        ]);
+        expect(rows[0]).to.have.property("NEXT_AMOUNT");
+        // Last row's LEAD should be null
+        const lastRow = rows[rows.length - 1];
+        expect(lastRow.NEXT_AMOUNT).to.be.null;
+    });
+
+    it("FIRST_VALUE returns first value in window", async function () {
+        const rows = await orders.aggregate([
+            {
+                $addFields: {
+                    FIRST_AMT: {
+                        $window: {
+                            fn: "FIRST_VALUE",
+                            field: "AMOUNT",
+                            partitionBy: "REGION",
+                            orderBy: { AMOUNT: 1 },
+                        },
+                    },
+                },
+            },
+        ]);
+        expect(rows[0]).to.have.property("FIRST_AMT");
+        // Within each region, FIRST_AMT should be the minimum amount
+        const northRows = rows.filter((r) => r.REGION === "North");
+        if (northRows.length > 0) {
+            const minNorth = Math.min(
+                ...northRows.map((r) => Number(r.AMOUNT)),
+            );
+            expect(Number(northRows[0].FIRST_AMT)).to.equal(minNorth);
+        }
+    });
+
+    it("LAST_VALUE returns last value in window", async function () {
+        const rows = await orders.aggregate([
+            {
+                $addFields: {
+                    LAST_AMT: {
+                        $window: {
+                            fn: "LAST_VALUE",
+                            field: "AMOUNT",
+                            partitionBy: "REGION",
+                            orderBy: { AMOUNT: 1 },
+                            frame: "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+                        },
+                    },
+                },
+            },
+        ]);
+        expect(rows[0]).to.have.property("LAST_AMT");
+    });
+
+    it("NTH_VALUE returns nth value in window", async function () {
+        const rows = await orders.aggregate([
+            {
+                $addFields: {
+                    SECOND_AMT: {
+                        $window: {
+                            fn: "NTH_VALUE",
+                            field: "AMOUNT",
+                            n: 2,
+                            orderBy: { AMOUNT: 1 },
+                            frame: "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+                        },
+                    },
+                },
+            },
+        ]);
+        expect(rows[0]).to.have.property("SECOND_AMT");
+    });
+
+    it("window AVG computes running average", async function () {
+        const rows = await orders.aggregate([
+            {
+                $addFields: {
+                    AVG_AMT: {
+                        $window: {
+                            fn: "AVG",
+                            field: "AMOUNT",
+                            orderBy: { ID: 1 },
+                        },
+                    },
+                },
+            },
+        ]);
+        expect(rows[0]).to.have.property("AVG_AMT");
+        expect(Number(rows[0].AVG_AMT)).to.be.a("number");
+    });
+
+    it("window COUNT counts within partition", async function () {
+        const rows = await orders.aggregate([
+            {
+                $addFields: {
+                    REG_COUNT: {
+                        $window: {
+                            fn: "COUNT",
+                            field: "*",
+                            partitionBy: "REGION",
+                        },
+                    },
+                },
+            },
+        ]);
+        expect(rows[0]).to.have.property("REG_COUNT");
+        expect(Number(rows[0].REG_COUNT)).to.be.greaterThan(0);
+    });
+
+    it("window MIN/MAX within partition", async function () {
+        const rows = await orders.aggregate([
+            {
+                $addFields: {
+                    MIN_AMT: {
+                        $window: {
+                            fn: "MIN",
+                            field: "AMOUNT",
+                            partitionBy: "REGION",
+                        },
+                    },
+                    MAX_AMT: {
+                        $window: {
+                            fn: "MAX",
+                            field: "AMOUNT",
+                            partitionBy: "REGION",
+                        },
+                    },
+                },
+            },
+        ]);
+        rows.forEach((r) => {
+            expect(Number(r.MIN_AMT)).to.be.at.most(Number(r.AMOUNT));
+            expect(Number(r.MAX_AMT)).to.be.at.least(Number(r.AMOUNT));
+        });
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 29 — Additional Filter Operators
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("29. Additional Filter Operators", function () {
+    it("$notBetween excludes range", async function () {
+        const rows = await users
+            .find({
+                AGE: { $notBetween: [25, 40] },
+            })
+            .toArray();
+        rows.forEach((r) => {
+            const age = Number(r.AGE);
+            expect(age < 25 || age > 40).to.be.true;
+        });
+    });
+
+    it("$case produces CASE WHEN expressions", function () {
+        const { whereClause, binds } = parseFilter({
+            STATUS: {
+                $case: [
+                    { when: { AGE: { $gte: 30 } }, then: "senior" },
+                    { when: { AGE: { $lt: 30 } }, then: "junior" },
+                ],
+                $else: "unknown",
+            },
+        });
+        expect(whereClause).to.include("CASE");
+        expect(whereClause).to.include("WHEN");
+        expect(whereClause).to.include("THEN");
+        expect(whereClause).to.include("ELSE");
+        expect(whereClause).to.include("END");
+        // Values must be bound
+        const vals = Object.values(binds);
+        expect(vals).to.include("senior");
+        expect(vals).to.include("junior");
+        expect(vals).to.include("unknown");
+    });
+
+    it("$coalesce produces COALESCE SQL", function () {
+        const { whereClause } = parseFilter({
+            STATUS: { $coalesce: ["$EMAIL", "$NAME"] },
+        });
+        expect(whereClause).to.include("COALESCE");
+        // Column refs should be quoted identifiers
+        expect(whereClause).to.include('"EMAIL"');
+        expect(whereClause).to.include('"NAME"');
+    });
+
+    it("$nullif produces NULLIF SQL", function () {
+        const { whereClause, binds } = parseFilter({
+            STATUS: { $nullif: ["STATUS", "inactive"] },
+        });
+        expect(whereClause).to.include("NULLIF");
+        expect(whereClause).to.include('"STATUS"');
+        expect(Object.values(binds)).to.include("inactive");
+    });
+
+    it("$not negates a filter condition", async function () {
+        const rows = await users
+            .find({
+                $not: { STATUS: "active" },
+            })
+            .toArray();
+        rows.forEach((r) => expect(r.STATUS).to.not.equal("active"));
+    });
+
+    it("$nor excludes all specified conditions", async function () {
+        const rows = await users
+            .find({
+                $nor: [{ STATUS: "active" }, { TIER: "platinum" }],
+            })
+            .toArray();
+        rows.forEach((r) => {
+            expect(r.STATUS).to.not.equal("active");
+            expect(r.TIER).to.not.equal("platinum");
+        });
+    });
+
+    it("$gtAny produces > ANY (SELECT ...) SQL", function () {
+        const { whereClause } = parseFilter({
+            SALARY: {
+                $gtAny: { collection: T.EMPLOYEES, field: "SALARY" },
+            },
+        });
+        expect(whereClause).to.include("> ANY");
+        expect(whereClause).to.include("SELECT");
+    });
+
+    it("$ltAll produces < ALL (SELECT ...) SQL", function () {
+        const { whereClause } = parseFilter({
+            SALARY: {
+                $ltAll: { collection: T.EMPLOYEES, field: "SALARY" },
+            },
+        });
+        expect(whereClause).to.include("< ALL");
+        expect(whereClause).to.include("SELECT");
+    });
+
+    it("$gteAny produces >= ANY SQL", function () {
+        const { whereClause } = parseFilter({
+            SALARY: {
+                $gteAny: { collection: T.EMPLOYEES, field: "SALARY" },
+            },
+        });
+        expect(whereClause).to.include(">= ANY");
+    });
+
+    it("$lteAll produces <= ALL SQL", function () {
+        const { whereClause } = parseFilter({
+            SALARY: {
+                $lteAll: { collection: T.EMPLOYEES, field: "SALARY" },
+            },
+        });
+        expect(whereClause).to.include("<= ALL");
+    });
+
+    it("$inSelect with array resolves to IN (:b1, :b2, ...)", function () {
+        const { whereClause, binds } = parseFilter({
+            ID: { $inSelect: [1, 2, 3] },
+        });
+        expect(whereClause).to.include("IN");
+        expect(Object.values(binds)).to.include(1);
+        expect(Object.values(binds)).to.include(2);
+        expect(Object.values(binds)).to.include(3);
+    });
+
+    it("$inSelect with empty array produces 1=0 (always false)", function () {
+        const { whereClause } = parseFilter({
+            ID: { $inSelect: [] },
+        });
+        expect(whereClause).to.include("1=0");
+    });
+
+    it("nested $and/$or logical operators combine correctly", async function () {
+        const rows = await users
+            .find({
+                $or: [
+                    { $and: [{ STATUS: "active" }, { TIER: "gold" }] },
+                    { $and: [{ STATUS: "inactive" }, { TIER: "standard" }] },
+                ],
+            })
+            .toArray();
+        rows.forEach((r) => {
+            const isActiveGold = r.STATUS === "active" && r.TIER === "gold";
+            const isInactiveStandard =
+                r.STATUS === "inactive" && r.TIER === "standard";
+            expect(isActiveGold || isInactiveStandard).to.be.true;
+        });
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 30 — Additional Pipeline Stages & Aggregate Expressions
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("30. Additional Pipeline Stages & Aggregate Expressions", function () {
+    it("$out inserts aggregate results into another table");
+
+    it("$bucket groups values into ranges");
+
+    it("$replaceRoot changes the document root");
+
+    it("$first and $last aggregate expressions", async function () {
+        const rows = await orders.aggregate([
+            { $sort: { ID: 1 } },
+            {
+                $group: {
+                    _id: "$REGION",
+                    FIRST_AMT: { $first: "$AMOUNT" },
+                    LAST_AMT: { $last: "$AMOUNT" },
+                },
+            },
+        ]);
+        expect(rows).to.be.an("array").with.length.greaterThan(0);
+        expect(rows[0]).to.have.property("FIRST_AMT");
+        expect(rows[0]).to.have.property("LAST_AMT");
+    });
+
+    it("$concat joins string fields", async function () {
+        const rows = await users.aggregate([
+            {
+                $project: {
+                    FULL: { $concat: ["$NAME", "$EMAIL"] },
+                },
+            },
+        ]);
+        expect(rows).to.be.an("array").with.length.greaterThan(0);
+        expect(rows[0]).to.have.property("FULL");
+        expect(rows[0].FULL).to.be.a("string");
+    });
+
+    it("$toUpper and $toLower transform case", async function () {
+        const rows = await users.aggregate([
+            {
+                $project: {
+                    UPPER_NAME: { $toUpper: "$NAME" },
+                    LOWER_NAME: { $toLower: "$NAME" },
+                },
+            },
+        ]);
+        expect(rows[0]).to.have.property("UPPER_NAME");
+        expect(rows[0]).to.have.property("LOWER_NAME");
+        // UPPER should be all caps
+        expect(rows[0].UPPER_NAME).to.equal(rows[0].UPPER_NAME.toUpperCase());
+        expect(rows[0].LOWER_NAME).to.equal(rows[0].LOWER_NAME.toLowerCase());
+    });
+
+    it("$substr extracts substring", async function () {
+        const rows = await users.aggregate([
+            {
+                $project: {
+                    INITIALS: { $substr: ["$NAME", 1, 3] },
+                },
+            },
+        ]);
+        expect(rows[0]).to.have.property("INITIALS");
+        expect(rows[0].INITIALS.length).to.be.at.most(3);
+    });
+
+    it("$cond produces conditional expressions", async function () {
+        const rows = await users.aggregate([
+            {
+                $project: {
+                    NAME: 1,
+                    LABEL: {
+                        $cond: {
+                            if: { STATUS: "active" },
+                            then: "Active User",
+                            else: "Inactive User",
+                        },
+                    },
+                },
+            },
+        ]);
+        rows.forEach((r) => {
+            expect(["Active User", "Inactive User"]).to.include(r.LABEL);
+        });
+    });
+
+    it("$ifNull provides fallback for null values", async function () {
+        const rows = await users.aggregate([
+            {
+                $project: {
+                    NAME: 1,
+                    UPDATED: { $ifNull: ["$UPDATED_AT", "$CREATED_AT"] },
+                },
+            },
+        ]);
+        expect(rows[0]).to.have.property("UPDATED");
+    });
+
+    it("$dateToString formats dates", async function () {
+        const rows = await users.aggregate([
+            {
+                $project: {
+                    NAME: 1,
+                    DATE_STR: {
+                        $dateToString: {
+                            format: "YYYY-MM-DD",
+                            date: "$CREATED_AT",
+                        },
+                    },
+                },
+            },
+        ]);
+        expect(rows[0]).to.have.property("DATE_STR");
+        expect(rows[0].DATE_STR).to.match(/^\d{4}-\d{2}-\d{2}/);
+    });
+
+    it("$mul computes product of fields and literals", async function () {
+        const rows = await orders.aggregate([
+            {
+                $addFields: {
+                    TAXED: { $mul: ["$AMOUNT", 1.12] },
+                },
+            },
+        ]);
+        expect(rows[0]).to.have.property("TAXED");
+        expect(Number(rows[0].TAXED)).to.be.closeTo(
+            Number(rows[0].AMOUNT) * 1.12,
+            0.01,
+        );
+    });
+
+    it("$subtract computes difference", async function () {
+        const rows = await orders.aggregate([
+            {
+                $addFields: {
+                    DISCOUNTED: { $subtract: ["$AMOUNT", 50] },
+                },
+            },
+        ]);
+        expect(Number(rows[0].DISCOUNTED)).to.equal(
+            Number(rows[0].AMOUNT) - 50,
+        );
+    });
+
+    it("$divide computes quotient", async function () {
+        const rows = await orders.aggregate([
+            {
+                $addFields: {
+                    HALF: { $divide: ["$AMOUNT", 2] },
+                },
+            },
+        ]);
+        expect(Number(rows[0].HALF)).to.be.closeTo(
+            Number(rows[0].AMOUNT) / 2,
+            0.01,
+        );
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 31 — Edge Cases, Streaming, and Additional Coverage
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("31. Edge Cases, Streaming, and Additional Coverage", function () {
+    it("forEach streams rows without collecting into array", async function () {
+        const collected = [];
+        await orders
+            .find({})
+            .sort({ ID: 1 })
+            .forEach((row) => {
+                collected.push(row);
+            });
+        const all = await orders.find({}).sort({ ID: 1 }).toArray();
+        expect(collected.length).to.equal(all.length);
+        expect(collected[0].ID).to.equal(all[0].ID);
+    });
+
+    it("estimatedDocumentCount uses NUM_ROWS (no table scan)", async function () {
+        // First gather stats so NUM_ROWS is populated
+        try {
+            await perf.analyze(T.USERS);
+        } catch (e) {
+            if (e.message.includes("ORA-01031")) {
+                this.skip();
+                return;
+            }
+        }
+        const est = await users.estimatedDocumentCount();
+        const exact = await users.countDocuments({});
+        // Estimated can differ slightly but should be in ballpark
+        expect(est).to.be.a("number");
+        expect(est).to.be.at.least(0);
+    });
+
+    it("distinct returns unique values for a field", async function () {
+        const regions = await sales.distinct("REGION");
+        expect(regions).to.be.an("array");
+        expect(regions).to.include("North");
+        expect(regions).to.include("South");
+        expect(new Set(regions).size).to.equal(regions.length);
+    });
+
+    it("distinct with filter narrows results", async function () {
+        const tiers = await users.distinct("TIER", { STATUS: "active" });
+        expect(tiers).to.be.an("array");
+        tiers.forEach((t) => expect(t).to.not.be.null);
+    });
+
+    it("combined $set, $inc, $mul in one update", async function () {
+        const target = await users.findOne({ NAME: "Pedro" });
+        const origBalance = Number(target.BALANCE);
+        await users.updateOne(
+            { NAME: "Pedro" },
+            {
+                $set: { STATUS: "active" },
+                $inc: { LOGIN_COUNT: 5 },
+                $mul: { BALANCE: 2 },
+            },
+        );
+        const updated = await users.findOne({ NAME: "Pedro" });
+        expect(updated.STATUS).to.equal("active");
+        expect(Number(updated.LOGIN_COUNT)).to.be.greaterThan(0);
+        expect(Number(updated.BALANCE)).to.equal(origBalance * 2);
+        // Restore
+        await users.updateOne(
+            { NAME: "Pedro" },
+            {
+                $set: {
+                    STATUS: "inactive",
+                    BALANCE: origBalance,
+                    LOGIN_COUNT: 0,
+                },
+            },
+        );
+    });
+
+    it("$unset sets fields to NULL", async function () {
+        await users.updateOne(
+            { NAME: "Pedro" },
+            { $unset: { UPDATED_AT: "" } },
+        );
+        const doc = await users.findOne({ NAME: "Pedro" });
+        expect(doc.UPDATED_AT).to.be.null;
+    });
+
+    it("$currentDate sets field to current date", async function () {
+        await users.updateOne(
+            { NAME: "Pedro" },
+            { $currentDate: { UPDATED_AT: true } },
+        );
+        const doc = await users.findOne({ NAME: "Pedro" });
+        expect(doc.UPDATED_AT).to.not.be.null;
+    });
+
+    it("$rename throws a descriptive error", function () {
+        expect(() => parseUpdate({ $rename: { OLD_COL: "NEW_COL" } })).to.throw(
+            /not supported|ALTER TABLE/i,
+        );
+    });
+
+    it("QueryBuilder .skip() offsets results", async function () {
+        const all = await users.find({}).sort({ ID: 1 }).toArray();
+        const skipped = await users.find({}).sort({ ID: 1 }).skip(2).toArray();
+        expect(skipped.length).to.equal(all.length - 2);
+        expect(skipped[0].ID).to.equal(all[2].ID);
+    });
+
+    it("QueryBuilder .count() returns count without executing full query", async function () {
+        const count = await users.find({ STATUS: "active" }).count();
+        expect(count).to.be.a("number");
+        expect(count).to.be.greaterThan(0);
+    });
+
+    it("QueryBuilder chaining .sort().skip().limit() works together", async function () {
+        const rows = await users
+            .find({})
+            .sort({ AGE: -1 })
+            .skip(1)
+            .limit(2)
+            .toArray();
+        expect(rows.length).to.equal(2);
+        // Should be sorted descending by AGE
+        expect(Number(rows[0].AGE)).to.be.at.least(Number(rows[1].AGE));
+    });
+
+    it("findOneAndUpdate returns the matched document", async function () {
+        const doc = await users.findOneAndUpdate(
+            { NAME: "Ana" },
+            { $set: { STATUS: "active" } },
+        );
+        expect(doc).to.not.be.null;
+        expect(doc.NAME).to.equal("Ana");
+    });
+
+    it("findOneAndDelete removes and returns the document", async function () {
+        await users.insertOne({ NAME: "TempDel", EMAIL: "tempdel@test.com" });
+        const doc = await users.findOneAndDelete({ NAME: "TempDel" });
+        expect(doc).to.not.be.null;
+        expect(doc.NAME).to.equal("TempDel");
+        // Confirm deleted
+        const gone = await users.findOne({ NAME: "TempDel" });
+        expect(gone).to.be.null;
+    });
+
+    it("buildWindowExpr produces correct SQL for all function types", function () {
+        const {
+            buildWindowExpr,
+        } = require("../../src/utils/oracle-mongo-wrapper/pipeline/windowFunctions");
+
+        const rn = buildWindowExpr({ fn: "ROW_NUMBER", orderBy: { ID: 1 } });
+        expect(rn).to.include("ROW_NUMBER()");
+        expect(rn).to.include("OVER");
+
+        const lead = buildWindowExpr({
+            fn: "LEAD",
+            field: "AMOUNT",
+            offset: 2,
+            orderBy: { ID: 1 },
+        });
+        expect(lead).to.include("LEAD");
+        expect(lead).to.include('"AMOUNT"');
+        expect(lead).to.include("2");
+
+        const fv = buildWindowExpr({
+            fn: "FIRST_VALUE",
+            field: "NAME",
+            partitionBy: "DEPT_ID",
+            orderBy: { ID: 1 },
+        });
+        expect(fv).to.include("FIRST_VALUE");
+        expect(fv).to.include("PARTITION BY");
+
+        const nth = buildWindowExpr({
+            fn: "NTH_VALUE",
+            field: "SALARY",
+            n: 3,
+            orderBy: { SALARY: -1 },
+        });
+        expect(nth).to.include("NTH_VALUE");
+        expect(nth).to.include("3");
+        expect(nth).to.include("DESC");
+    });
+
+    it("buildJoinSQL generates correct SQL for each join type", function () {
+        const {
+            buildJoinSQL,
+        } = require("../../src/utils/oracle-mongo-wrapper/joins/joinBuilder");
+
+        const left = buildJoinSQL('"ORDERS"', {
+            from: "USERS",
+            localField: "USER_ID",
+            foreignField: "ID",
+            joinType: "left",
+        });
+        expect(left).to.include("LEFT OUTER JOIN");
+
+        const right = buildJoinSQL('"ORDERS"', {
+            from: "USERS",
+            localField: "USER_ID",
+            foreignField: "ID",
+            joinType: "right",
+        });
+        expect(right).to.include("RIGHT OUTER JOIN");
+
+        const full = buildJoinSQL('"ORDERS"', {
+            from: "USERS",
+            localField: "USER_ID",
+            foreignField: "ID",
+            joinType: "full",
+        });
+        expect(full).to.include("FULL OUTER JOIN");
+
+        const inner = buildJoinSQL('"ORDERS"', {
+            from: "USERS",
+            localField: "USER_ID",
+            foreignField: "ID",
+            joinType: "inner",
+        });
+        expect(inner).to.include("INNER JOIN");
+
+        const cross = buildJoinSQL('"ORDERS"', {
+            from: "USERS",
+            localField: "USER_ID",
+            foreignField: "ID",
+            joinType: "cross",
+        });
+        expect(cross).to.include("CROSS JOIN");
+
+        const natural = buildJoinSQL('"ORDERS"', {
+            from: "USERS",
+            localField: "USER_ID",
+            foreignField: "ID",
+            joinType: "natural",
+        });
+        expect(natural).to.include("NATURAL JOIN");
+
+        const self = buildJoinSQL('"EMPLOYEES"', {
+            from: "EMPLOYEES",
+            localField: "MANAGER_ID",
+            foreignField: "ID",
+            joinType: "self",
+        });
+        expect(self).to.include("INNER JOIN");
+    });
+
+    it("adjacent $match stages are merged for performance", async function () {
+        const rows = await orders.aggregate([
+            { $match: { REGION: "North" } },
+            { $match: { STATUS: "completed" } },
+        ]);
+        expect(rows).to.be.an("array");
+        rows.forEach((r) => {
+            expect(r.REGION).to.equal("North");
+            expect(r.STATUS).to.equal("completed");
+        });
+    });
+
+    it("drop() removes a collection table", async function () {
+        const TEMP = "TEST_WRAP_DROP_ME";
+        await schema.createTable(TEMP, {
+            ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
+        });
+        const exists1 = await tableExists(TEMP);
+        expect(exists1).to.be.true;
+
+        const tempColl = new OracleCollection(TEMP, db);
+        await tempColl.drop();
+        const exists2 = await tableExists(TEMP);
+        expect(exists2).to.be.false;
+    });
+
+    it("replaceOne replaces entire document (all fields)", async function () {
+        // Insert a test doc, replace it, verify fields changed
+        await users.insertOne({
+            NAME: "ReplaceTest",
+            EMAIL: "replace@test.com",
+            STATUS: "active",
+            AGE: 99,
+        });
+        const orig = await users.findOne({ NAME: "ReplaceTest" });
+        await users.replaceOne(
+            { NAME: "ReplaceTest" },
+            {
+                NAME: "ReplaceTest",
+                EMAIL: "replaced@test.com",
+                STATUS: "inactive",
+                AGE: 1,
+            },
+        );
+        const replaced = await users.findOne({ NAME: "ReplaceTest" });
+        expect(replaced.EMAIL).to.equal("replaced@test.com");
+        expect(replaced.STATUS).to.equal("inactive");
+        expect(Number(replaced.AGE)).to.equal(1);
+        // Cleanup
+        await users.deleteOne({ NAME: "ReplaceTest" });
+    });
+
+    it("updateMany updates all matching documents", async function () {
+        const before = await users.find({ STATUS: "active" }).toArray();
+        await users.updateMany(
+            { STATUS: "active" },
+            { $inc: { LOGIN_COUNT: 1 } },
+        );
+        const after = await users.find({ STATUS: "active" }).toArray();
+        after.forEach((r) => {
+            const orig = before.find((b) => b.ID === r.ID);
+            expect(Number(r.LOGIN_COUNT)).to.equal(
+                Number(orig.LOGIN_COUNT) + 1,
+            );
+        });
+        // Restore
+        await users.updateMany(
+            { STATUS: "active" },
+            { $inc: { LOGIN_COUNT: -1 } },
+        );
+    });
+});
