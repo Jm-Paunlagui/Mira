@@ -250,6 +250,7 @@ before(async function () {
 after(async function () {
     this.timeout(30_000);
     for (const t of Object.values(T)) await dropIfExists(t);
+    await dropIfExists("TEST_WRAP_AGG_OUT");
     await db.closePool();
 });
 
@@ -2900,11 +2901,70 @@ describe("29. Additional Filter Operators", function () {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe("30. Additional Pipeline Stages & Aggregate Expressions", function () {
-    it("$out inserts aggregate results into another table");
+    const OUT_TABLE = "TEST_WRAP_AGG_OUT";
 
-    it("$bucket groups values into ranges");
+    afterEach(async function () {
+        // Clean up $out target table if it was created
+        try {
+            await db.withConnection(async (conn) => {
+                await conn.execute(`DROP TABLE "${OUT_TABLE}" PURGE`);
+            });
+        } catch (_) {
+            /* table may not exist */
+        }
+    });
 
-    it("$replaceRoot changes the document root");
+    it("$out inserts aggregate results into another table", async function () {
+        // Create target table matching the $group output shape
+        await schema.createTable(OUT_TABLE, {
+            REGION: { type: "VARCHAR2(50)" },
+            TOTAL: { type: "NUMBER(12,2)" },
+        });
+
+        await sales.aggregate([
+            {
+                $group: {
+                    _id: "$REGION",
+                    TOTAL: { $sum: "$AMOUNT" },
+                },
+            },
+            { $out: OUT_TABLE },
+        ]);
+
+        // Verify rows were inserted
+        const outCol = new OracleCollection(OUT_TABLE, db);
+        const rows = await outCol.find().toArray();
+        expect(rows).to.be.an("array").with.length.greaterThan(0);
+        expect(rows[0]).to.have.property("TOTAL");
+    });
+
+    it("$bucket groups values into ranges", async function () {
+        const rows = await sales.aggregate([
+            {
+                $bucket: {
+                    groupBy: "$AMOUNT",
+                    boundaries: [0, 10000, 15000, 20000],
+                    default: "Other",
+                    output: { COUNT: { $sum: 1 } },
+                },
+            },
+        ]);
+        expect(rows).to.be.an("array").with.length.greaterThan(0);
+        expect(rows[0]).to.have.property("BUCKET");
+        expect(rows[0]).to.have.property("COUNT");
+    });
+
+    it("$replaceRoot changes the document root", async function () {
+        // Using "$" as newRoot should pass through all columns
+        const rows = await users.aggregate([
+            { $match: { STATUS: "active" } },
+            { $replaceRoot: { newRoot: "$" } },
+        ]);
+        expect(rows).to.be.an("array").with.length.greaterThan(0);
+        // All original columns should be present
+        expect(rows[0]).to.have.property("NAME");
+        expect(rows[0]).to.have.property("EMAIL");
+    });
 
     it("$first and $last aggregate expressions", async function () {
         const rows = await orders.aggregate([

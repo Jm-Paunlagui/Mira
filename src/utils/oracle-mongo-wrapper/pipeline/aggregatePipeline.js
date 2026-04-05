@@ -109,6 +109,7 @@ function buildAggregateSQL(tableName, pipeline, db) {
     const allBinds = {};
     let prevSource = quoteIdentifier(tableName);
     let stageIdx = 0;
+    let outTable = null;
 
     // Pre-scan for $having — attach to preceding $group
     for (let i = 0; i < pipeline.length; i++) {
@@ -240,10 +241,9 @@ function buildAggregateSQL(tableName, pipeline, db) {
             }
 
             case "$out": {
-                ctes.push({
-                    alias: stageAlias,
-                    sql: `INSERT INTO ${quoteIdentifier(stage.$out)} SELECT * FROM ${prevSource}`,
-                });
+                // Don't push a CTE — store the target table.
+                // INSERT INTO is prepended to the final assembled SQL.
+                outTable = stage.$out;
                 break;
             }
 
@@ -289,10 +289,13 @@ function buildAggregateSQL(tableName, pipeline, db) {
             case "$replaceRoot": {
                 // Use the expression as the new root
                 const newRoot = stage.$replaceRoot.newRoot;
-                if (typeof newRoot === "string" && newRoot.startsWith("$")) {
+                const fieldName = typeof newRoot === "string" && newRoot.startsWith("$")
+                    ? newRoot.substring(1)
+                    : null;
+                if (fieldName) {
                     ctes.push({
                         alias: stageAlias,
-                        sql: `SELECT ${quoteIdentifier(newRoot.substring(1))}.* FROM ${prevSource}`,
+                        sql: `SELECT ${quoteIdentifier(fieldName)}.* FROM ${prevSource}`,
                     });
                 } else {
                     ctes.push({
@@ -331,7 +334,11 @@ function buildAggregateSQL(tableName, pipeline, db) {
     }
 
     if (ctes.length === 1) {
-        return { sql: ctes[0].sql, binds: allBinds };
+        let sql = ctes[0].sql;
+        if (outTable) {
+            sql = `INSERT INTO ${quoteIdentifier(outTable)} ${sql}`;
+        }
+        return { sql, binds: allBinds };
     }
 
     // Build WITH ... AS chain
@@ -340,7 +347,10 @@ function buildAggregateSQL(tableName, pipeline, db) {
         .map((c) => `${quoteIdentifier(c.alias)} AS (${c.sql})`);
     const lastCte = ctes[ctes.length - 1];
 
-    const sql = `WITH ${withParts.join(",\n     ")}\n${lastCte.sql}`;
+    let sql = `WITH ${withParts.join(",\n     ")}\n${lastCte.sql}`;
+    if (outTable) {
+        sql = `INSERT INTO ${quoteIdentifier(outTable)} ${sql}`;
+    }
     return { sql, binds: allBinds };
 }
 
@@ -760,20 +770,26 @@ function _buildBucket(bucket, source, counter) {
     const col = groupBy.startsWith("$") ? groupBy.substring(1) : groupBy;
     const cases = [];
 
+    // Determine if boundaries are numeric — if so, use TO_CHAR for THEN labels
+    // so that the default bucket string doesn't cause ORA-00932 (inconsistent datatypes).
+    const numericBoundaries = boundaries.every((b) => typeof b === "number");
+
     for (let i = 0; i < boundaries.length - 1; i++) {
         const lo = counter.next("bkt");
         const hi = counter.next("bkt");
         binds[lo] = boundaries[i];
         binds[hi] = boundaries[i + 1];
         const thenBind = counter.next("bkt");
-        binds[thenBind] = boundaries[i];
+        binds[thenBind] = numericBoundaries && defaultBucket
+            ? String(boundaries[i])
+            : boundaries[i];
         cases.push(
             `WHEN ${quoteIdentifier(col)} >= :${lo} AND ${quoteIdentifier(col)} < :${hi} THEN :${thenBind}`,
         );
     }
     if (defaultBucket) {
         const defBind = counter.next("bkt");
-        binds[defBind] = defaultBucket;
+        binds[defBind] = String(defaultBucket);
         cases.push(`ELSE :${defBind}`);
     }
 
