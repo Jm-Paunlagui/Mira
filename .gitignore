@@ -28,3 +28,6 @@ responses/
 # Ignore dev/scratch test files
 test/oracle-mongo-wrapper/sample.js
 test/oracle-mongo-wrapper/test.dev.js
+
+# Ignore AI instruction files
+CLAUDE.md
