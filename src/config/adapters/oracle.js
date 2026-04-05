@@ -141,6 +141,8 @@ try {
     throw err;
 }
 
+oracledb.fetchArraySize = 1000; // Reduce internal round-trips for bulk reads (default: 100)
+
 const OUT_FORMAT_OBJECT = oracledb.OUT_FORMAT_OBJECT;
 const SYSDBA_PRIVILEGE = oracledb.SYSDBA_PRIVILEGE;
 
@@ -166,6 +168,7 @@ const POOL_DEFAULTS = {
 const EXECUTE_OPTIONS = Object.freeze({
     outFormat: OUT_FORMAT_OBJECT,
     autoCommit: true,
+    fetchArraySize: 1000,
 });
 
 const poolRegistry = new Map(); // name → Promise<Pool>
