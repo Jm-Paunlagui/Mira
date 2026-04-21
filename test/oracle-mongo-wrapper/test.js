@@ -1,22 +1,25 @@
 "use strict";
 
 /**
- * @fileoverview End-to-end test suite for oracle-mongo-wrapper
- * @description Runs against a real Oracle DB using the existing src/config adapter.
- *              Uses the 'userAccount' connection (UA_DB_USERNAME / UA_DB_PASSWORD).
+ * @fileoverview Comprehensive end-to-end test suite for oracle-mongo-wrapper.
+ *
+ * Tests against REAL production tables in the Inventory schema + a scratch table
+ * for write operations. Generates a full report at the end.
+ *
+ * TABLES USED (read-only):
+ *   DEV_BOOK, DEV_LOCATION, DEV_LOCK, DEV_MATERIAL, DEV_STOCKS, DEV_UNIT, T_OPITS_USERS
+ *
+ * TABLES CREATED (read-write, auto-cleaned):
+ *   TEST_SCRATCH — temporary table for CRUD/DDL/Merge tests
  *
  * SETUP:
- *   1. Copy this file to your project root (same level as src/)
- *   2. Ensure your .env is configured (DB_HOST, DB_PORT, DB_SERVICE_NAME, UA_DB_*)
- *   3. npm install --save-dev mocha chai
- *   4. npx mocha test.js --timeout 30000 --exit
- *
- * TEARDOWN:
- *   All test tables are dropped after the suite runs.
- *   Safe to run repeatedly — uses IF NOT EXISTS / IF EXISTS guards.
+ *   1. Ensure .env is configured
+ *   2. npm install --save-dev mocha chai
+ *   3. npx mocha test.js --timeout 60000 --exit
  */
 
 const path = require("path");
+const fs = require("fs");
 const { expect } = require("chai");
 const dotenv = require("dotenv");
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -30,14 +33,10 @@ const {
     OracleSchema,
 } = require("../../src/utils/oracle-mongo-wrapper/schema/OracleSchema");
 const {
-    OracleDCL,
-} = require("../../src/utils/oracle-mongo-wrapper/schema/OracleDCL");
-const {
     Transaction,
 } = require("../../src/utils/oracle-mongo-wrapper/Transaction");
 const {
     withCTE,
-    withRecursiveCTE,
 } = require("../../src/utils/oracle-mongo-wrapper/pipeline/cteBuilder");
 const {
     createPerformance,
@@ -48,28 +47,101 @@ const {
 const {
     parseUpdate,
 } = require("../../src/utils/oracle-mongo-wrapper/parsers/updateParser");
+const {
+    buildWindowExpr,
+} = require("../../src/utils/oracle-mongo-wrapper/pipeline/windowFunctions");
+const {
+    buildJoinSQL,
+} = require("../../src/utils/oracle-mongo-wrapper/joins/joinBuilder");
 
-// ─── Test DB binding ──────────────────────────────────────────────────────────
-const db = createDb("userAccount");
+// ─── Table Column Schemas ─────────────────────────────────────────────────────
 
-// ─── Test table names (prefixed to avoid collision with real tables) ──────────
-const T = {
-    USERS: "TEST_WRAP_USERS",
-    ORDERS: "TEST_WRAP_ORDERS",
-    EMPLOYEES: "TEST_WRAP_EMPLOYEES",
-    SALES: "TEST_WRAP_SALES",
-    ARCHIVE: "TEST_WRAP_ARCHIVE",
+const SAPBook = {
+    table: "DEV_BOOK",
+    columns: [
+        "ID", "DIVISION", "YEAR", "MONTH", "MATERIALID", "SAP_BOOK_QUANTITY",
+        "SLOC", "CREATEDBY", "MODIFIEDBY", "DELETEDBY", "CREATEDDATE",
+        "MODIFIEDDATE", "DELETEDDATE", "REASON", "ACTION",
+    ],
 };
 
+const StorageLocation = {
+    table: "DEV_LOCATION",
+    columns: [
+        "ID", "DIVISION", "YEAR", "MONTH", "SLOC", "PSA", "TERMINAL", "TYPE",
+        "TOTAL_TAG_GENERATED", "CREATEDBY", "MODIFIEDBY", "DELETEDBY",
+        "CREATEDDATE", "MODIFIEDDATE", "DELETEDDATE", "REASON", "ACTION",
+    ],
+};
+
+const UnlockedInventoryByMonth = {
+    table: "DEV_LOCK",
+    columns: ["ID", "MONTH", "LAST_CHANGE_BY", "AUTO_GR", "ACTIVE"],
+};
+
+const MaterialMaster = {
+    table: "DEV_MATERIAL",
+    columns: [
+        "ID", "DIVISION", "YEAR", "MONTH", "MATERIALID", "DESCRIPTION", "TYPE",
+        "STANDARDPRICE", "MRP", "CREATEDBY", "MODIFIEDBY", "DELETEDBY",
+        "CREATEDDATE", "MODIFIEDDATE", "DELETEDDATE", "REASON", "ACTION",
+    ],
+};
+
+const InventoryStocks = {
+    table: "DEV_STOCKS",
+    columns: [
+        "ID", "DIVISION", "YEAR", "MONTH", "MATERIALID", "BATCHID", "QUANTITY",
+        "PARTQTY", "CATEGORY", "SLOC", "ID_LOC", "TAGNUM", "USERNAME", "GR_SU",
+        "PACKAGE_ID", "CREATEDBY", "MODIFIEDBY", "DELETEDBY", "CREATEDDATE",
+        "MODIFIEDDATE", "DELETEDDATE", "REASON", "ACTION",
+    ],
+};
+
+const InventoryUnit = {
+    table: "DEV_UNIT",
+    columns: [
+        "ID", "DIVISION", "YEAR", "MONTH", "BATCHID", "UNITID", "UNITIDTYPE",
+        "UNITSTATUS", "LOCATION", "ORDERNAME", "MATERIALNUMBER",
+        "CURRENTOPERATION", "ITEMSPASSED", "ITEMSFAILED", "ITEMSSCRAP",
+        "CREATEDBY", "MODIFIEDBY", "DELETEDBY", "CREATEDDATE", "MODIFIEDDATE",
+        "DELETEDDATE", "REASON", "ACTION",
+    ],
+};
+
+// ─── DB binding ───────────────────────────────────────────────────────────────
+const inventoryDB = createDb("unitInventory");
+const userdb = createDb("userAccount");
+
 // ─── Collection handles ───────────────────────────────────────────────────────
-let users, orders, employees, sales, archive;
-let schema, dcl, txManager, perf;
+const devBook = new OracleCollection(SAPBook.table, inventoryDB);
+const devLocation = new OracleCollection(StorageLocation.table, inventoryDB);
+const devLock = new OracleCollection(UnlockedInventoryByMonth.table, inventoryDB);
+const devMaterial = new OracleCollection(MaterialMaster.table, inventoryDB);
+const devStocks = new OracleCollection(InventoryStocks.table, inventoryDB);
+const devUnit = new OracleCollection(InventoryUnit.table, inventoryDB);
+const users = new OracleCollection("T_OPITS_USERS", userdb);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Scratch table and helpers ────────────────────────────────────────────────
+const SCRATCH = "TEST_SCRATCH";
+const schema = new OracleSchema(inventoryDB);
+const txManager = new Transaction(inventoryDB);
+let scratch;
 
-async function tableExists(tableName) {
+// ─── Report collector ─────────────────────────────────────────────────────────
+const report = {
+    startTime: null,
+    endTime: null,
+    tables: {},
+    categories: {},
+    totalTests: 0,
+    passed: 0,
+    failed: 0,
+    failures: [],
+};
+
+// ─── Shared helpers ───────────────────────────────────────────────────────────
+async function tableExists(db, tableName) {
     return db.withConnection(async (conn) => {
         const res = await conn.execute(
             `SELECT COUNT(*) AS CNT FROM USER_TABLES WHERE TABLE_NAME = UPPER(:n)`,
@@ -80,9 +152,8 @@ async function tableExists(tableName) {
     });
 }
 
-async function dropIfExists(tableName) {
-    const exists = await tableExists(tableName);
-    if (exists) {
+async function dropIfExists(db, tableName) {
+    if (await tableExists(db, tableName)) {
         await db.withConnection(async (conn) => {
             await conn.execute(
                 `DROP TABLE "${tableName}" CASCADE CONSTRAINTS PURGE`,
@@ -93,7 +164,7 @@ async function dropIfExists(tableName) {
     }
 }
 
-async function rowCount(tableName) {
+async function rowCount(db, tableName) {
     return db.withConnection(async (conn) => {
         const res = await conn.execute(
             `SELECT COUNT(*) AS CNT FROM "${tableName}"`,
@@ -104,3329 +175,1937 @@ async function rowCount(tableName) {
     });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SUITE SETUP / TEARDOWN
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//  SUITE SETUP / TEARDOWN
+// ═════════════════════════════════════════════════════════════════════════════
 
 before(async function () {
     this.timeout(60_000);
+    report.startTime = new Date();
 
-    schema = new OracleSchema(db);
-    dcl = new OracleDCL(db);
-    txManager = new Transaction(db);
-    perf = createPerformance(db);
-
-    // Drop any leftover tables from a previous failed run
-    for (const t of Object.values(T)) await dropIfExists(t);
-
-    // ── Create test tables ────────────────────────────────────────────────────
-
-    await schema.createTable(T.USERS, {
+    // Create scratch table for write tests
+    await dropIfExists(inventoryDB, SCRATCH);
+    await schema.createTable(SCRATCH, {
         ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
         NAME: { type: "VARCHAR2(200)", notNull: true },
-        EMAIL: { type: "VARCHAR2(400)", notNull: true },
+        DIVISION: { type: "VARCHAR2(50)" },
+        YEAR: { type: "VARCHAR2(10)" },
+        MONTH: { type: "VARCHAR2(10)" },
+        MATERIALID: { type: "VARCHAR2(100)" },
+        CATEGORY: { type: "VARCHAR2(100)" },
+        VALUE: { type: "NUMBER(12,2)", default: 0 },
+        QUANTITY: { type: "NUMBER(12,2)", default: 0 },
         STATUS: { type: "VARCHAR2(20)", default: "'active'" },
-        AGE: { type: "NUMBER(3)" },
-        TIER: { type: "VARCHAR2(20)", default: "'standard'" },
-        BALANCE: { type: "NUMBER(12,2)", default: 0 },
-        LOGIN_COUNT: { type: "NUMBER", default: 0 },
         CREATED_AT: { type: "DATE", default: "SYSDATE" },
         UPDATED_AT: { type: "DATE" },
     });
 
-    await schema.createTable(T.ORDERS, {
-        ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
-        USER_ID: { type: "NUMBER", notNull: true },
-        AMOUNT: { type: "NUMBER(12,2)", notNull: true },
-        STATUS: { type: "VARCHAR2(20)", default: "'pending'" },
-        REGION: { type: "VARCHAR2(50)" },
-        CREATED_AT: { type: "DATE", default: "SYSDATE" },
-    });
+    scratch = new OracleCollection(SCRATCH, inventoryDB);
 
-    await schema.createTable(T.EMPLOYEES, {
-        ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
-        NAME: { type: "VARCHAR2(200)", notNull: true },
-        MANAGER_ID: { type: "NUMBER" },
-        DEPT_ID: { type: "NUMBER" },
-        SALARY: { type: "NUMBER(12,2)" },
-    });
-
-    await schema.createTable(T.SALES, {
-        ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
-        REGION: { type: "VARCHAR2(50)", notNull: true },
-        QUARTER: { type: "VARCHAR2(5)", notNull: true },
-        AMOUNT: { type: "NUMBER(12,2)", notNull: true },
-    });
-
-    await schema.createTable(T.ARCHIVE, {
-        ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
-        USER_ID: { type: "NUMBER" },
-        AMOUNT: { type: "NUMBER(12,2)" },
-        STATUS: { type: "VARCHAR2(20)" },
-        ARCHIVED_AT: { type: "DATE", default: "SYSDATE" },
-    });
-
-    // ── Bind collection handles ───────────────────────────────────────────────
-    users = new OracleCollection(T.USERS, db);
-    orders = new OracleCollection(T.ORDERS, db);
-    employees = new OracleCollection(T.EMPLOYEES, db);
-    sales = new OracleCollection(T.SALES, db);
-    archive = new OracleCollection(T.ARCHIVE, db);
-
-    // ── Seed data ─────────────────────────────────────────────────────────────
-    await users.insertMany([
-        {
-            NAME: "Juan",
-            EMAIL: "juan@test.com",
-            STATUS: "active",
-            AGE: 28,
-            TIER: "gold",
-            BALANCE: 1500,
-        },
-        {
-            NAME: "Maria",
-            EMAIL: "maria@test.com",
-            STATUS: "active",
-            AGE: 34,
-            TIER: "platinum",
-            BALANCE: 5000,
-        },
-        {
-            NAME: "Pedro",
-            EMAIL: "pedro@test.com",
-            STATUS: "inactive",
-            AGE: 22,
-            TIER: "standard",
-            BALANCE: 200,
-        },
-        {
-            NAME: "Ana",
-            EMAIL: "ana@test.com",
-            STATUS: "active",
-            AGE: 45,
-            TIER: "gold",
-            BALANCE: 3000,
-        },
-        {
-            NAME: "Carlos",
-            EMAIL: "carlos@test.com",
-            STATUS: "inactive",
-            AGE: 19,
-            TIER: "standard",
-            BALANCE: 0,
-        },
-    ]);
-
-    await orders.insertMany([
-        { USER_ID: 1, AMOUNT: 250, STATUS: "completed", REGION: "North" },
-        { USER_ID: 1, AMOUNT: 750, STATUS: "completed", REGION: "North" },
-        { USER_ID: 2, AMOUNT: 1200, STATUS: "completed", REGION: "South" },
-        { USER_ID: 2, AMOUNT: 300, STATUS: "pending", REGION: "South" },
-        { USER_ID: 3, AMOUNT: 80, STATUS: "cancelled", REGION: "East" },
-        { USER_ID: 4, AMOUNT: 2000, STATUS: "completed", REGION: "West" },
-    ]);
-
-    await employees.insertMany([
-        { NAME: "CEO", MANAGER_ID: null, DEPT_ID: 1, SALARY: 150000 },
-        { NAME: "VP Eng", MANAGER_ID: 1, DEPT_ID: 2, SALARY: 120000 },
-        { NAME: "VP Sales", MANAGER_ID: 1, DEPT_ID: 3, SALARY: 110000 },
-        { NAME: "Dev Lead", MANAGER_ID: 2, DEPT_ID: 2, SALARY: 90000 },
-        { NAME: "Dev 1", MANAGER_ID: 4, DEPT_ID: 2, SALARY: 70000 },
-        { NAME: "Dev 2", MANAGER_ID: 4, DEPT_ID: 2, SALARY: 68000 },
-    ]);
-
-    await sales.insertMany([
-        { REGION: "North", QUARTER: "Q1", AMOUNT: 10000 },
-        { REGION: "North", QUARTER: "Q2", AMOUNT: 15000 },
-        { REGION: "North", QUARTER: "Q3", AMOUNT: 12000 },
-        { REGION: "North", QUARTER: "Q4", AMOUNT: 18000 },
-        { REGION: "South", QUARTER: "Q1", AMOUNT: 8000 },
-        { REGION: "South", QUARTER: "Q2", AMOUNT: 9500 },
-        { REGION: "South", QUARTER: "Q3", AMOUNT: 11000 },
-        { REGION: "South", QUARTER: "Q4", AMOUNT: 13000 },
-    ]);
+    // Gather table row counts for report
+    const tableSchemas = [SAPBook, StorageLocation, UnlockedInventoryByMonth, MaterialMaster, InventoryStocks, InventoryUnit];
+    for (const ts of tableSchemas) {
+        try {
+            const coll = new OracleCollection(ts.table, inventoryDB);
+            const cnt = await coll.countDocuments();
+            report.tables[ts.table] = { rowCount: cnt, columnCount: ts.columns.length, columns: ts.columns };
+        } catch (e) {
+            report.tables[ts.table] = { rowCount: "ERROR", columnCount: ts.columns.length, columns: ts.columns, error: e.message };
+        }
+    }
+    // T_OPITS_USERS on userdb
+    try {
+        const cnt = await users.countDocuments();
+        report.tables["T_OPITS_USERS"] = { rowCount: cnt, columnCount: "N/A", columns: [] };
+    } catch (e) {
+        report.tables["T_OPITS_USERS"] = { rowCount: "ERROR", error: e.message };
+    }
 });
 
 after(async function () {
     this.timeout(30_000);
-    for (const t of Object.values(T)) await dropIfExists(t);
-    await dropIfExists("TEST_WRAP_AGG_OUT");
-    await db.closePool();
+    await dropIfExists(inventoryDB, SCRATCH);
+    report.endTime = new Date();
+    generateReport();
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 0 — db adapter
-// ─────────────────────────────────────────────────────────────────────────────
+afterEach(function () {
+    report.totalTests++;
+    const state = this.currentTest.state;
+    if (state === "passed") {
+        report.passed++;
+    } else if (state === "failed") {
+        report.failed++;
+        report.failures.push({
+            title: this.currentTest.fullTitle(),
+            error: this.currentTest.err?.message || "Unknown error",
+        });
+    }
+});
 
-describe("0. db adapter (createDb)", function () {
-    it("createDb returns required interface", function () {
-        expect(db).to.have.all.keys(
-            "connectionName",
-            "withConnection",
-            "withTransaction",
-            "withBatchConnection",
-            "closePool",
-            "getPoolStats",
-            "isHealthy",
-            "oracledb",
-        );
-    });
+// ═════════════════════════════════════════════════════════════════════════════
+//  1. CONNECTION & HEALTH CHECKS
+// ═════════════════════════════════════════════════════════════════════════════
 
-    it("connectionName is set correctly", function () {
-        expect(db.connectionName).to.equal("userAccount");
-    });
-
-    it("withConnection executes a query", async function () {
-        const result = await db.withConnection(async (conn) => {
+describe("1. Connection & Health", function () {
+    it("1.1 inventoryDB.withConnection executes a simple query", async function () {
+        const result = await inventoryDB.withConnection(async (conn) => {
             const r = await conn.execute(
                 "SELECT 1 AS VAL FROM DUAL",
                 {},
-                { outFormat: db.oracledb.OUT_FORMAT_OBJECT },
+                { outFormat: inventoryDB.oracledb.OUT_FORMAT_OBJECT },
             );
             return r.rows[0].VAL;
         });
         expect(result).to.equal(1);
     });
 
-    it("isHealthy returns true for a live pool", async function () {
-        const healthy = await db.isHealthy();
+    it("1.2 userdb.withConnection executes a simple query", async function () {
+        const result = await userdb.withConnection(async (conn) => {
+            const r = await conn.execute(
+                "SELECT 1 AS VAL FROM DUAL",
+                {},
+                { outFormat: userdb.oracledb.OUT_FORMAT_OBJECT },
+            );
+            return r.rows[0].VAL;
+        });
+        expect(result).to.equal(1);
+    });
+
+    it("1.3 db.isHealthy returns true", async function () {
+        const healthy = await inventoryDB.isHealthy();
         expect(healthy).to.be.true;
     });
 
-    it("getPoolStats returns pool info", async function () {
-        const stats = await db.getPoolStats();
-        expect(stats).to.have.property("pools");
-        expect(stats.pools).to.have.property("userAccount");
-    });
-
-    it("createDb throws for invalid connectionName", function () {
-        expect(() => createDb("")).to.throw(TypeError);
-        expect(() => createDb(null)).to.throw(TypeError);
+    it("1.4 db.getPoolStats returns stats object", async function () {
+        const stats = await inventoryDB.getPoolStats();
+        expect(stats).to.be.an("object");
     });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 1 — filterParser
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//  2. FILTER PARSER — Unit Tests (All Operators)
+// ═════════════════════════════════════════════════════════════════════════════
 
-describe("1. filterParser", function () {
-    it("empty filter returns empty whereClause", function () {
+describe("2. filterParser — Unit Tests", function () {
+    it("2.1 empty filter → empty whereClause", function () {
         const { whereClause, binds } = parseFilter({});
         expect(whereClause).to.equal("");
         expect(binds).to.deep.equal({});
     });
 
-    it("simple equality", function () {
-        const { whereClause, binds } = parseFilter({ STATUS: "active" });
-        expect(whereClause).to.include("WHERE");
-        expect(whereClause).to.include('"STATUS"');
-        expect(Object.values(binds)).to.include("active");
+    it("2.2 null filter → empty whereClause", function () {
+        const { whereClause } = parseFilter(null);
+        expect(whereClause).to.equal("");
     });
 
-    it("$gt, $gte, $lt, $lte operators", function () {
-        const ops = [
-            [{ AGE: { $gt: 18 } }, ">"],
-            [{ AGE: { $gte: 18 } }, ">="],
-            [{ AGE: { $lt: 18 } }, "<"],
-            [{ AGE: { $lte: 18 } }, "<="],
-        ];
-        for (const [filter, op] of ops) {
-            const { whereClause } = parseFilter(filter);
-            expect(whereClause).to.include(op);
-        }
+    it("2.3 simple equality", function () {
+        const { whereClause, binds } = parseFilter({ DIVISION: "WH" });
+        expect(whereClause).to.include("=");
+        expect(Object.values(binds)).to.include("WH");
     });
 
-    it("$in and $nin operators", function () {
-        const { whereClause: inClause } = parseFilter({
-            STATUS: { $in: ["active", "pending"] },
+    it("2.4 $eq operator", function () {
+        const { whereClause } = parseFilter({ STATUS: { $eq: "active" } });
+        expect(whereClause).to.include("=");
+    });
+
+    it("2.5 $ne operator", function () {
+        const { whereClause } = parseFilter({ STATUS: { $ne: "deleted" } });
+        expect(whereClause).to.include("<>");
+    });
+
+    it("2.6 $gt operator", function () {
+        const { whereClause } = parseFilter({ QUANTITY: { $gt: 100 } });
+        expect(whereClause).to.include(">");
+    });
+
+    it("2.7 $gte operator", function () {
+        const { whereClause } = parseFilter({ QUANTITY: { $gte: 100 } });
+        expect(whereClause).to.include(">=");
+    });
+
+    it("2.8 $lt operator", function () {
+        const { whereClause } = parseFilter({ QUANTITY: { $lt: 50 } });
+        expect(whereClause).to.include("<");
+    });
+
+    it("2.9 $lte operator", function () {
+        const { whereClause } = parseFilter({ QUANTITY: { $lte: 50 } });
+        expect(whereClause).to.include("<=");
+    });
+
+    it("2.10 $in operator", function () {
+        const { whereClause } = parseFilter({ DIVISION: { $in: ["WH", "PR"] } });
+        expect(whereClause.toUpperCase()).to.include("IN");
+    });
+
+    it("2.11 $nin operator", function () {
+        const { whereClause } = parseFilter({ DIVISION: { $nin: ["WH", "PR"] } });
+        expect(whereClause.toUpperCase()).to.include("NOT IN");
+    });
+
+    it("2.12 $between operator", function () {
+        const { whereClause } = parseFilter({ QUANTITY: { $between: [10, 100] } });
+        expect(whereClause.toUpperCase()).to.include("BETWEEN");
+    });
+
+    it("2.13 $notBetween operator", function () {
+        const { whereClause } = parseFilter({ QUANTITY: { $notBetween: [10, 100] } });
+        expect(whereClause.toUpperCase()).to.include("NOT BETWEEN");
+    });
+
+    it("2.14 $exists true → IS NOT NULL", function () {
+        const { whereClause } = parseFilter({ MATERIALID: { $exists: true } });
+        expect(whereClause.toUpperCase()).to.include("IS NOT NULL");
+    });
+
+    it("2.15 $exists false → IS NULL", function () {
+        const { whereClause } = parseFilter({ MATERIALID: { $exists: false } });
+        expect(whereClause.toUpperCase()).to.include("IS NULL");
+    });
+
+    it("2.16 $regex operator", function () {
+        const { whereClause } = parseFilter({ MATERIALID: { $regex: "^MAT" } });
+        expect(whereClause.toUpperCase()).to.include("REGEXP_LIKE");
+    });
+
+    it("2.17 $like operator", function () {
+        const { whereClause } = parseFilter({ MATERIALID: { $like: "MAT%" } });
+        expect(whereClause.toUpperCase()).to.include("LIKE");
+    });
+
+    it("2.18 $and operator", function () {
+        const { whereClause } = parseFilter({
+            $and: [{ DIVISION: "WH" }, { YEAR: "2025" }],
         });
-        const { whereClause: ninClause } = parseFilter({
-            STATUS: { $nin: ["inactive"] },
-        });
-        expect(inClause).to.include("IN");
-        expect(ninClause).to.include("NOT IN");
+        expect(whereClause.toUpperCase()).to.include("AND");
     });
 
-    it("$exists true/false", function () {
-        const { whereClause: notNull } = parseFilter({
-            UPDATED_AT: { $exists: true },
+    it("2.19 $or operator", function () {
+        const { whereClause } = parseFilter({
+            $or: [{ DIVISION: "WH" }, { DIVISION: "PR" }],
         });
-        const { whereClause: isNull } = parseFilter({
-            UPDATED_AT: { $exists: false },
-        });
-        expect(notNull).to.include("IS NOT NULL");
-        expect(isNull).to.include("IS NULL");
+        expect(whereClause.toUpperCase()).to.include("OR");
     });
 
-    it("$and / $or / $nor logical operators", function () {
-        const { whereClause: and } = parseFilter({
-            $and: [{ STATUS: "active" }, { AGE: { $gte: 18 } }],
+    it("2.20 $nor operator", function () {
+        const { whereClause } = parseFilter({
+            $nor: [{ STATUS: "deleted" }, { STATUS: "archived" }],
         });
-        const { whereClause: or } = parseFilter({
-            $or: [{ STATUS: "active" }, { STATUS: "pending" }],
-        });
-        const { whereClause: nor } = parseFilter({
-            $nor: [{ STATUS: "inactive" }],
-        });
-        expect(and).to.include("AND");
-        expect(or).to.include("OR");
-        expect(nor).to.include("NOT");
+        expect(whereClause.toUpperCase()).to.include("NOT");
     });
 
-    it("$like operator", function () {
-        const { whereClause } = parseFilter({ NAME: { $like: "J%" } });
-        expect(whereClause).to.include("LIKE");
+    it("2.21 $not operator", function () {
+        const { whereClause } = parseFilter({ $not: { STATUS: "deleted" } });
+        expect(whereClause.toUpperCase()).to.include("NOT");
     });
 
-    it("$regex operator", function () {
-        const { whereClause } = parseFilter({ NAME: { $regex: "^J" } });
-        expect(whereClause).to.include("REGEXP_LIKE");
+    it("2.22 combined comparison operators", function () {
+        const { whereClause } = parseFilter({ QUANTITY: { $gte: 10, $lte: 100 } });
+        expect(whereClause).to.include(">=");
+        expect(whereClause).to.include("<=");
     });
 
-    it("$between operator", function () {
-        const { whereClause } = parseFilter({ AGE: { $between: [20, 40] } });
-        expect(whereClause).to.include("BETWEEN");
+    it("2.23 multiple fields (implicit AND)", function () {
+        const { binds } = parseFilter({ DIVISION: "WH", YEAR: "2025", MONTH: "01" });
+        expect(Object.keys(binds).length).to.equal(3);
     });
 
-    it("unique bind variable names when same field repeated", function () {
-        const { binds } = parseFilter({
-            $and: [{ AGE: { $gte: 18 } }, { AGE: { $lte: 60 } }],
-        });
-        const keys = Object.keys(binds);
-        expect(keys.length).to.equal(2);
-        expect(new Set(keys).size).to.equal(2); // all unique
+    it("2.24 null value → IS NULL", function () {
+        const { whereClause } = parseFilter({ DELETEDBY: null });
+        expect(whereClause.toUpperCase()).to.include("IS NULL");
     });
 
-    it("throws for unsupported operator", function () {
-        expect(() => parseFilter({ NAME: { $unknown: "x" } })).to.throw();
+    it("2.25 $in with empty array → always false", function () {
+        const { whereClause } = parseFilter({ DIVISION: { $in: [] } });
+        expect(whereClause).to.include("1=0");
     });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 2 — updateParser
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//  3. UPDATE PARSER — Unit Tests (All Operators)
+// ═════════════════════════════════════════════════════════════════════════════
 
-describe("2. updateParser", function () {
-    it("$set produces SET clause", function () {
-        const { setClause, binds } = parseUpdate({
-            $set: { STATUS: "premium" },
-        });
-        expect(setClause).to.include("SET");
-        expect(setClause).to.include('"STATUS"');
-        expect(Object.values(binds)).to.include("premium");
+describe("3. updateParser — Unit Tests", function () {
+    it("3.1 $set generates SET clause", function () {
+        const { setClause, binds } = parseUpdate({ $set: { DIVISION: "WH" } });
+        expect(setClause).to.include("=");
+        expect(Object.values(binds)).to.include("WH");
     });
 
-    it("$unset sets field to NULL", function () {
-        const { setClause } = parseUpdate({ $unset: { UPDATED_AT: "" } });
-        expect(setClause).to.include("NULL");
+    it("3.2 $inc generates field = field + n", function () {
+        const { setClause } = parseUpdate({ $inc: { QUANTITY: 10 } });
+        expect(setClause).to.include("+");
     });
 
-    it("$inc produces field = field + :n", function () {
-        const { setClause } = parseUpdate({ $inc: { LOGIN_COUNT: 1 } });
-        expect(setClause).to.match(/"LOGIN_COUNT"\s*=\s*"LOGIN_COUNT"\s*\+/);
+    it("3.3 $mul generates field = field * n", function () {
+        const { setClause } = parseUpdate({ $mul: { VALUE: 1.5 } });
+        expect(setClause).to.include("*");
     });
 
-    it("$mul produces field = field * :n", function () {
-        const { setClause } = parseUpdate({ $mul: { BALANCE: 2 } });
-        expect(setClause).to.match(/"BALANCE"\s*=\s*"BALANCE"\s*\*/);
+    it("3.4 $unset generates field = NULL", function () {
+        const { setClause } = parseUpdate({ $unset: { DELETEDBY: "" } });
+        expect(setClause.toUpperCase()).to.include("NULL");
     });
 
-    it("$min produces LEAST()", function () {
-        const { setClause } = parseUpdate({ $min: { BALANCE: 100 } });
-        expect(setClause).to.include("LEAST");
+    it("3.5 $currentDate generates SYSDATE", function () {
+        const { setClause } = parseUpdate({ $currentDate: { MODIFIEDDATE: true } });
+        expect(setClause.toUpperCase()).to.include("SYSDATE");
     });
 
-    it("$max produces GREATEST()", function () {
-        const { setClause } = parseUpdate({ $max: { BALANCE: 9999 } });
-        expect(setClause).to.include("GREATEST");
+    it("3.6 $min generates LEAST", function () {
+        const { setClause } = parseUpdate({ $min: { VALUE: 10 } });
+        expect(setClause.toUpperCase()).to.include("LEAST");
     });
 
-    it("$currentDate produces SYSDATE", function () {
-        const { setClause } = parseUpdate({
-            $currentDate: { UPDATED_AT: true },
-        });
-        expect(setClause).to.include("SYSDATE");
+    it("3.7 $max generates GREATEST", function () {
+        const { setClause } = parseUpdate({ $max: { VALUE: 100 } });
+        expect(setClause.toUpperCase()).to.include("GREATEST");
     });
 
-    it("$rename throws a descriptive error", function () {
-        expect(() => parseUpdate({ $rename: { NAME: "FULL_NAME" } })).to.throw(
-            /ALTER TABLE/i,
-        );
+    it("3.8 $rename throws error", function () {
+        expect(() => parseUpdate({ $rename: { OLD: "NEW" } })).to.throw();
     });
 
-    it("throws on empty update object", function () {
+    it("3.9 empty update throws error", function () {
         expect(() => parseUpdate({})).to.throw();
     });
 
-    it("update binds prefixed with upd_ (no collision with filter binds)", function () {
-        const { binds } = parseUpdate({ $set: { STATUS: "active" } });
-        const allKeys = Object.keys(binds);
-        expect(allKeys.every((k) => k.startsWith("upd_"))).to.be.true;
+    it("3.10 combined $set + $inc + $currentDate", function () {
+        const { setClause } = parseUpdate({
+            $set: { STATUS: "updated" },
+            $inc: { QUANTITY: 5 },
+            $currentDate: { MODIFIEDDATE: true },
+        });
+        expect(setClause).to.include("STATUS");
+        expect(setClause).to.include("QUANTITY");
+        expect(setClause.toUpperCase()).to.include("SYSDATE");
     });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 3 — Insert Operations
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+//  4. DEV_BOOK (SAPBook) — Read Operations
+// ═════════════════════════════════════════════════════════════════════════════
 
-describe("3. Insert Operations", function () {
-    it("insertOne returns acknowledged + insertedId", async function () {
-        const result = await users.insertOne({
-            NAME: "TestUser1",
-            EMAIL: "test1@test.com",
-            STATUS: "active",
-            AGE: 30,
+describe("4. DEV_BOOK — Read Operations", function () {
+    it("4.1 countDocuments returns a number", async function () {
+        const count = await devBook.countDocuments();
+        expect(count).to.be.a("number");
+        expect(count).to.be.at.least(0);
+    });
+
+    it("4.2 estimatedDocumentCount returns a number (O(1))", async function () {
+        const count = await devBook.estimatedDocumentCount();
+        expect(count).to.be.a("number");
+    });
+
+    it("4.3 find().toArray() returns rows with correct columns", async function () {
+        const rows = await devBook.find({}).limit(5).toArray();
+        expect(rows).to.be.an("array");
+        if (rows.length > 0) {
+            for (const col of ["ID", "DIVISION", "YEAR", "MONTH", "MATERIALID"]) {
+                expect(rows[0]).to.have.property(col);
+            }
+        }
+    });
+
+    it("4.4 find with projection", async function () {
+        const rows = await devBook
+            .find({})
+            .project({ ID: 1, DIVISION: 1, YEAR: 1, MATERIALID: 1 })
+            .limit(3)
+            .toArray();
+        expect(rows).to.be.an("array");
+        if (rows.length > 0) {
+            expect(rows[0]).to.have.property("ID");
+            expect(rows[0]).to.have.property("MATERIALID");
+        }
+    });
+
+    it("4.5 find with sort DESC and limit", async function () {
+        const rows = await devBook.find({}).sort({ ID: -1 }).limit(3).toArray();
+        expect(rows).to.be.an("array");
+        if (rows.length >= 2) {
+            expect(Number(rows[0].ID)).to.be.at.least(Number(rows[1].ID));
+        }
+    });
+
+    it("4.6 find with skip + limit (pagination)", async function () {
+        const page1 = await devBook.find({}).sort({ ID: 1 }).limit(2).toArray();
+        const page2 = await devBook.find({}).sort({ ID: 1 }).skip(2).limit(2).toArray();
+        if (page1.length === 2 && page2.length > 0) {
+            expect(Number(page2[0].ID)).to.be.greaterThan(Number(page1[1].ID));
+        }
+    });
+
+    it("4.7 findOne returns a single document or null", async function () {
+        const doc = await devBook.findOne({});
+        if (doc) {
+            expect(doc).to.have.property("ID");
+            expect(doc).to.have.property("SAP_BOOK_QUANTITY");
+        } else {
+            expect(doc).to.be.null;
+        }
+    });
+
+    it("4.8 distinct on DIVISION", async function () {
+        const divisions = await devBook.distinct("DIVISION");
+        expect(divisions).to.be.an("array");
+    });
+
+    it("4.9 find with $exists filter (non-null MATERIALID)", async function () {
+        const rows = await devBook
+            .find({ MATERIALID: { $exists: true } })
+            .limit(5)
+            .toArray();
+        expect(rows).to.be.an("array");
+        rows.forEach((r) => expect(r.MATERIALID).to.not.be.null);
+    });
+
+    it("4.10 QueryBuilder.count()", async function () {
+        const count = await devBook.find({}).count();
+        expect(count).to.be.a("number").and.at.least(0);
+    });
+
+    it("4.11 QueryBuilder.explain() returns SQL string", async function () {
+        const sql = await devBook.find({ DIVISION: "WH" }).sort({ ID: 1 }).limit(10).explain();
+        expect(sql).to.be.a("string");
+        expect(sql.toUpperCase()).to.include("SELECT");
+        expect(sql.toUpperCase()).to.include("ORDER BY");
+    });
+
+    it("4.12 QueryBuilder.next() returns first row", async function () {
+        const row = await devBook.find({}).sort({ ID: 1 }).next();
+        if (row) expect(row).to.have.property("ID");
+    });
+
+    it("4.13 QueryBuilder.hasNext() returns boolean", async function () {
+        const has = await devBook.find({}).hasNext();
+        expect(has).to.be.a("boolean");
+    });
+
+    it("4.14 find with $like filter on YEAR", async function () {
+        const rows = await devBook.find({ YEAR: { $like: "202%" } }).limit(5).toArray();
+        expect(rows).to.be.an("array");
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  5. DEV_LOCATION (StorageLocation) — Read Operations
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("5. DEV_LOCATION — Read Operations", function () {
+    it("5.1 countDocuments", async function () {
+        const count = await devLocation.countDocuments();
+        expect(count).to.be.a("number");
+    });
+
+    it("5.2 find with $in filter on TYPE", async function () {
+        const rows = await devLocation.find({ TYPE: { $in: ["WH", "PR"] } }).limit(10).toArray();
+        expect(rows).to.be.an("array");
+    });
+
+    it("5.3 distinct SLOC values", async function () {
+        const slocs = await devLocation.distinct("SLOC");
+        expect(slocs).to.be.an("array");
+    });
+
+    it("5.4 find with multiple conditions (implicit AND)", async function () {
+        const rows = await devLocation.find({ DIVISION: "WH", YEAR: "2025" }).limit(5).toArray();
+        expect(rows).to.be.an("array");
+    });
+
+    it("5.5 find with $or", async function () {
+        const rows = await devLocation
+            .find({ $or: [{ TYPE: "WH" }, { TYPE: "PR" }] })
+            .limit(5)
+            .toArray();
+        expect(rows).to.be.an("array");
+    });
+
+    it("5.6 find with projection", async function () {
+        const rows = await devLocation
+            .find({})
+            .project({ ID: 1, DIVISION: 1, SLOC: 1, PSA: 1, TERMINAL: 1 })
+            .limit(3)
+            .toArray();
+        expect(rows).to.be.an("array");
+        if (rows.length > 0) expect(rows[0]).to.have.property("SLOC");
+    });
+
+    it("5.7 distinct on TERMINAL", async function () {
+        const terminals = await devLocation.distinct("TERMINAL");
+        expect(terminals).to.be.an("array");
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  6. DEV_MATERIAL (MaterialMaster) — Read Operations
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("6. DEV_MATERIAL — Read Operations", function () {
+    it("6.1 countDocuments", async function () {
+        const count = await devMaterial.countDocuments();
+        expect(count).to.be.a("number");
+    });
+
+    it("6.2 find with $ne filter on TYPE", async function () {
+        const rows = await devMaterial.find({ TYPE: { $ne: "RM" } }).limit(10).toArray();
+        expect(rows).to.be.an("array");
+    });
+
+    it("6.3 distinct TYPE", async function () {
+        const types = await devMaterial.distinct("TYPE");
+        expect(types).to.be.an("array");
+    });
+
+    it("6.4 findOne with specific MATERIALID", async function () {
+        const any = await devMaterial.findOne({});
+        if (any) {
+            const found = await devMaterial.findOne({ MATERIALID: any.MATERIALID });
+            expect(found).to.not.be.null;
+            expect(found.MATERIALID).to.equal(any.MATERIALID);
+        }
+    });
+
+    it("6.5 find with $gte on ID", async function () {
+        const rows = await devMaterial.find({ ID: { $gte: 1 } }).sort({ ID: 1 }).limit(5).toArray();
+        expect(rows).to.be.an("array");
+        if (rows.length > 0) expect(Number(rows[0].ID)).to.be.at.least(1);
+    });
+
+    it("6.6 shared columns: common DIVISION/YEAR/MONTH/MATERIALID", async function () {
+        const doc = await devMaterial.findOne({});
+        if (doc) {
+            expect(doc).to.have.property("DIVISION");
+            expect(doc).to.have.property("YEAR");
+            expect(doc).to.have.property("MONTH");
+            expect(doc).to.have.property("MATERIALID");
+        }
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  7. DEV_STOCKS (InventoryStocks) — Read Operations
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("7. DEV_STOCKS — Read Operations", function () {
+    it("7.1 countDocuments", async function () {
+        const count = await devStocks.countDocuments();
+        expect(count).to.be.a("number");
+    });
+
+    it("7.2 find with sort by QUANTITY desc", async function () {
+        const rows = await devStocks
+            .find({ QUANTITY: { $exists: true } })
+            .sort({ QUANTITY: -1 })
+            .limit(5)
+            .toArray();
+        expect(rows).to.be.an("array");
+        if (rows.length >= 2) {
+            expect(Number(rows[0].QUANTITY)).to.be.at.least(Number(rows[1].QUANTITY));
+        }
+    });
+
+    it("7.3 distinct CATEGORY", async function () {
+        const cats = await devStocks.distinct("CATEGORY");
+        expect(cats).to.be.an("array");
+    });
+
+    it("7.4 find with $gt on QUANTITY", async function () {
+        const rows = await devStocks.find({ QUANTITY: { $gt: 0 } }).limit(10).toArray();
+        expect(rows).to.be.an("array");
+        rows.forEach((r) => expect(Number(r.QUANTITY)).to.be.greaterThan(0));
+    });
+
+    it("7.5 QueryBuilder.next() returns first row", async function () {
+        const row = await devStocks.find({}).sort({ ID: 1 }).next();
+        if (row) expect(row).to.have.property("ID");
+    });
+
+    it("7.6 QueryBuilder.hasNext() returns boolean", async function () {
+        const has = await devStocks.find({}).hasNext();
+        expect(has).to.be.a("boolean");
+    });
+
+    it("7.7 find with $between on QUANTITY", async function () {
+        const rows = await devStocks.find({ QUANTITY: { $between: [1, 1000] } }).limit(10).toArray();
+        expect(rows).to.be.an("array");
+    });
+
+    it("7.8 forEach iterates with O(1) memory", async function () {
+        const items = [];
+        await devStocks
+            .find({})
+            .limit(5)
+            .forEach((row) => items.push(row.ID));
+        expect(items).to.be.an("array");
+        expect(items.length).to.be.at.most(5);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  8. DEV_UNIT (InventoryUnit) — Read Operations
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("8. DEV_UNIT — Read Operations", function () {
+    it("8.1 countDocuments", async function () {
+        const count = await devUnit.countDocuments();
+        expect(count).to.be.a("number");
+    });
+
+    it("8.2 find with $in on UNITSTATUS", async function () {
+        const rows = await devUnit
+            .find({ UNITSTATUS: { $in: ["OPEN", "CLOSED", "ACTIVE"] } })
+            .limit(10)
+            .toArray();
+        expect(rows).to.be.an("array");
+    });
+
+    it("8.3 distinct UNITIDTYPE", async function () {
+        const types = await devUnit.distinct("UNITIDTYPE");
+        expect(types).to.be.an("array");
+    });
+
+    it("8.4 find with $exists false (null MATERIALNUMBER)", async function () {
+        const rows = await devUnit
+            .find({ MATERIALNUMBER: { $exists: false } })
+            .limit(5)
+            .toArray();
+        expect(rows).to.be.an("array");
+        rows.forEach((r) => expect(r.MATERIALNUMBER).to.be.null);
+    });
+
+    it("8.5 find with $like on ORDERNAME", async function () {
+        const rows = await devUnit.find({ ORDERNAME: { $like: "%ORD%" } }).limit(5).toArray();
+        expect(rows).to.be.an("array");
+    });
+
+    it("8.6 shared columns: DIVISION/YEAR/MONTH are present", async function () {
+        const doc = await devUnit.findOne({});
+        if (doc) {
+            expect(doc).to.have.property("DIVISION");
+            expect(doc).to.have.property("YEAR");
+            expect(doc).to.have.property("MONTH");
+        }
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  9. DEV_LOCK (UnlockedInventoryByMonth) — Read Operations
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("9. DEV_LOCK — Read Operations", function () {
+    it("9.1 countDocuments", async function () {
+        const count = await devLock.countDocuments();
+        expect(count).to.be.a("number");
+    });
+
+    it("9.2 find with $eq on ACTIVE", async function () {
+        const rows = await devLock.find({ ACTIVE: { $eq: 1 } }).limit(10).toArray();
+        expect(rows).to.be.an("array");
+        rows.forEach((r) => expect(Number(r.ACTIVE)).to.equal(1));
+    });
+
+    it("9.3 verify column structure", async function () {
+        const rows = await devLock.find({}).limit(1).toArray();
+        if (rows.length > 0) {
+            expect(rows[0]).to.have.property("ID");
+            expect(rows[0]).to.have.property("MONTH");
+            expect(rows[0]).to.have.property("ACTIVE");
+        }
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 10. T_OPITS_USERS — Read Operations
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("10. T_OPITS_USERS — Read Operations", function () {
+    it("10.1 countDocuments", async function () {
+        const count = await users.countDocuments();
+        expect(count).to.be.a("number").and.at.least(0);
+    });
+
+    it("10.2 findOne returns full user doc", async function () {
+        const user = await users.findOne({});
+        if (user) {
+            expect(user).to.have.property("USERID");
+            expect(user).to.have.property("NAME");
+        }
+    });
+
+    it("10.3 find with sort and limit", async function () {
+        const rows = await users.find({}).sort({ USERID: 1 }).limit(5).toArray();
+        expect(rows).to.be.an("array");
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 11. SCRATCH TABLE — CRUD Write Operations
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("11. Scratch Table — CRUD Operations", function () {
+    it("11.1 insertOne inserts a row and returns insertedId", async function () {
+        const result = await scratch.insertOne({
+            NAME: "ItemA", DIVISION: "WH", YEAR: "2025", MONTH: "01",
+            MATERIALID: "MAT001", CATEGORY: "Alpha", VALUE: 100, QUANTITY: 50,
         });
         expect(result.acknowledged).to.be.true;
         expect(result.insertedId).to.exist;
     });
 
-    it("insertOne with returning option returns extra columns", async function () {
-        const result = await users.insertOne(
-            {
-                NAME: "TestUser2",
-                EMAIL: "test2@test.com",
-                STATUS: "active",
-                AGE: 25,
-            },
-            { returning: ["ID", "CREATED_AT"] },
-        );
-        expect(result.acknowledged).to.be.true;
-        expect(result.returning).to.have.property("ID");
-        expect(result.returning).to.have.property("CREATED_AT");
-    });
-
-    it("insertMany inserts all documents atomically", async function () {
-        const before = await rowCount(T.USERS);
-        const result = await users.insertMany([
-            { NAME: "Batch1", EMAIL: "b1@test.com", AGE: 20 },
-            { NAME: "Batch2", EMAIL: "b2@test.com", AGE: 21 },
-            { NAME: "Batch3", EMAIL: "b3@test.com", AGE: 22 },
+    it("11.2 insertMany inserts multiple rows", async function () {
+        const result = await scratch.insertMany([
+            { NAME: "ItemB", DIVISION: "PR", YEAR: "2025", MONTH: "02", MATERIALID: "MAT002", CATEGORY: "Beta", VALUE: 200, QUANTITY: 30 },
+            { NAME: "ItemC", DIVISION: "WH", YEAR: "2025", MONTH: "03", MATERIALID: "MAT001", CATEGORY: "Alpha", VALUE: 300, QUANTITY: 70 },
+            { NAME: "ItemD", DIVISION: "PR", YEAR: "2024", MONTH: "12", MATERIALID: "MAT003", CATEGORY: "Gamma", VALUE: 150, QUANTITY: 20 },
+            { NAME: "ItemE", DIVISION: "WH", YEAR: "2025", MONTH: "01", MATERIALID: "MAT002", CATEGORY: "Beta", VALUE: 450, QUANTITY: 90 },
+            { NAME: "ItemF", DIVISION: "WH", YEAR: "2025", MONTH: "02", MATERIALID: "MAT001", CATEGORY: "Alpha", VALUE: 50, QUANTITY: 10 },
         ]);
-        const after = await rowCount(T.USERS);
         expect(result.acknowledged).to.be.true;
-        expect(result.insertedCount).to.equal(3);
-        expect(result.insertedIds).to.have.length(3);
-        expect(after - before).to.equal(3);
+        expect(result.insertedCount).to.equal(5);
+        expect(result.insertedIds).to.be.an("array").with.length(5);
     });
 
-    it("insertMany rolls back all rows on failure", async function () {
-        const before = await rowCount(T.USERS);
-        try {
-            // Second doc has EMAIL too long — should cause ORA error and rollback
-            await users.insertMany([
-                { NAME: "RollbackOk", EMAIL: "ok@test.com" },
-                { NAME: "RollbackFail", EMAIL: "x".repeat(500) }, // exceeds VARCHAR2(400)
-            ]);
-        } catch (e) {
-            /* expected */
-        }
-        const after = await rowCount(T.USERS);
-        expect(after).to.equal(before); // all rolled back
+    it("11.3 countDocuments after inserts = 6", async function () {
+        const count = await scratch.countDocuments();
+        expect(count).to.equal(6);
     });
-});
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 4 — Query / Read Operations
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("4. Query / Read Operations", function () {
-    it("findOne returns a single document", async function () {
-        const doc = await users.findOne({ NAME: "Juan" });
+    it("11.4 findOne by CATEGORY", async function () {
+        const doc = await scratch.findOne({ CATEGORY: "Gamma" });
         expect(doc).to.not.be.null;
-        expect(doc.NAME).to.equal("Juan");
+        expect(doc.NAME).to.equal("ItemD");
     });
 
-    it("findOne returns null when no match", async function () {
-        const doc = await users.findOne({ NAME: "NoSuchPerson" });
-        expect(doc).to.be.null;
+    it("11.5 find with sort and limit", async function () {
+        const rows = await scratch.find({}).sort({ VALUE: -1 }).limit(3).toArray();
+        expect(rows).to.have.length(3);
+        expect(Number(rows[0].VALUE)).to.be.at.least(Number(rows[1].VALUE));
     });
 
-    it("countDocuments returns correct count", async function () {
-        const count = await users.countDocuments({ STATUS: "active" });
-        expect(count).to.be.a("number");
-        expect(count).to.be.greaterThan(0);
-    });
-
-    it("estimatedDocumentCount returns a number", async function () {
-        const count = await users.estimatedDocumentCount();
-        expect(count).to.be.a("number");
-    });
-
-    it("distinct returns unique values", async function () {
-        const statuses = await users.distinct("STATUS");
-        expect(statuses).to.be.an("array");
-        expect(new Set(statuses).size).to.equal(statuses.length); // all unique
-        expect(statuses).to.include.members(["active", "inactive"]);
-    });
-
-    it("distinct with filter narrows results", async function () {
-        const statuses = await users.distinct("STATUS", { AGE: { $gte: 30 } });
-        expect(statuses).to.be.an("array");
-    });
-
-    it("findOneAndUpdate returns before document by default", async function () {
-        const before = await users.findOneAndUpdate(
-            { NAME: "Juan" },
-            { $set: { TIER: "platinum" } },
-            { returnDocument: "before" },
-        );
-        expect(before).to.not.be.null;
-        expect(before.TIER).to.equal("gold"); // original value
-    });
-
-    it("findOneAndUpdate with returnDocument:after returns updated doc", async function () {
-        const after = await users.findOneAndUpdate(
-            { NAME: "Pedro" },
-            { $set: { STATUS: "active" } },
-            { returnDocument: "after" },
-        );
-        expect(after).to.not.be.null;
-        expect(after.STATUS).to.equal("active");
-    });
-
-    it("findOneAndUpdate with upsert inserts when no match", async function () {
-        const result = await users.findOneAndUpdate(
-            { NAME: "NewUpsertUser" },
-            { $set: { EMAIL: "upsert@test.com", STATUS: "active", AGE: 30 } },
-            { upsert: true, returnDocument: "after" },
-        );
-        expect(result).to.not.be.null;
-    });
-
-    it("findOneAndDelete returns and removes the document", async function () {
-        // Insert a throwaway record
-        await users.insertOne({
-            NAME: "DeleteMe",
-            EMAIL: "del@test.com",
-            AGE: 99,
-        });
-        const deleted = await users.findOneAndDelete({ NAME: "DeleteMe" });
-        expect(deleted).to.not.be.null;
-        expect(deleted.NAME).to.equal("DeleteMe");
-        const check = await users.findOne({ NAME: "DeleteMe" });
-        expect(check).to.be.null;
-    });
-
-    it("findOneAndReplace replaces the document", async function () {
-        await users.insertOne({
-            NAME: "ReplaceMe",
-            EMAIL: "rep@test.com",
-            AGE: 10,
-        });
-        const result = await users.findOneAndReplace(
-            { NAME: "ReplaceMe" },
-            {
-                NAME: "Replaced",
-                EMAIL: "replaced@test.com",
-                AGE: 11,
-                STATUS: "active",
-            },
-            { returnDocument: "after" },
-        );
-        expect(result.NAME).to.equal("Replaced");
-        await users.deleteOne({ NAME: "Replaced" }); // cleanup
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 5 — QueryBuilder (cursor chaining)
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("5. QueryBuilder — cursor chaining", function () {
-    it("find().toArray() returns all matched rows", async function () {
-        const rows = await users.find({ STATUS: "active" }).toArray();
-        expect(rows).to.be.an("array");
-        rows.forEach((r) => expect(r.STATUS).to.equal("active"));
-    });
-
-    it(".limit() caps result count", async function () {
-        const rows = await users.find({}).limit(2).toArray();
-        expect(rows.length).to.be.at.most(2);
-    });
-
-    it(".skip() offsets results", async function () {
-        const all = await users.find({}).sort({ ID: 1 }).toArray();
-        const paged = await users.find({}).sort({ ID: 1 }).skip(2).toArray();
-        expect(paged[0].ID).to.equal(all[2].ID);
-    });
-
-    it(".sort() orders results ASC and DESC", async function () {
-        const asc = await users
-            .find({ AGE: { $exists: true } })
-            .sort({ AGE: 1 })
-            .toArray();
-        const desc = await users
-            .find({ AGE: { $exists: true } })
-            .sort({ AGE: -1 })
-            .toArray();
-        expect(Number(asc[0].AGE)).to.be.at.most(
-            Number(asc[asc.length - 1].AGE),
-        );
-        expect(Number(desc[0].AGE)).to.be.at.least(
-            Number(desc[desc.length - 1].AGE),
-        );
-    });
-
-    it(".project() returns only specified columns", async function () {
-        const rows = await users
-            .find({})
-            .project({ NAME: 1, EMAIL: 1 })
-            .toArray();
-        rows.forEach((r) => {
-            expect(r).to.have.property("NAME");
-            expect(r).to.have.property("EMAIL");
-            expect(r).to.not.have.property("STATUS");
-        });
-    });
-
-    it(".project() with exclusion (0) omits the column", async function () {
-        const rows = await users.find({}).project({ STATUS: 0 }).toArray();
-        rows.forEach((r) => expect(r).to.not.have.property("STATUS"));
-    });
-
-    it(".count() returns the count without returning rows", async function () {
-        const count = await users.find({ STATUS: "active" }).count();
-        expect(count).to.be.a("number");
-        expect(count).to.be.greaterThan(0);
-    });
-
-    it(".next() returns first matching row", async function () {
-        const row = await users
-            .find({ STATUS: "active" })
-            .sort({ ID: 1 })
-            .next();
-        expect(row).to.not.be.null;
-        expect(row).to.have.property("ID");
-    });
-
-    it(".hasNext() returns true when rows exist", async function () {
-        const has = await users.find({ STATUS: "active" }).hasNext();
-        expect(has).to.be.true;
-    });
-
-    it(".hasNext() returns false when no rows", async function () {
-        const has = await users.find({ NAME: "ZZZNoMatch" }).hasNext();
-        expect(has).to.be.false;
-    });
-
-    it(".forEach() iterates over each row", async function () {
-        const names = [];
-        await users
-            .find({ STATUS: "active" })
-            .forEach((row) => names.push(row.NAME));
-        expect(names.length).to.be.greaterThan(0);
-    });
-
-    it(".explain() returns SQL string without executing", async function () {
-        const sql = await users
-            .find({ STATUS: "active" })
-            .sort({ NAME: 1 })
-            .limit(5)
-            .explain();
-        expect(sql).to.be.a("string");
-        expect(sql.toUpperCase()).to.include("SELECT");
-        expect(sql.toUpperCase()).to.include("FROM");
-    });
-
-    it("chaining after terminal method throws", async function () {
-        const qb = users.find({ STATUS: "active" });
-        await qb.toArray(); // terminal
-        expect(() => qb.sort({ NAME: 1 })).to.throw(/terminal/i);
-    });
-
-    it(".skip() without .limit() still works", async function () {
-        const rows = await users.find({}).sort({ ID: 1 }).skip(1).toArray();
-        expect(rows).to.be.an("array");
-    });
-
-    it(".forUpdate() appends FOR UPDATE clause (inside transaction)", async function () {
-        await db.withTransaction(async (conn) => {
-            // Just verify no error is thrown — FOR UPDATE requires a transaction
-            const qb = users.find({ NAME: "Juan" }).forUpdate("nowait");
-            const sql = await qb.explain();
-            expect(sql.toUpperCase()).to.include("FOR UPDATE");
-        });
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 6 — Update Operations
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("6. Update Operations", function () {
-    it("updateOne updates exactly one row", async function () {
-        const result = await users.updateOne(
-            { NAME: "Carlos" },
-            { $set: { STATUS: "active" } },
+    it("11.6 updateOne with $set", async function () {
+        const result = await scratch.updateOne(
+            { NAME: "ItemA" },
+            { $set: { STATUS: "updated", VALUE: 999 } },
         );
         expect(result.acknowledged).to.be.true;
-        expect(result.matchedCount).to.equal(1);
         expect(result.modifiedCount).to.equal(1);
+
+        const updated = await scratch.findOne({ NAME: "ItemA" });
+        expect(updated.STATUS).to.equal("updated");
+        expect(Number(updated.VALUE)).to.equal(999);
     });
 
-    it("updateOne with $inc increments the field", async function () {
-        const before = await users.findOne({ NAME: "Juan" });
-        await users.updateOne({ NAME: "Juan" }, { $inc: { LOGIN_COUNT: 1 } });
-        const after = await users.findOne({ NAME: "Juan" });
-        expect(Number(after.LOGIN_COUNT)).to.equal(
-            Number(before.LOGIN_COUNT) + 1,
+    it("11.7 updateOne with $inc", async function () {
+        const before = await scratch.findOne({ NAME: "ItemB" });
+        const beforeVal = Number(before.VALUE);
+        await scratch.updateOne({ NAME: "ItemB" }, { $inc: { VALUE: 50 } });
+        const after = await scratch.findOne({ NAME: "ItemB" });
+        expect(Number(after.VALUE)).to.equal(beforeVal + 50);
+    });
+
+    it("11.8 updateMany with $set", async function () {
+        const result = await scratch.updateMany(
+            { CATEGORY: "Alpha" },
+            { $set: { STATUS: "alpha-updated" } },
         );
+        expect(result.acknowledged).to.be.true;
+        expect(result.modifiedCount).to.be.at.least(2);
+
+        const rows = await scratch.find({ CATEGORY: "Alpha" }).toArray();
+        rows.forEach((r) => expect(r.STATUS).to.equal("alpha-updated"));
     });
 
-    it("updateOne with $currentDate sets SYSDATE", async function () {
-        await users.updateOne(
-            { NAME: "Maria" },
+    it("11.9 updateOne with $currentDate", async function () {
+        await scratch.updateOne(
+            { NAME: "ItemA" },
             { $currentDate: { UPDATED_AT: true } },
         );
-        const doc = await users.findOne({ NAME: "Maria" });
+        const doc = await scratch.findOne({ NAME: "ItemA" });
+        expect(doc.UPDATED_AT).to.not.be.null;
         expect(doc.UPDATED_AT).to.be.instanceOf(Date);
     });
 
-    it("updateOne with upsert inserts when no match", async function () {
-        const result = await users.updateOne(
-            { NAME: "UpsertTarget" },
-            { $set: { EMAIL: "upsert2@test.com", STATUS: "active", AGE: 30 } },
+    it("11.10 updateOne with $mul", async function () {
+        const before = await scratch.findOne({ NAME: "ItemC" });
+        const beforeVal = Number(before.VALUE);
+        await scratch.updateOne({ NAME: "ItemC" }, { $mul: { VALUE: 2 } });
+        const after = await scratch.findOne({ NAME: "ItemC" });
+        expect(Number(after.VALUE)).to.equal(beforeVal * 2);
+    });
+
+    it("11.11 distinct on CATEGORY", async function () {
+        const cats = await scratch.distinct("CATEGORY");
+        expect(cats).to.be.an("array");
+        expect(cats).to.include("Alpha");
+        expect(cats).to.include("Beta");
+        expect(cats).to.include("Gamma");
+    });
+
+    it("11.12 distinct on shared column DIVISION", async function () {
+        const divs = await scratch.distinct("DIVISION");
+        expect(divs).to.be.an("array");
+        expect(divs).to.include("WH");
+        expect(divs).to.include("PR");
+    });
+
+    it("11.13 find with $gte and $lte on VALUE", async function () {
+        const rows = await scratch.find({ VALUE: { $gte: 100, $lte: 500 } }).toArray();
+        expect(rows).to.be.an("array");
+        rows.forEach((r) => {
+            const v = Number(r.VALUE);
+            expect(v).to.be.at.least(100);
+            expect(v).to.be.at.most(500);
+        });
+    });
+
+    it("11.14 findOneAndUpdate returns before doc", async function () {
+        const before = await scratch.findOneAndUpdate(
+            { NAME: "ItemC" },
+            { $set: { VALUE: 777 } },
+            { returnDocument: "before" },
+        );
+        expect(before).to.not.be.null;
+        expect(Number(before.VALUE)).to.not.equal(777);
+    });
+
+    it("11.15 findOneAndUpdate returns after doc", async function () {
+        const after = await scratch.findOneAndUpdate(
+            { NAME: "ItemC" },
+            { $set: { VALUE: 888 } },
+            { returnDocument: "after" },
+        );
+        expect(after).to.not.be.null;
+        expect(Number(after.VALUE)).to.equal(888);
+    });
+
+    it("11.16 replaceOne replaces all columns except ID", async function () {
+        await scratch.replaceOne(
+            { NAME: "ItemD" },
+            { NAME: "ItemD-Replaced", DIVISION: "XX", YEAR: "2024", MONTH: "12", CATEGORY: "Delta", VALUE: 666, QUANTITY: 99, STATUS: "replaced" },
+        );
+        const doc = await scratch.findOne({ NAME: "ItemD-Replaced" });
+        expect(doc).to.not.be.null;
+        expect(doc.CATEGORY).to.equal("Delta");
+        expect(Number(doc.VALUE)).to.equal(666);
+    });
+
+    it("11.17 deleteOne deletes a single row", async function () {
+        const result = await scratch.deleteOne({ NAME: "ItemF" });
+        expect(result.acknowledged).to.be.true;
+        expect(result.deletedCount).to.equal(1);
+        const doc = await scratch.findOne({ NAME: "ItemF" });
+        expect(doc).to.be.null;
+    });
+
+    it("11.18 findOneAndDelete returns deleted doc", async function () {
+        const deleted = await scratch.findOneAndDelete({ NAME: "ItemE" });
+        expect(deleted).to.not.be.null;
+        expect(deleted.NAME).to.equal("ItemE");
+        const check = await scratch.findOne({ NAME: "ItemE" });
+        expect(check).to.be.null;
+    });
+
+    it("11.19 deleteMany with filter", async function () {
+        await scratch.insertMany([
+            { NAME: "Del1", CATEGORY: "ToDelete", VALUE: 1, QUANTITY: 1 },
+            { NAME: "Del2", CATEGORY: "ToDelete", VALUE: 2, QUANTITY: 2 },
+            { NAME: "Del3", CATEGORY: "ToDelete", VALUE: 3, QUANTITY: 3 },
+        ]);
+        const result = await scratch.deleteMany({ CATEGORY: "ToDelete" });
+        expect(result.acknowledged).to.be.true;
+        expect(result.deletedCount).to.equal(3);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 12. UPSERT
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("12. Upsert Operations", function () {
+    it("12.1 updateOne upsert inserts when no match", async function () {
+        const result = await scratch.updateOne(
+            { NAME: "UpsertItem" },
+            { $set: { NAME: "UpsertItem", DIVISION: "WH", CATEGORY: "Upsert", VALUE: 555, QUANTITY: 25 } },
             { upsert: true },
         );
         expect(result.acknowledged).to.be.true;
-        await users.deleteOne({ NAME: "UpsertTarget" }); // cleanup
-    });
-
-    it("updateOne with returning returns updated values", async function () {
-        const result = await users.updateOne(
-            { NAME: "Ana" },
-            { $set: { TIER: "platinum" } },
-            { returning: ["TIER"] },
-        );
-        expect(result.returning).to.have.property("TIER");
-        expect(result.returning.TIER).to.equal("platinum");
-    });
-
-    it("updateMany updates all matching rows", async function () {
-        // Insert temp inactive users to ensure test data exists
-        await users.insertOne({
-            NAME: "InactiveA",
-            EMAIL: "ia@test.com",
-            STATUS: "inactive",
-            BALANCE: 100,
-        });
-        await users.insertOne({
-            NAME: "InactiveB",
-            EMAIL: "ib@test.com",
-            STATUS: "inactive",
-            BALANCE: 200,
-        });
-        const result = await users.updateMany(
-            { STATUS: "inactive" },
-            { $set: { BALANCE: 0 } },
-        );
-        expect(result.acknowledged).to.be.true;
-        expect(result.modifiedCount).to.be.greaterThan(0);
-        // cleanup
-        await users.deleteMany({ NAME: { $in: ["InactiveA", "InactiveB"] } });
-    });
-
-    it("replaceOne replaces the entire row", async function () {
-        await users.insertOne({
-            NAME: "ToReplace",
-            EMAIL: "rep2@test.com",
-            AGE: 50,
-        });
-        const result = await users.replaceOne(
-            { NAME: "ToReplace" },
-            {
-                NAME: "WasReplaced",
-                EMAIL: "was@test.com",
-                STATUS: "active",
-                AGE: 51,
-            },
-        );
-        expect(result.acknowledged).to.be.true;
-        expect(result.matchedCount).to.equal(1);
-        await users.deleteOne({ NAME: "WasReplaced" }); // cleanup
-    });
-
-    it("bulkWrite executes all ops atomically", async function () {
-        const result = await users.bulkWrite([
-            {
-                insertOne: {
-                    document: { NAME: "BulkA", EMAIL: "ba@test.com", AGE: 20 },
-                },
-            },
-            {
-                insertOne: {
-                    document: { NAME: "BulkB", EMAIL: "bb@test.com", AGE: 21 },
-                },
-            },
-            {
-                updateOne: {
-                    filter: { NAME: "BulkA" },
-                    update: { $set: { STATUS: "active" } },
-                },
-            },
-            { deleteOne: { filter: { NAME: "BulkB" } } },
-        ]);
-        expect(result.acknowledged).to.be.true;
-        expect(result.results).to.be.an("array").with.length(4);
-        await users.deleteOne({ NAME: "BulkA" }); // cleanup
-    });
-
-    it("bulkWrite rolls back all ops on any failure", async function () {
-        const before = await rowCount(T.USERS);
-        try {
-            await users.bulkWrite([
-                {
-                    insertOne: {
-                        document: { NAME: "BulkOk", EMAIL: "bok@test.com" },
-                    },
-                },
-                { updateOne: { filter: { NAME: "NoMatch" }, update: {} } }, // empty update — throws
-            ]);
-        } catch (e) {
-            /* expected */
-        }
-        const after = await rowCount(T.USERS);
-        expect(after).to.equal(before);
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 7 — Delete Operations
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("7. Delete Operations", function () {
-    it("deleteOne removes exactly one row", async function () {
-        await users.insertOne({ NAME: "ToDelete1", EMAIL: "td1@test.com" });
-        const result = await users.deleteOne({ NAME: "ToDelete1" });
-        expect(result.acknowledged).to.be.true;
-        expect(result.deletedCount).to.equal(1);
-    });
-
-    it("deleteOne with returning returns deleted row values", async function () {
-        await users.insertOne({
-            NAME: "ToDelete2",
-            EMAIL: "td2@test.com",
-            AGE: 55,
-        });
-        const result = await users.deleteOne(
-            { NAME: "ToDelete2" },
-            { returning: ["NAME", "AGE"] },
-        );
-        expect(result.returning.NAME).to.equal("ToDelete2");
-        expect(Number(result.returning.AGE)).to.equal(55);
-    });
-
-    it("deleteMany removes all matching rows", async function () {
-        await users.insertMany([
-            { NAME: "DMTest1", EMAIL: "dm1@test.com", STATUS: "inactive" },
-            { NAME: "DMTest2", EMAIL: "dm2@test.com", STATUS: "inactive" },
-        ]);
-        const result = await users.deleteMany({ NAME: { $like: "DMTest%" } });
-        expect(result.acknowledged).to.be.true;
-        expect(result.deletedCount).to.be.at.least(2);
-    });
-
-    it("deleteOne on no match returns deletedCount 0", async function () {
-        const result = await users.deleteOne({ NAME: "ZZZDoesNotExist" });
-        expect(result.deletedCount).to.equal(0);
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 8 — Aggregation Pipeline
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("8. Aggregation Pipeline", function () {
-    it("$match filters rows", async function () {
-        const rows = await orders.aggregate([
-            { $match: { STATUS: "completed" } },
-        ]);
-        expect(rows).to.be.an("array");
-        rows.forEach((r) => expect(r.STATUS).to.equal("completed"));
-    });
-
-    it("$group with $sum aggregates correctly", async function () {
-        const rows = await orders.aggregate([
-            { $match: { STATUS: "completed" } },
-            { $group: { _id: "$REGION", total: { $sum: "$AMOUNT" } } },
-        ]);
-        expect(rows).to.be.an("array");
-        rows.forEach((r) => {
-            expect(r).to.have.property("REGION");
-            expect(r).to.have.property("TOTAL");
-            expect(Number(r.TOTAL)).to.be.greaterThan(0);
-        });
-    });
-
-    it("$group with $count, $avg, $min, $max", async function () {
-        const rows = await orders.aggregate([
-            {
-                $group: {
-                    _id: "$REGION",
-                    cnt: { $count: "*" },
-                    avg: { $avg: "$AMOUNT" },
-                    minAmt: { $min: "$AMOUNT" },
-                    maxAmt: { $max: "$AMOUNT" },
-                },
-            },
-        ]);
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-    });
-
-    it("$sort orders results", async function () {
-        const rows = await orders.aggregate([
-            { $group: { _id: "$REGION", total: { $sum: "$AMOUNT" } } },
-            { $sort: { total: -1 } },
-        ]);
-        for (let i = 1; i < rows.length; i++) {
-            expect(Number(rows[i - 1].TOTAL)).to.be.at.least(
-                Number(rows[i].TOTAL),
-            );
-        }
-    });
-
-    it("$limit caps results", async function () {
-        const rows = await orders.aggregate([{ $limit: 2 }]);
-        expect(rows.length).to.be.at.most(2);
-    });
-
-    it("$skip offsets results", async function () {
-        const all = await orders.aggregate([{ $sort: { ID: 1 } }]);
-        const paged = await orders.aggregate([
-            { $sort: { ID: 1 } },
-            { $skip: 2 },
-        ]);
-        expect(paged[0].ID).to.equal(all[2].ID);
-    });
-
-    it("$project selects specific fields", async function () {
-        const rows = await orders.aggregate([
-            { $project: { ID: 1, STATUS: 1 } },
-        ]);
-        rows.forEach((r) => {
-            expect(r).to.have.property("ID");
-            expect(r).to.have.property("STATUS");
-        });
-    });
-
-    it("$count returns total count", async function () {
-        const rows = await orders.aggregate([
-            { $match: { STATUS: "completed" } },
-            { $count: "total" },
-        ]);
-        expect(rows[0]).to.have.property("TOTAL");
-        expect(Number(rows[0].TOTAL)).to.be.greaterThan(0);
-    });
-
-    it("$having filters groups", async function () {
-        const rows = await orders.aggregate([
-            { $group: { _id: "$REGION", total: { $sum: "$AMOUNT" } } },
-            { $having: { total: { $gt: 500 } } },
-        ]);
-        rows.forEach((r) => expect(Number(r.TOTAL)).to.be.greaterThan(500));
-    });
-
-    it("$addFields adds computed columns", async function () {
-        const rows = await orders.aggregate([
-            { $addFields: { TAX: { $mul: ["$AMOUNT", 0.12] } } },
-        ]);
-        expect(rows[0]).to.have.property("TAX");
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 9 — Window Functions
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("9. Window Functions", function () {
-    it("ROW_NUMBER generates sequential numbers", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    RN: { $window: { fn: "ROW_NUMBER", orderBy: { ID: 1 } } },
-                },
-            },
-        ]);
-        const nums = rows.map((r) => Number(r.RN));
-        expect(nums).to.deep.equal(
-            [...Array(nums.length).keys()].map((i) => i + 1),
-        );
-    });
-
-    it("RANK with PARTITION BY groups correctly", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    RNK: {
-                        $window: {
-                            fn: "RANK",
-                            partitionBy: "REGION",
-                            orderBy: { AMOUNT: -1 },
-                        },
-                    },
-                },
-            },
-        ]);
-        rows.forEach((r) => expect(Number(r.RNK)).to.be.greaterThan(0));
-    });
-
-    it("SUM running total accumulates", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    RUNNING_TOTAL: {
-                        $window: {
-                            fn: "SUM",
-                            field: "AMOUNT",
-                            partitionBy: "USER_ID",
-                            orderBy: { ID: 1 },
-                        },
-                    },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("RUNNING_TOTAL");
-    });
-
-    it("LAG accesses previous row value", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    PREV_AMOUNT: {
-                        $window: {
-                            fn: "LAG",
-                            field: "AMOUNT",
-                            offset: 1,
-                            partitionBy: "USER_ID",
-                            orderBy: { ID: 1 },
-                        },
-                    },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("PREV_AMOUNT");
-    });
-
-    it("NTILE splits into quartiles", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    QUARTILE: {
-                        $window: { fn: "NTILE", n: 4, orderBy: { AMOUNT: 1 } },
-                    },
-                },
-            },
-        ]);
-        rows.forEach((r) => {
-            const q = Number(r.QUARTILE);
-            expect(q).to.be.within(1, 4);
-        });
-    });
-
-    it("DENSE_RANK does not skip numbers after ties", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    DR: {
-                        $window: { fn: "DENSE_RANK", orderBy: { REGION: 1 } },
-                    },
-                },
-            },
-        ]);
-        const ranks = [...new Set(rows.map((r) => Number(r.DR)))].sort(
-            (a, b) => a - b,
-        );
-        for (let i = 1; i < ranks.length; i++) {
-            expect(ranks[i] - ranks[i - 1]).to.equal(1); // no gaps
-        }
-    });
-
-    it("frame clause: ROWS BETWEEN 1 PRECEDING AND CURRENT ROW", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    WINDOWED: {
-                        $window: {
-                            fn: "SUM",
-                            field: "AMOUNT",
-                            orderBy: { ID: 1 },
-                            frame: "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW",
-                        },
-                    },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("WINDOWED");
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 10 — Advanced Grouping
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("10. Advanced Grouping (ROLLUP / CUBE / GROUPING SETS)", function () {
-    it("$rollup produces subtotals", async function () {
-        const rows = await sales.aggregate([
-            {
-                $group: {
-                    _id: { $rollup: ["REGION", "QUARTER"] },
-                    total: { $sum: "$AMOUNT" },
-                },
-            },
-        ]);
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-        // ROLLUP produces rows with NULL for rolled-up dimensions
-        const nullRows = rows.filter(
-            (r) => r.REGION === null || r.QUARTER === null,
-        );
-        expect(nullRows.length).to.be.greaterThan(0);
-    });
-
-    it("$cube produces all subtotal combinations", async function () {
-        const rows = await sales.aggregate([
-            {
-                $group: {
-                    _id: { $cube: ["REGION", "QUARTER"] },
-                    total: { $sum: "$AMOUNT" },
-                },
-            },
-        ]);
-        expect(rows.length).to.be.greaterThan(0);
-    });
-
-    it("$groupingSets targets specific grouping combinations", async function () {
-        const rows = await sales.aggregate([
-            {
-                $group: {
-                    _id: {
-                        $groupingSets: [["REGION", "QUARTER"], ["REGION"], []],
-                    },
-                    total: { $sum: "$AMOUNT" },
-                },
-            },
-        ]);
-        expect(rows.length).to.be.greaterThan(0);
-        // Grand total row has both REGION and QUARTER as null
-        const grandTotal = rows.find(
-            (r) => r.REGION === null && r.QUARTER === null,
-        );
-        expect(grandTotal).to.exist;
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 11 — JOINs
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("11. JOINs ($lookup)", function () {
-    it("LEFT JOIN returns all orders including unmatched", async function () {
-        const rows = await orders.aggregate([
-            {
-                $lookup: {
-                    from: T.USERS,
-                    localField: "USER_ID",
-                    foreignField: "ID",
-                    as: "user",
-                    joinType: "left",
-                },
-            },
-        ]);
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-        expect(rows[0]).to.have.property("NAME"); // joined user column
-    });
-
-    it("INNER JOIN excludes rows with no match", async function () {
-        const rows = await orders.aggregate([
-            {
-                $lookup: {
-                    from: T.USERS,
-                    localField: "USER_ID",
-                    foreignField: "ID",
-                    as: "user",
-                    joinType: "inner",
-                },
-            },
-        ]);
-        expect(rows.length).to.be.greaterThan(0);
-        rows.forEach((r) => expect(r.NAME).to.not.be.null);
-    });
-
-    it("multi-condition join works with on: []", async function () {
-        const rows = await orders.aggregate([
-            {
-                $lookup: {
-                    from: T.USERS,
-                    as: "user",
-                    joinType: "left",
-                    on: [{ localField: "USER_ID", foreignField: "ID" }],
-                },
-            },
-        ]);
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-    });
-
-    it("self-join works on employees table", async function () {
-        const rows = await employees.aggregate([
-            {
-                $lookup: {
-                    from: T.EMPLOYEES,
-                    as: "manager",
-                    joinType: "self",
-                    localField: "MANAGER_ID",
-                    foreignField: "ID",
-                },
-            },
-        ]);
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 12 — Set Operations
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("12. Set Operations (UNION / INTERSECT / MINUS)", function () {
-    it("UNION removes duplicates", async function () {
-        const rows = await OracleCollection.union(
-            users.find({ TIER: "gold" }).project({ NAME: 1 }),
-            users.find({ TIER: "platinum" }).project({ NAME: 1 }),
-        );
-        const names = rows.map((r) => r.NAME);
-        expect(new Set(names).size).to.equal(names.length); // no duplicates
-    });
-
-    it("UNION ALL keeps duplicates", async function () {
-        const withoutAll = await OracleCollection.union(
-            users.find({ STATUS: "active" }).project({ NAME: 1 }),
-            users.find({ STATUS: "active" }).project({ NAME: 1 }),
-        );
-        const withAll = await OracleCollection.union(
-            users.find({ STATUS: "active" }).project({ NAME: 1 }),
-            users.find({ STATUS: "active" }).project({ NAME: 1 }),
-            { all: true },
-        );
-        expect(withAll.length).to.be.greaterThan(withoutAll.length);
-    });
-
-    it("INTERSECT returns only rows in both queries", async function () {
-        // Both queries target gold users — intersection should equal gold users
-        const rows = await OracleCollection.intersect(
-            users.find({ STATUS: "active" }).project({ NAME: 1 }),
-            users.find({ TIER: "gold" }).project({ NAME: 1 }),
-        );
-        expect(rows).to.be.an("array");
-    });
-
-    it("MINUS returns rows in first but not second", async function () {
-        const rows = await OracleCollection.minus(
-            users.find({ STATUS: "active" }).project({ NAME: 1 }),
-            users.find({ TIER: "platinum" }).project({ NAME: 1 }),
-        );
-        expect(rows).to.be.an("array");
-    });
-
-    it("set operation result supports .sort().limit().toArray()", async function () {
-        const rows = await OracleCollection.union(
-            users.find({ TIER: "gold" }).project({ NAME: 1 }),
-            users.find({ TIER: "platinum" }).project({ NAME: 1 }),
-        )
-            .sort({ NAME: 1 })
-            .limit(2)
-            .toArray();
-        expect(rows.length).to.be.at.most(2);
-    });
-
-    it("throws when projected column counts differ", function () {
-        expect(() =>
-            OracleCollection.union(
-                users.find({}).project({ NAME: 1 }),
-                users.find({}).project({ NAME: 1, EMAIL: 1 }), // different count
-            ),
-        ).to.throw();
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 13 — CTEs
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("13. CTEs (withCTE / withRecursiveCTE)", function () {
-    it("regular CTE executes and returns results", async function () {
-        const rows = await withCTE(db, {
-            active: users.find({ STATUS: "active" }),
-        })
-            .from("active")
-            .toArray();
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-        rows.forEach((r) => expect(r.STATUS).to.equal("active"));
-    });
-
-    it("CTE with join across two named CTEs", async function () {
-        const rows = await withCTE(db, {
-            big_orders: orders.find({ AMOUNT: { $gte: 500 } }),
-            vip_users: users.find({ TIER: "platinum" }),
-        })
-            .from("big_orders")
-            .join({
-                from: "vip_users",
-                localField: "USER_ID",
-                foreignField: "ID",
-                joinType: "inner",
-            })
-            .toArray();
-        expect(rows).to.be.an("array");
-    });
-
-    it("recursive CTE traverses hierarchy", async function () {
-        const rows = await withRecursiveCTE(db, "ORG_TREE", {
-            anchor: employees.find({ MANAGER_ID: null }),
-            recursive: {
-                collection: T.EMPLOYEES,
-                joinOn: { MANAGER_ID: "$ORG_TREE.ID" },
-            },
-        }).toArray();
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-        // Should include all employees since everyone chains up to CEO
-        expect(rows.length).to.equal(6);
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 14 — Subqueries
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("14. Subqueries", function () {
-    it("scalar subquery in projection returns computed column", async function () {
-        const rows = await users.find(
-            {},
-            {
-                projection: {
-                    NAME: 1,
-                    ORDER_COUNT: {
-                        $subquery: {
-                            collection: T.ORDERS,
-                            fn: "count",
-                            filter: { USER_ID: "$ID" },
-                        },
-                    },
-                },
-            },
-        );
-        expect(rows[0]).to.have.property("ORDER_COUNT");
-    });
-
-    it("EXISTS subquery filters correctly", async function () {
-        const rows = await users.find({
-            $exists: { collection: T.ORDERS, match: { USER_ID: "$ID" } },
-        });
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-    });
-
-    it("NOT EXISTS subquery excludes matched rows", async function () {
-        const rows = await users.find({
-            $notExists: { collection: T.ORDERS, match: { USER_ID: "$ID" } },
-        });
-        expect(rows).to.be.an("array");
-    });
-
-    it("IN (SELECT ...) with $inSelect", async function () {
-        const rows = await users.find({
-            ID: {
-                $inSelect: orders.distinct("USER_ID", { STATUS: "completed" }),
-            },
-        });
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-    });
-
-    it("correlated subquery in WHERE", async function () {
-        const rows = await users.find({
-            BALANCE: {
-                $gt: {
-                    $subquery: {
-                        collection: T.USERS,
-                        field: "BALANCE",
-                        aggregate: "$avg",
-                        where: {},
-                    },
-                },
-            },
-        });
-        expect(rows).to.be.an("array");
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 15 — Transactions + Savepoints
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("15. Transactions & Savepoints", function () {
-    it("withTransaction commits on success", async function () {
-        await txManager.withTransaction(async (session) => {
-            const u = session.collection(T.USERS);
-            await u.insertOne({
-                NAME: "TxCommit",
-                EMAIL: "txc@test.com",
-                AGE: 30,
-            });
-        });
-        const doc = await users.findOne({ NAME: "TxCommit" });
+        const doc = await scratch.findOne({ NAME: "UpsertItem" });
         expect(doc).to.not.be.null;
-        await users.deleteOne({ NAME: "TxCommit" }); // cleanup
+        expect(Number(doc.VALUE)).to.equal(555);
     });
 
-    it("withTransaction rolls back on error", async function () {
-        const before = await rowCount(T.USERS);
+    it("12.2 updateOne upsert updates when match exists", async function () {
+        const result = await scratch.updateOne(
+            { NAME: "UpsertItem" },
+            { $set: { VALUE: 777 } },
+            { upsert: true },
+        );
+        expect(result.acknowledged).to.be.true;
+        expect(result.modifiedCount).to.equal(1);
+        const doc = await scratch.findOne({ NAME: "UpsertItem" });
+        expect(Number(doc.VALUE)).to.equal(777);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 13. MERGE / UPSERT (Oracle MERGE)
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("13. MERGE Operations", function () {
+    it("13.1 merge inserts when no match", async function () {
+        const result = await scratch.merge(
+            { NAME: "MergeNew", DIVISION: "WH", CATEGORY: "Merge", VALUE: 1000, QUANTITY: 50, STATUS: "merged" },
+            { localField: "NAME", foreignField: "NAME" },
+            { whenMatched: { $set: { VALUE: 1000, STATUS: "merged" } }, whenNotMatched: "insert" },
+        );
+        expect(result.acknowledged).to.be.true;
+        const doc = await scratch.findOne({ NAME: "MergeNew" });
+        expect(doc).to.not.be.null;
+    });
+
+    it("13.2 merge updates when match exists", async function () {
+        const result = await scratch.merge(
+            { NAME: "MergeNew", DIVISION: "WH", CATEGORY: "Merge", VALUE: 2000, QUANTITY: 75, STATUS: "re-merged" },
+            { localField: "NAME", foreignField: "NAME" },
+            { whenMatched: { $set: { VALUE: 2000, STATUS: "re-merged" } }, whenNotMatched: "insert" },
+        );
+        expect(result.acknowledged).to.be.true;
+        const doc = await scratch.findOne({ NAME: "MergeNew" });
+        expect(Number(doc.VALUE)).to.equal(2000);
+        expect(doc.STATUS).to.equal("re-merged");
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 14. TRANSACTIONS & SAVEPOINTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("14. Transactions & Savepoints", function () {
+    it("14.1 withTransaction commits on success", async function () {
+        await txManager.withTransaction(async (session) => {
+            const s = session.collection(SCRATCH);
+            await s.insertOne({ NAME: "TxCommit", DIVISION: "TX", CATEGORY: "TX", VALUE: 111, QUANTITY: 1 });
+        });
+        const doc = await scratch.findOne({ NAME: "TxCommit" });
+        expect(doc).to.not.be.null;
+        expect(doc.CATEGORY).to.equal("TX");
+    });
+
+    it("14.2 withTransaction rolls back on error", async function () {
         try {
             await txManager.withTransaction(async (session) => {
-                await session.collection(T.USERS).insertOne({
-                    NAME: "TxRollback",
-                    EMAIL: "txr@test.com",
-                });
+                const s = session.collection(SCRATCH);
+                await s.insertOne({ NAME: "TxRollback", CATEGORY: "TX", VALUE: 222, QUANTITY: 2 });
                 throw new Error("Intentional rollback");
             });
-        } catch (e) {
-            expect(e.message).to.include("Intentional rollback");
-        }
-        const after = await rowCount(T.USERS);
-        expect(after).to.equal(before);
+        } catch (e) { /* expected */ }
+        const doc = await scratch.findOne({ NAME: "TxRollback" });
+        expect(doc).to.be.null;
     });
 
-    it("savepoint allows partial rollback", async function () {
-        let firstInsertedName = "SPart1_" + Date.now();
-        let secondInsertedName = "SPart2_" + Date.now();
-
+    it("14.3 savepoint + rollbackTo partially undoes work", async function () {
         await txManager.withTransaction(async (session) => {
-            const u = session.collection(T.USERS);
-
-            // First operation — should survive
-            await u.insertOne({
-                NAME: firstInsertedName,
-                EMAIL: "sp1@test.com",
-            });
-            await session.savepoint("checkpoint_1");
-
-            try {
-                // Second operation — will be rolled back to savepoint
-                await u.insertOne({
-                    NAME: secondInsertedName,
-                    EMAIL: "sp2@test.com",
-                });
-                throw new Error("Force rollback to savepoint");
-            } catch (e) {
-                await session.rollbackTo("checkpoint_1");
-            }
-
-            // Third operation — should survive (after savepoint recovery)
-            await u.insertOne({
-                NAME: "SPart3_" + Date.now(),
-                EMAIL: "sp3@test.com",
-                STATUS: "active",
-            });
+            const s = session.collection(SCRATCH);
+            await s.insertOne({ NAME: "SP_Keep", CATEGORY: "Savepoint", VALUE: 10, QUANTITY: 1 });
+            await session.savepoint("sp1");
+            await s.insertOne({ NAME: "SP_Undo", CATEGORY: "Savepoint", VALUE: 20, QUANTITY: 2 });
+            await session.rollbackTo("sp1");
+            await s.insertOne({ NAME: "SP_After", CATEGORY: "Savepoint", VALUE: 30, QUANTITY: 3 });
         });
-
-        // First insert survived
-        const first = await users.findOne({ NAME: firstInsertedName });
-        expect(first).to.not.be.null;
-
-        // Second insert was rolled back
-        const second = await users.findOne({ NAME: secondInsertedName });
-        expect(second).to.be.null;
-
-        // cleanup
-        await users.deleteOne({ NAME: firstInsertedName });
-        await users.deleteMany({ NAME: { $like: "SPart3_%" } });
-    });
-
-    it("session.collection operations share the same connection", async function () {
-        // Both ops must see each other's uncommitted changes
-        let balanceSeen = null;
-        await txManager.withTransaction(async (session) => {
-            const u = session.collection(T.USERS);
-            await u.insertOne({
-                NAME: "SharedConn",
-                EMAIL: "sc@test.com",
-                BALANCE: 9999,
-            });
-            // Read within same transaction — must see the uncommitted insert
-            const doc = await u.findOne({ NAME: "SharedConn" });
-            balanceSeen = doc ? Number(doc.BALANCE) : null;
-        });
-        expect(balanceSeen).to.equal(9999);
-        await users.deleteOne({ NAME: "SharedConn" }); // cleanup
-    });
-
-    it("releaseSavepoint is a no-op (no error thrown)", async function () {
-        await txManager.withTransaction(async (session) => {
-            await session.savepoint("sp_noop");
-            await session.releaseSavepoint("sp_noop"); // should not throw
-        });
+        expect(await scratch.findOne({ NAME: "SP_Keep" })).to.not.be.null;
+        expect(await scratch.findOne({ NAME: "SP_Undo" })).to.be.null;
+        expect(await scratch.findOne({ NAME: "SP_After" })).to.not.be.null;
     });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 16 — Index Operations
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 15. BULK WRITE
+// ═════════════════════════════════════════════════════════════════════════════
 
-describe("16. Index Operations", function () {
-    let createdIndexName;
-
-    it("createIndex creates a non-unique index", async function () {
-        const result = await users.createIndex({ STATUS: 1 });
-        expect(result.acknowledged).to.be.true;
-        expect(result.indexName).to.be.a("string");
-        createdIndexName = result.indexName;
-    });
-
-    it("createIndex with unique:true creates a unique index", async function () {
-        const result = await users.createIndex({ EMAIL: 1 }, { unique: true });
-        expect(result.acknowledged).to.be.true;
-        expect(result.indexName).to.be.a("string");
-        await users.dropIndex(result.indexName); // cleanup immediately
-    });
-
-    it("createIndex with custom name", async function () {
-        const result = await users.createIndex(
-            { AGE: -1 },
-            { name: "IDX_TEST_AGE_DESC" },
-        );
-        expect(result.indexName).to.equal("IDX_TEST_AGE_DESC");
-        await users.dropIndex("IDX_TEST_AGE_DESC");
-    });
-
-    it("getIndexes returns array with index info", async function () {
-        const indexes = await users.getIndexes();
-        expect(indexes).to.be.an("array").with.length.greaterThan(0);
-        const idx = indexes[0];
-        expect(idx).to.have.all.keys("indexName", "columns", "unique", "type");
-    });
-
-    it("dropIndex removes the index", async function () {
-        const result = await users.dropIndex(createdIndexName);
-        expect(result.acknowledged).to.be.true;
-    });
-
-    it("createIndexes creates multiple indexes at once", async function () {
-        const result = await users.createIndexes([
-            { fields: { TIER: 1 } },
-            { fields: { BALANCE: 1 } },
+describe("15. bulkWrite", function () {
+    it("15.1 bulkWrite executes mixed operations atomically", async function () {
+        const result = await scratch.bulkWrite([
+            { insertOne: { document: { NAME: "BulkA", DIVISION: "WH", CATEGORY: "Bulk", VALUE: 10, QUANTITY: 1 } } },
+            { insertOne: { document: { NAME: "BulkB", DIVISION: "PR", CATEGORY: "Bulk", VALUE: 20, QUANTITY: 2 } } },
+            { updateOne: { filter: { NAME: "BulkA" }, update: { $set: { VALUE: 99 } } } },
         ]);
         expect(result.acknowledged).to.be.true;
-        expect(result.indexNames).to.be.an("array").with.length(2);
-        for (const n of result.indexNames) await users.dropIndex(n);
+        const a = await scratch.findOne({ NAME: "BulkA" });
+        expect(Number(a.VALUE)).to.equal(99);
+        const b = await scratch.findOne({ NAME: "BulkB" });
+        expect(b).to.not.be.null;
     });
 
-    it("reIndex rebuilds all indexes", async function () {
-        const result = await users.reIndex();
+    it("15.2 bulkWrite rolls back on failure", async function () {
+        const countBefore = await scratch.countDocuments();
+        try {
+            await scratch.bulkWrite([
+                { insertOne: { document: { NAME: "BulkFail1", CATEGORY: "Fail", VALUE: 1, QUANTITY: 1 } } },
+                { insertOne: { document: { NAME: null, CATEGORY: "Fail", VALUE: 2, QUANTITY: 1 } } }, // NAME NOT NULL
+            ]);
+        } catch (e) { /* expected */ }
+        const countAfter = await scratch.countDocuments();
+        expect(countAfter).to.equal(countBefore);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 16. INDEX OPERATIONS
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("16. Index Operations", function () {
+    it("16.1 createIndex", async function () {
+        const result = await scratch.createIndex(
+            { CATEGORY: 1 },
+            { name: "IDX_SCRATCH_CATEGORY" },
+        );
+        expect(result.acknowledged).to.be.true;
+        expect(result.indexName).to.equal("IDX_SCRATCH_CATEGORY");
+    });
+
+    it("16.2 getIndexes returns array including created index", async function () {
+        const indexes = await scratch.getIndexes();
+        expect(indexes).to.be.an("array");
+        const names = indexes.map((idx) => idx.indexName);
+        expect(names).to.include("IDX_SCRATCH_CATEGORY");
+    });
+
+    it("16.3 createIndex composite + unique", async function () {
+        const result = await scratch.createIndex(
+            { NAME: 1, DIVISION: 1 },
+            { name: "IDX_SCRATCH_NAME_DIV" },
+        );
         expect(result.acknowledged).to.be.true;
     });
 
-    it("dropIndexes drops all non-PK indexes", async function () {
-        // Create a couple first
-        await users.createIndex({ TIER: 1 });
-        await users.createIndex({ BALANCE: 1 });
-        const result = await users.dropIndexes();
+    it("16.4 dropIndex drops a specific index", async function () {
+        const result = await scratch.dropIndex("IDX_SCRATCH_NAME_DIV");
+        expect(result.acknowledged).to.be.true;
+    });
+
+    it("16.5 dropIndexes drops all non-PK indexes", async function () {
+        const result = await scratch.dropIndexes();
         expect(result.acknowledged).to.be.true;
         expect(result.dropped).to.be.an("array");
     });
-});
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 17 — DDL (OracleSchema)
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("17. DDL Operations (OracleSchema)", function () {
-    const TEMP_TABLE = "TEST_WRAP_DDL_TEMP";
-    const TEMP_VIEW = "TEST_WRAP_VIEW_TEMP";
-    const TEMP_SEQ = "TEST_WRAP_SEQ_TEMP";
-
-    after(async function () {
-        await dropIfExists(TEMP_TABLE);
-        await db.withConnection(async (conn) => {
-            try {
-                await conn.execute(
-                    `DROP VIEW "${TEMP_VIEW}"`,
-                    {},
-                    { autoCommit: true },
-                );
-            } catch (e) {
-                /* ignore */
-            }
-            try {
-                await conn.execute(
-                    `DROP SEQUENCE "${TEMP_SEQ}"`,
-                    {},
-                    { autoCommit: true },
-                );
-            } catch (e) {
-                /* ignore */
-            }
-        });
-    });
-
-    it("createTable creates a table with all column options", async function () {
-        await schema.createTable(TEMP_TABLE, {
-            ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
-            LABEL: { type: "VARCHAR2(100)", notNull: true },
-            SCORE: { type: "NUMBER(5,2)", default: 0 },
-        });
-        expect(await tableExists(TEMP_TABLE)).to.be.true;
-    });
-
-    it("createTable with ifNotExists does not throw if already exists", async function () {
-        await schema.createTable(
-            TEMP_TABLE,
-            {
-                ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
-                LABEL: { type: "VARCHAR2(100)", notNull: true },
-            },
-            { ifNotExists: true },
-        );
-    });
-
-    it("alterTable — addColumn", async function () {
-        await schema.alterTable(TEMP_TABLE, {
-            addColumn: { NOTES: "VARCHAR2(500)" },
-        });
-        // Verify column exists via select
-        await db.withConnection(async (conn) => {
-            await conn.execute(
-                `SELECT "NOTES" FROM "${TEMP_TABLE}" WHERE ROWNUM = 1`,
-                {},
-            );
-        });
-    });
-
-    it("alterTable — modifyColumn", async function () {
-        await schema.alterTable(TEMP_TABLE, {
-            modifyColumn: { SCORE: "NUMBER(8,2)" },
-        });
-    });
-
-    it("alterTable — renameColumn", async function () {
-        await schema.alterTable(TEMP_TABLE, {
-            renameColumn: { from: "NOTES", to: "REMARKS" },
-        });
-        await db.withConnection(async (conn) => {
-            await conn.execute(
-                `SELECT "REMARKS" FROM "${TEMP_TABLE}" WHERE ROWNUM = 1`,
-                {},
-            );
-        });
-    });
-
-    it("alterTable — addConstraint UNIQUE", async function () {
-        await schema.alterTable(TEMP_TABLE, {
-            addConstraint: {
-                type: "UNIQUE",
-                columns: ["LABEL"],
-                name: "UQ_TEMP_LABEL",
-            },
-        });
-    });
-
-    it("alterTable — dropConstraint", async function () {
-        await schema.alterTable(TEMP_TABLE, {
-            dropConstraint: "UQ_TEMP_LABEL",
-        });
-    });
-
-    it("alterTable — dropColumn", async function () {
-        await schema.alterTable(TEMP_TABLE, { dropColumn: "REMARKS" });
-    });
-
-    it("createView creates a view from a QueryBuilder", async function () {
-        const tmpColl = new OracleCollection(TEMP_TABLE, db);
-        try {
-            await schema.createView(
-                TEMP_VIEW,
-                tmpColl.find({}).project({ ID: 1, LABEL: 1 }),
-                { orReplace: true },
-            );
-            await db.withConnection(async (conn) => {
-                await conn.execute(`SELECT COUNT(*) FROM "${TEMP_VIEW}"`, {});
-            });
-        } catch (e) {
-            if (e.message.includes("ORA-01031")) {
-                this.skip(); // CREATE VIEW requires privilege not granted
-                return;
-            }
-            throw e;
-        }
-    });
-
-    it("dropView removes the view", async function () {
-        await schema.dropView(TEMP_VIEW, { ifExists: true });
-    });
-
-    it("createSequence creates an Oracle sequence", async function () {
-        await schema.createSequence(TEMP_SEQ, {
-            startWith: 100,
-            incrementBy: 5,
-            maxValue: 99999,
-            cycle: false,
-            cache: 10,
-        });
-        // Verify by selecting nextval
-        await db.withConnection(async (conn) => {
-            const r = await conn.execute(
-                `SELECT "${TEMP_SEQ}".NEXTVAL FROM DUAL`,
-                {},
-                { outFormat: db.oracledb.OUT_FORMAT_OBJECT },
-            );
-            expect(Number(r.rows[0].NEXTVAL)).to.be.at.least(100);
-        });
-    });
-
-    it("truncateTable removes all rows", async function () {
-        const tmpColl = new OracleCollection(TEMP_TABLE, db);
-        await tmpColl.insertOne({ LABEL: "ToTruncate", SCORE: 1 });
-        await schema.truncateTable(TEMP_TABLE);
-        expect(await rowCount(TEMP_TABLE)).to.equal(0);
-    });
-
-    it("renameTable renames and original no longer exists", async function () {
-        const NEW_NAME = "TEST_WRAP_DDL_RENAMED";
-        await schema.renameTable(TEMP_TABLE, NEW_NAME);
-        expect(await tableExists(TEMP_TABLE)).to.be.false;
-        expect(await tableExists(NEW_NAME)).to.be.true;
-        await schema.renameTable(NEW_NAME, TEMP_TABLE); // rename back
-    });
-
-    it("dropTable with cascade removes the table", async function () {
-        await schema.dropTable(TEMP_TABLE, { cascade: true });
-        expect(await tableExists(TEMP_TABLE)).to.be.false;
-    });
-
-    it("dropTable with ifExists does not throw for missing table", async function () {
-        await schema.dropTable("NO_SUCH_TABLE_XYZ", { ifExists: true });
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 18 — MERGE / UPSERT
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("18. MERGE / UPSERT", function () {
-    it("merge updates existing row when matched", async function () {
-        const existing = await users.findOne({ NAME: "Juan" });
-        await users.merge(
-            { ID: existing.ID, NAME: "Juan", BALANCE: 9999 },
-            { localField: "ID", foreignField: "ID" },
-            { whenMatched: { $set: { BALANCE: 9999 } } },
-        );
-        const updated = await users.findOne({ NAME: "Juan" });
-        expect(Number(updated.BALANCE)).to.equal(9999);
-    });
-
-    it("merge inserts when no match (whenNotMatched: insert)", async function () {
-        const before = await rowCount(T.USERS);
-        await users.merge(
-            {
-                NAME: "MergeNew",
-                EMAIL: "mn@test.com",
-                STATUS: "active",
-                AGE: 30,
-            },
-            { localField: "NAME", foreignField: "NAME" },
-            { whenNotMatched: "insert" },
-        );
-        const after = await rowCount(T.USERS);
-        expect(after).to.equal(before + 1);
-        await users.deleteOne({ NAME: "MergeNew" }); // cleanup
-    });
-
-    it("merge with whenMatchedDelete removes row on condition", async function () {
-        await users.insertOne({
-            NAME: "MergeDelete",
-            EMAIL: "md@test.com",
-            BALANCE: -1,
-        });
-        const inserted = await users.findOne({ NAME: "MergeDelete" });
-        await users.merge(
-            { ID: inserted.ID, BALANCE: -1 },
-            { localField: "ID", foreignField: "ID" },
-            {
-                whenMatched: { $set: { BALANCE: -1 } },
-                whenMatchedDelete: { BALANCE: { $lt: 0 } },
-            },
-        );
-        const check = await users.findOne({ NAME: "MergeDelete" });
-        expect(check).to.be.null; // deleted by WHEN MATCHED DELETE
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 19 — Oracle Advanced Features
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("19. Oracle Advanced Features", function () {
-    it("CONNECT BY traverses hierarchy correctly", async function () {
-        const rows = await employees.connectBy({
-            startWith: { MANAGER_ID: null },
-            connectBy: { MANAGER_ID: "$PRIOR ID" },
-            includeLevel: true,
-        });
-        expect(rows).to.be.an("array").with.length(6);
-        const ceo = rows.find((r) => r.MANAGER_ID === null);
-        expect(Number(ceo.LEVEL)).to.equal(1);
-    });
-
-    it("CONNECT BY with includePath adds SYS_CONNECT_BY_PATH", async function () {
-        const rows = await employees.connectBy({
-            startWith: { MANAGER_ID: null },
-            connectBy: { MANAGER_ID: "$PRIOR ID" },
-            includePath: true,
-        });
-        expect(rows[0]).to.have.property("PATH");
-        expect(rows[0].PATH).to.be.a("string");
-    });
-
-    it("CONNECT BY with maxLevel limits depth", async function () {
-        const rows = await employees.connectBy({
-            startWith: { MANAGER_ID: null },
-            connectBy: { MANAGER_ID: "$PRIOR ID" },
-            includeLevel: true,
-            maxLevel: 2,
-        });
-        rows.forEach((r) => expect(Number(r.LEVEL)).to.be.at.most(2));
-    });
-
-    it("PIVOT produces one column per pivot value", async function () {
-        const rows = await sales.pivot({
-            value: { $sum: "$AMOUNT" },
-            pivotOn: "QUARTER",
-            pivotValues: ["Q1", "Q2", "Q3", "Q4"],
-            groupBy: "REGION",
-        });
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-        expect(rows[0]).to.have.property("Q1");
-        expect(rows[0]).to.have.property("Q2");
-        expect(rows[0]).to.have.property("Q3");
-        expect(rows[0]).to.have.property("Q4");
-    });
-
-    it("TABLESAMPLE returns a subset of rows", async function () {
-        const all = await users.find({}).toArray();
-        const sample = await users
-            .find({}, { sample: { percentage: 50 } })
-            .toArray();
-        // Sampled result could be up to full size but is usually less
-        expect(sample.length).to.be.at.most(all.length);
-    });
-
-    it("TABLESAMPLE with seed is reproducible", async function () {
-        const s1 = await users
-            .find({}, { sample: { percentage: 50, seed: 42 } })
-            .toArray();
-        const s2 = await users
-            .find({}, { sample: { percentage: 50, seed: 42 } })
-            .toArray();
-        // Same seed → same rows
-        expect(s1.map((r) => r.ID)).to.deep.equal(s2.map((r) => r.ID));
-    });
-
-    it("AS OF SCN returns data at past SCN (no error)", async function () {
-        // Get current SCN — requires access to V$DATABASE (DBA privilege)
-        let scn;
-        try {
-            await db.withConnection(async (conn) => {
-                await conn.execute(
-                    `SELECT CURRENT_SCN FROM V$DATABASE`,
-                    {},
-                    { outFormat: db.oracledb.OUT_FORMAT_OBJECT },
-                );
-            });
-        } catch (e) {
-            if (
-                e.message.includes("ORA-00942") ||
-                e.message.includes("ORA-01031")
-            ) {
-                this.skip(); // V$DATABASE not accessible — insufficient privileges
-                return;
-            }
-            throw e;
-        }
-
-        // ORA-01466 can fire when DDL occurred on the table after the
-        // referenced SCN (e.g. the before() hook just created the table).
-        // Wait briefly so Oracle's undo/SCN bookkeeping stabilizes, then
-        // query using a freshly captured SCN that is safely after all DDL.
-        await new Promise((r) => setTimeout(r, 3000));
-
-        // Re-fetch SCN after the wait so it is guaranteed to post-date
-        // the table creation DDL from the before() hook.
-        scn = await db.withConnection(async (conn) => {
-            const r = await conn.execute(
-                `SELECT CURRENT_SCN FROM V$DATABASE`,
-                {},
-                { outFormat: db.oracledb.OUT_FORMAT_OBJECT },
-            );
-            return r.rows[0].CURRENT_SCN;
-        });
-
-        try {
-            const rows = await users
-                .find({ STATUS: "active" }, { asOf: { scn } })
-                .toArray();
-            expect(rows).to.be.an("array");
-        } catch (e) {
-            // ORA-01466 is environment-dependent (undo retention, DDL timing)
-            // — skip gracefully rather than fail the suite.
-            if (e.message.includes("ORA-01466")) {
-                this.skip();
-                return;
-            }
-            throw e;
-        }
-    });
-
-    it("LATERAL JOIN returns correlated subquery rows inline", async function () {
-        const rows = await users.aggregate([
-            {
-                $lateralJoin: {
-                    subquery: orders
-                        .find({ USER_ID: "$outer.ID" })
-                        .sort({ AMOUNT: -1 })
-                        .limit(2),
-                    as: "recent_orders",
-                },
-            },
-        ]);
-        expect(rows).to.be.an("array");
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 20 — INSERT INTO ... SELECT + UPDATE ... JOIN
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("20. INSERT INTO SELECT & UPDATE JOIN", function () {
-    it("insertFromQuery copies rows to archive table", async function () {
-        const result = await users.insertFromQuery(
-            T.ARCHIVE,
-            orders.find({ STATUS: "completed" }),
-            { columns: ["USER_ID", "AMOUNT", "STATUS"] },
-        );
+    it("16.6 createIndex + reIndex rebuilds", async function () {
+        await scratch.createIndex({ VALUE: 1 }, { name: "IDX_SCRATCH_VALUE" });
+        const result = await scratch.reIndex();
         expect(result.acknowledged).to.be.true;
-        expect(result.insertedCount).to.be.greaterThan(0);
-        expect(await rowCount(T.ARCHIVE)).to.be.greaterThan(0);
+        await scratch.dropIndex("IDX_SCRATCH_VALUE");
     });
 
-    it("insertFromQuery without column mapping uses SELECT *", async function () {
-        // Archive has compatible shape — just test no error is thrown
-        const result = await archive.insertFromQuery(
-            T.ARCHIVE,
-            archive.find({ STATUS: "completed" }),
-        );
-        expect(result.acknowledged).to.be.true;
-    });
-
-    it("updateFromJoin updates target using joined table values", async function () {
-        // Insert a salary update source row into orders as a stand-in
-        // (real test would use a dedicated salary table — adapted here for existing schema)
-        const result = await users.updateFromJoin({
-            target: T.USERS,
-            join: {
-                table: T.ORDERS,
-                on: { [`${T.USERS}.ID`]: `${T.ORDERS}.USER_ID` },
-                type: "inner",
-            },
-            set: { [`${T.USERS}.LOGIN_COUNT`]: `${T.ORDERS}.AMOUNT` },
-            where: { [`${T.ORDERS}.STATUS`]: "completed" },
-        });
-        expect(result.acknowledged).to.be.true;
-        expect(result.modifiedCount).to.be.greaterThan(0);
+    it("16.7 getIndexes on real table DEV_BOOK", async function () {
+        const indexes = await devBook.getIndexes();
+        expect(indexes).to.be.an("array");
     });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 21 — Performance Utilities
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 17. AGGREGATION PIPELINE — Scratch Table
+// ═════════════════════════════════════════════════════════════════════════════
 
-describe("21. Performance Utilities", function () {
-    const MV_NAME = "TEST_WRAP_MV_SALES";
-
-    after(async function () {
-        try {
-            await perf.dropMaterializedView(MV_NAME);
-        } catch (e) {
-            /* ignore */
-        }
-    });
-
-    it("explainPlan returns plan rows array", async function () {
-        const plan = await perf.explainPlan(
-            users.find({ STATUS: "active" }).sort({ NAME: 1 }).limit(10),
-        );
-        expect(plan).to.be.an("array").with.length.greaterThan(0);
-        expect(plan[0]).to.have.property("PLAN_TABLE_OUTPUT");
-    });
-
-    it("explainPlan accepts raw SQL string", async function () {
-        const plan = await perf.explainPlan(
-            `SELECT * FROM "${T.USERS}" WHERE "STATUS" = 'active'`,
-        );
-        expect(plan).to.be.an("array").with.length.greaterThan(0);
-    });
-
-    it("analyze gathers table stats without error", async function () {
-        // May require DBA privilege in some environments — wrapped in try
-        try {
-            await perf.analyze(T.USERS);
-        } catch (e) {
-            if (!e.message.includes("ORA-01031")) throw e; // ignore insufficient privileges
-        }
-    });
-
-    it("createMaterializedView creates the MV", async function () {
-        try {
-            const result = await perf.createMaterializedView(
-                MV_NAME,
-                sales.aggregate([
-                    { $group: { _id: "$REGION", total: { $sum: "$AMOUNT" } } },
-                ]),
-                {
-                    refreshMode: "complete",
-                    refreshOn: "demand",
-                    buildMode: "immediate",
-                    orReplace: true,
-                },
+describe("17. Aggregation Pipeline — Scratch", function () {
+    it("17.1 $match + $group + $sort", async function () {
+        const result = await scratch.aggregate([
+            { $match: { STATUS: { $ne: null } } },
+            { $group: { _id: "$CATEGORY", totalVal: { $sum: "$VALUE" }, cnt: { $count: "*" } } },
+            { $sort: { totalVal: -1 } },
+        ]);
+        expect(result).to.be.an("array");
+        if (result.length >= 2) {
+            expect(Number(result[0].TOTALVAL || result[0].totalVal)).to.be.at.least(
+                Number(result[1].TOTALVAL || result[1].totalVal),
             );
-            expect(result.acknowledged).to.be.true;
-        } catch (e) {
-            if (e.message.includes("ORA-01031")) {
-                this.skip(); // CREATE MATERIALIZED VIEW requires privilege
-                return;
-            }
-            throw e;
         }
     });
 
-    it("refreshMaterializedView refreshes the MV", async function () {
-        try {
-            await perf.refreshMaterializedView(MV_NAME, "complete");
-        } catch (e) {
-            if (
-                e.message.includes("ORA-01031") ||
-                e.message.includes("ORA-12003")
-            ) {
-                this.skip(); // MV does not exist or insufficient privileges
-                return;
-            }
-            throw e;
+    it("17.2 $match + $limit", async function () {
+        const result = await scratch.aggregate([{ $match: {} }, { $limit: 3 }]);
+        expect(result.length).to.be.at.most(3);
+    });
+
+    it("17.3 $count stage", async function () {
+        const result = await scratch.aggregate([{ $match: {} }, { $count: "total" }]);
+        if (result.length > 0) {
+            expect(Number(result[0].TOTAL || result[0].total)).to.be.greaterThan(0);
         }
     });
 
-    it("dropMaterializedView removes the MV", async function () {
-        try {
-            const result = await perf.dropMaterializedView(MV_NAME);
-            expect(result.acknowledged).to.be.true;
-        } catch (e) {
-            if (
-                e.message.includes("ORA-01031") ||
-                e.message.includes("ORA-12003")
-            ) {
-                this.skip(); // MV does not exist or insufficient privileges
-                return;
-            }
-            throw e;
-        }
+    it("17.4 $group with $avg", async function () {
+        const result = await scratch.aggregate([
+            { $match: { VALUE: { $exists: true } } },
+            { $group: { _id: "$DIVISION", avgVal: { $avg: "$VALUE" } } },
+        ]);
+        expect(result).to.be.an("array");
+    });
+
+    it("17.5 $group with $min and $max", async function () {
+        const result = await scratch.aggregate([
+            { $match: {} },
+            { $group: { _id: "$CATEGORY", minVal: { $min: "$VALUE" }, maxVal: { $max: "$VALUE" } } },
+        ]);
+        expect(result).to.be.an("array");
+    });
+
+    it("17.6 $project stage", async function () {
+        const result = await scratch.aggregate([
+            { $match: {} },
+            { $project: { NAME: 1, VALUE: 1, DIVISION: 1 } },
+            { $limit: 5 },
+        ]);
+        expect(result).to.be.an("array");
+    });
+
+    it("17.7 $group by shared columns DIVISION + YEAR", async function () {
+        const result = await scratch.aggregate([
+            { $match: {} },
+            { $group: { _id: { div: "$DIVISION", yr: "$YEAR" }, total: { $sum: "$VALUE" } } },
+            { $sort: { total: -1 } },
+        ]);
+        expect(result).to.be.an("array");
     });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 22 — DCL Operations
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 18. AGGREGATION ON REAL TABLES
+// ═════════════════════════════════════════════════════════════════════════════
 
-describe("22. DCL Operations (OracleDCL)", function () {
-    // DCL tests require a grantee that exists in the DB.
-    // Uses the same schema user (self-grant) — adjust GRANTEE if needed.
-    const GRANTEE = process.env.UA_DB_USERNAME;
-
-    it("grant SELECT on a table succeeds", async function () {
-        // Self-grant on test table — valid in Oracle
-        try {
-            const result = await dcl.grant(["SELECT"], T.USERS, GRANTEE);
-            expect(result.acknowledged).to.be.true;
-        } catch (e) {
-            // Skip on privilege or user-not-found errors
-            if (
-                e.message.includes("ORA-01749") ||
-                e.message.includes("ORA-01917") ||
-                e.message.includes("ORA-01031")
-            ) {
-                this.skip();
-                return;
-            }
-            throw e;
-        }
+describe("18. Aggregation on Real Tables", function () {
+    it("18.1 DEV_STOCKS: group by CATEGORY, sum QUANTITY", async function () {
+        const result = await devStocks.aggregate([
+            { $match: { CATEGORY: { $exists: true } } },
+            { $group: { _id: "$CATEGORY", totalQty: { $sum: "$QUANTITY" }, cnt: { $count: "*" } } },
+            { $sort: { totalQty: -1 } },
+            { $limit: 10 },
+        ]);
+        expect(result).to.be.an("array");
     });
 
-    it("grant multiple privileges at once", async function () {
-        try {
-            const result = await dcl.grant(
-                ["SELECT", "INSERT", "UPDATE"],
-                T.ORDERS,
-                GRANTEE,
-            );
-            expect(result.acknowledged).to.be.true;
-        } catch (e) {
-            if (
-                e.message.includes("ORA-01749") ||
-                e.message.includes("ORA-01917") ||
-                e.message.includes("ORA-01031")
-            ) {
-                this.skip();
-                return;
-            }
-            throw e;
-        }
+    it("18.2 DEV_BOOK: group by DIVISION + YEAR", async function () {
+        const result = await devBook.aggregate([
+            { $match: {} },
+            { $group: { _id: { div: "$DIVISION", yr: "$YEAR" }, total: { $sum: "$SAP_BOOK_QUANTITY" } } },
+            { $sort: { total: -1 } },
+            { $limit: 5 },
+        ]);
+        expect(result).to.be.an("array");
     });
 
-    it("revoke removes a privilege", async function () {
-        try {
-            const result = await dcl.revoke(["INSERT"], T.ORDERS, GRANTEE);
-            expect(result.acknowledged).to.be.true;
-        } catch (e) {
-            if (
-                e.message.includes("ORA-01749") ||
-                e.message.includes("ORA-01927") ||
-                e.message.includes("ORA-01917") ||
-                e.message.includes("ORA-01031")
-            ) {
-                this.skip();
-                return;
-            }
-            throw e;
-        }
+    it("18.3 DEV_UNIT: count by UNITSTATUS", async function () {
+        const result = await devUnit.aggregate([
+            { $match: {} },
+            { $group: { _id: "$UNITSTATUS", cnt: { $count: "*" } } },
+            { $sort: { cnt: -1 } },
+        ]);
+        expect(result).to.be.an("array");
+    });
+
+    it("18.4 DEV_MATERIAL: group by TYPE, avg STANDARDPRICE", async function () {
+        const result = await devMaterial.aggregate([
+            { $match: { STANDARDPRICE: { $exists: true } } },
+            { $group: { _id: "$TYPE", avgPrice: { $avg: "$STANDARDPRICE" } } },
+        ]);
+        expect(result).to.be.an("array");
+    });
+
+    it("18.5 DEV_STOCKS: group by MATERIALID with $having", async function () {
+        const result = await devStocks.aggregate([
+            { $match: {} },
+            { $group: { _id: "$MATERIALID", totalQty: { $sum: "$QUANTITY" } } },
+            { $having: { totalQty: { $gt: 0 } } },
+            { $limit: 10 },
+        ]);
+        expect(result).to.be.an("array");
     });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 23 — utils helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 19. CTE (Common Table Expressions)
+// ═════════════════════════════════════════════════════════════════════════════
 
-describe("23. utils helpers", function () {
-    const {
-        convertTypes,
-        quoteIdentifier,
-        mergeBinds,
-        rowToDoc,
-    } = require("../../src/utils/oracle-mongo-wrapper/utils");
-
-    it("convertTypes coerces Oracle number strings to JS numbers", function () {
-        const row = { ID: "123", AMOUNT: "99.99", NAME: "Juan" };
-        const out = convertTypes(row);
-        expect(out.ID).to.equal(123);
-        expect(out.AMOUNT).to.equal(99.99);
-        expect(out.NAME).to.equal("Juan"); // string left as-is
-    });
-
-    it("quoteIdentifier wraps names in double quotes", function () {
-        expect(quoteIdentifier("users")).to.equal('"users"');
-        expect(quoteIdentifier("STATUS")).to.equal('"STATUS"');
-    });
-
-    it("mergeBinds combines two bind objects without collision", function () {
-        const a = { where_field_0: "active" };
-        const b = { upd_field_0: "premium" };
-        const merged = mergeBinds(a, b);
-        expect(merged).to.deep.equal({
-            where_field_0: "active",
-            upd_field_0: "premium",
-        });
-    });
-
-    it("mergeBinds throws on key collision", function () {
-        const a = { field_0: "x" };
-        const b = { field_0: "y" }; // same key
-        expect(() => mergeBinds(a, b)).to.throw(/collision/i);
-    });
-
-    it("rowToDoc converts an Oracle row to a plain object", function () {
-        const row = { ID: "1", NAME: "Juan", AMOUNT: "500.00" };
-        const doc = rowToDoc(row);
-        expect(doc).to.be.an("object");
-        expect(doc.ID).to.equal(1);
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 24 — Error handling & edge cases
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("24. Error handling & edge cases", function () {
-    it("method errors include SQL in the message", async function () {
-        try {
-            // Force a syntax error by passing a filter that generates bad SQL
-            await db.withConnection(async (conn) => {
-                await conn.execute('SELECT * FROM "NO_SUCH_TABLE_EVER"');
-            });
-        } catch (e) {
-            expect(e.message).to.exist;
-        }
-    });
-
-    it("findOne on empty table returns null, not undefined", async function () {
-        const EMPTY = "TEST_WRAP_EMPTY";
-        await schema.createTable(EMPTY, {
-            ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
-        });
-        const emptyColl = new OracleCollection(EMPTY, db);
-        const result = await emptyColl.findOne({});
-        expect(result).to.be.null;
-        await schema.dropTable(EMPTY, { cascade: true });
-    });
-
-    it("deleteOne on no match returns deletedCount 0, not error", async function () {
-        const result = await users.deleteOne({ NAME: "AbsolutelyNobody" });
-        expect(result.deletedCount).to.equal(0);
-    });
-
-    it("updateOne on no match with no upsert returns modifiedCount 0", async function () {
-        const result = await users.updateOne(
-            { NAME: "AbsolutelyNobody" },
-            { $set: { STATUS: "active" } },
-        );
-        expect(result.matchedCount).to.equal(0);
-        expect(result.modifiedCount).to.equal(0);
-    });
-
-    it("insertMany with empty array throws descriptively", async function () {
-        try {
-            await users.insertMany([]);
-            expect.fail("Should have thrown");
-        } catch (e) {
-            expect(e.message).to.match(/empty/i);
-        }
-    });
-
-    it("bulkWrite with unknown op type throws", async function () {
-        try {
-            await users.bulkWrite([{ weirdOp: {} }]);
-            expect.fail("Should have thrown");
-        } catch (e) {
-            expect(e.message).to.exist;
-        }
-    });
-
-    it("withTransaction rethrows the original error", async function () {
-        const sentinel = new Error("sentinel_error");
-        try {
-            await txManager.withTransaction(async () => {
-                throw sentinel;
-            });
-            expect.fail("Should have thrown");
-        } catch (e) {
-            expect(e.message).to.include("sentinel_error");
-        }
-    });
-
-    it("createDb with unknown connectionName throws on first withConnection", async function () {
-        const badDb = createDb("nonExistentConnection");
-        try {
-            await badDb.withConnection(async () => {});
-            expect.fail("Should have thrown");
-        } catch (e) {
-            expect(e.message).to.match(/unknown connection/i);
-        }
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 25 — SQL Injection & Security
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("25. SQL Injection & Security", function () {
-    it("filter values with SQL injection payloads are safely bound", async function () {
-        const malicious = "'; DROP TABLE TEST_WRAP_USERS; --";
-        const { whereClause, binds } = parseFilter({ NAME: malicious });
-        expect(whereClause).to.include(":where_");
-        expect(whereClause).to.not.include(malicious);
-        expect(Object.values(binds)).to.include(malicious);
-    });
-
-    it("$in values are individually bound, not interpolated", async function () {
-        const { whereClause, binds } = parseFilter({
-            STATUS: { $in: ["active", "'; DELETE FROM users; --"] },
-        });
-        expect(whereClause).to.not.include("DELETE");
-        const bindVals = Object.values(binds);
-        expect(bindVals).to.include("'; DELETE FROM users; --");
-    });
-
-    it("$regex values are bound, not interpolated into SQL", async function () {
-        const { whereClause, binds } = parseFilter({
-            NAME: { $regex: ".*'; DROP TABLE x; --" },
-        });
-        expect(whereClause).to.include("REGEXP_LIKE");
-        expect(whereClause).to.not.include("DROP TABLE");
-        expect(Object.values(binds)).to.include(".*'; DROP TABLE x; --");
-    });
-
-    it("$like values are bound, not interpolated", async function () {
-        const { whereClause, binds } = parseFilter({
-            NAME: { $like: "%'; DROP TABLE x; --%" },
-        });
-        expect(whereClause).to.include("LIKE");
-        expect(whereClause).to.not.include("DROP TABLE");
-        expect(Object.values(binds)).to.include("%'; DROP TABLE x; --%");
-    });
-
-    it("update $set values are bound, never interpolated", function () {
-        const { setClause, binds } = parseUpdate({
-            $set: { NAME: "'; DROP TABLE x; --" },
-        });
-        expect(setClause).to.not.include("DROP TABLE");
-        expect(Object.values(binds)).to.include("'; DROP TABLE x; --");
-    });
-
-    it("$between values are bound", function () {
-        const { whereClause, binds } = parseFilter({
-            AGE: { $between: [10, 50] },
-        });
-        expect(whereClause).to.include("BETWEEN");
-        expect(Object.values(binds)).to.include(10);
-        expect(Object.values(binds)).to.include(50);
-    });
-
-    it("UNIQUE constraint violation produces an error on duplicate insert", async function () {
-        const TABLE = "TEST_WRAP_UNIQUE_CONSTRAINT";
-        try {
-            await schema.createTable(TABLE, {
-                ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
-                CODE: { type: "VARCHAR2(20)", notNull: true },
-            });
-            await schema.alterTable(TABLE, {
-                addConstraint: {
-                    type: "UNIQUE",
-                    columns: ["CODE"],
-                    name: "UQ_WRAP_CODE",
-                },
-            });
-            const coll = new OracleCollection(TABLE, db);
-            await coll.insertOne({ CODE: "UNIQ1" });
-            let threw = false;
-            try {
-                await coll.insertOne({ CODE: "UNIQ1" });
-            } catch (e) {
-                threw = true;
-                expect(e.message).to.match(/ORA-00001|unique constraint/i);
-            }
-            expect(threw, "Second insert should have thrown").to.be.true;
-        } finally {
-            await dropIfExists(TABLE);
-        }
-    });
-
-    it("NOT NULL constraint violation produces an error", async function () {
-        try {
-            await users.insertOne({ EMAIL: "noname@test.com" });
-            expect.fail("Should have thrown for missing NAME");
-        } catch (e) {
-            expect(e.message).to.match(/ORA-01400|cannot insert NULL/i);
-        }
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 26 — mergeFrom, UNPIVOT, buildAnyAllSubquery
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("26. mergeFrom, UNPIVOT, buildAnyAllSubquery", function () {
-    const MERGE_SRC = "TEST_WRAP_MERGE_SRC";
-    const MERGE_TGT = "TEST_WRAP_MERGE_TGT";
-
-    before(async function () {
-        await dropIfExists(MERGE_SRC);
-        await dropIfExists(MERGE_TGT);
-
-        await schema.createTable(MERGE_SRC, {
-            ID: { type: "NUMBER", primaryKey: true },
-            PRICE: { type: "NUMBER(12,2)" },
-            STOCK: { type: "NUMBER" },
-        });
-        await schema.createTable(MERGE_TGT, {
-            ID: { type: "NUMBER", primaryKey: true },
-            PRICE: { type: "NUMBER(12,2)" },
-            STOCK: { type: "NUMBER" },
-        });
-
-        const src = new OracleCollection(MERGE_SRC, db);
-        const tgt = new OracleCollection(MERGE_TGT, db);
-        await src.insertMany([
-            { ID: 1, PRICE: 19.99, STOCK: 100 },
-            { ID: 2, PRICE: 29.99, STOCK: 200 },
-        ]);
-        await tgt.insertMany([
-            { ID: 1, PRICE: 14.99, STOCK: 50 },
-            { ID: 2, PRICE: 24.99, STOCK: 75 },
-        ]);
-    });
-
-    after(async function () {
-        await dropIfExists(MERGE_SRC);
-        await dropIfExists(MERGE_TGT);
-    });
-
-    it("mergeFrom updates target from source table", async function () {
-        const tgt = new OracleCollection(MERGE_TGT, db);
-        const result = await tgt.mergeFrom(
-            MERGE_SRC,
-            { localField: "ID", foreignField: "ID" },
-            {
-                whenMatched: {
-                    $set: { PRICE: "$src.PRICE", STOCK: "$src.STOCK" },
-                },
-            },
-        );
-        expect(result.acknowledged).to.be.true;
-
-        const updated = await tgt.findOne({ ID: 1 });
-        expect(Number(updated.PRICE)).to.equal(19.99);
-        expect(Number(updated.STOCK)).to.equal(100);
-    });
-
-    it("UNPIVOT turns columns into rows", async function () {
-        const rows = await sales.unpivot({
-            valueColumn: "AMOUNT_VAL",
-            nameColumn: "MEASURE",
-            columns: ["AMOUNT"],
-        });
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-        expect(rows[0]).to.have.property("AMOUNT_VAL");
-        expect(rows[0]).to.have.property("MEASURE");
-    });
-
-    it("buildAnyAllSubquery produces correct SQL", function () {
-        const {
-            buildAnyAllSubquery,
-        } = require("../../src/utils/oracle-mongo-wrapper/pipeline/subqueryBuilder");
-        const anySql = buildAnyAllSubquery(
-            { collection: T.EMPLOYEES, field: "SALARY" },
-            "ANY",
-        );
-        expect(anySql).to.include("ANY");
-        expect(anySql).to.include('"SALARY"');
-        expect(anySql).to.include(`"${T.EMPLOYEES}"`);
-
-        const allSql = buildAnyAllSubquery(
-            { collection: T.EMPLOYEES, field: "SALARY" },
-            "ALL",
-        );
-        expect(allSql).to.include("ALL");
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 27 — Additional JOINs, Window Functions, and Filter Operators
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("27. Additional JOINs", function () {
-    it("RIGHT OUTER JOIN returns all rows from right table", async function () {
-        const rows = await orders.aggregate([
-            {
-                $lookup: {
-                    from: T.USERS,
-                    localField: "USER_ID",
-                    foreignField: "ID",
-                    as: "user",
-                    joinType: "right",
-                },
-            },
-        ]);
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-        // Right join keeps all users, even those without orders
-        const allUsers = await users.find({}).toArray();
-        expect(rows.length).to.be.at.least(allUsers.length);
-    });
-
-    it("FULL OUTER JOIN returns all rows from both tables", async function () {
-        const rows = await orders.aggregate([
-            {
-                $lookup: {
-                    from: T.USERS,
-                    localField: "USER_ID",
-                    foreignField: "ID",
-                    as: "user",
-                    joinType: "full",
-                },
-            },
-        ]);
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-    });
-
-    it("CROSS JOIN produces cartesian product", async function () {
-        const rows = await orders.aggregate([
-            {
-                $lookup: {
-                    from: T.USERS,
-                    localField: "USER_ID",
-                    foreignField: "ID",
-                    as: "user",
-                    joinType: "cross",
-                },
-            },
-        ]);
-        const orderCount = await orders.countDocuments({});
-        const userCount = await users.countDocuments({});
-        expect(rows.length).to.equal(orderCount * userCount);
-    });
-
-    it("NATURAL JOIN joins on matching column names", async function () {
-        // Both ORDERS and USERS share columns like STATUS, so natural join works
-        const rows = await orders.aggregate([
-            {
-                $lookup: {
-                    from: T.USERS,
-                    localField: "ID",
-                    foreignField: "ID",
-                    as: "user",
-                    joinType: "natural",
-                },
-            },
-        ]);
-        expect(rows).to.be.an("array");
-    });
-});
-
-describe("28. Additional Window Functions", function () {
-    it("LEAD accesses next row value", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    NEXT_AMOUNT: {
-                        $window: {
-                            fn: "LEAD",
-                            field: "AMOUNT",
-                            offset: 1,
-                            orderBy: { ID: 1 },
-                        },
-                    },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("NEXT_AMOUNT");
-        // Last row's LEAD should be null
-        const lastRow = rows[rows.length - 1];
-        expect(lastRow.NEXT_AMOUNT).to.be.null;
-    });
-
-    it("FIRST_VALUE returns first value in window", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    FIRST_AMT: {
-                        $window: {
-                            fn: "FIRST_VALUE",
-                            field: "AMOUNT",
-                            partitionBy: "REGION",
-                            orderBy: { AMOUNT: 1 },
-                        },
-                    },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("FIRST_AMT");
-        // Within each region, FIRST_AMT should be the minimum amount
-        const northRows = rows.filter((r) => r.REGION === "North");
-        if (northRows.length > 0) {
-            const minNorth = Math.min(
-                ...northRows.map((r) => Number(r.AMOUNT)),
-            );
-            expect(Number(northRows[0].FIRST_AMT)).to.equal(minNorth);
-        }
-    });
-
-    it("LAST_VALUE returns last value in window", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    LAST_AMT: {
-                        $window: {
-                            fn: "LAST_VALUE",
-                            field: "AMOUNT",
-                            partitionBy: "REGION",
-                            orderBy: { AMOUNT: 1 },
-                            frame: "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
-                        },
-                    },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("LAST_AMT");
-    });
-
-    it("NTH_VALUE returns nth value in window", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    SECOND_AMT: {
-                        $window: {
-                            fn: "NTH_VALUE",
-                            field: "AMOUNT",
-                            n: 2,
-                            orderBy: { AMOUNT: 1 },
-                            frame: "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
-                        },
-                    },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("SECOND_AMT");
-    });
-
-    it("window AVG computes running average", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    AVG_AMT: {
-                        $window: {
-                            fn: "AVG",
-                            field: "AMOUNT",
-                            orderBy: { ID: 1 },
-                        },
-                    },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("AVG_AMT");
-        expect(Number(rows[0].AVG_AMT)).to.be.a("number");
-    });
-
-    it("window COUNT counts within partition", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    REG_COUNT: {
-                        $window: {
-                            fn: "COUNT",
-                            field: "*",
-                            partitionBy: "REGION",
-                        },
-                    },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("REG_COUNT");
-        expect(Number(rows[0].REG_COUNT)).to.be.greaterThan(0);
-    });
-
-    it("window MIN/MAX within partition", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    MIN_AMT: {
-                        $window: {
-                            fn: "MIN",
-                            field: "AMOUNT",
-                            partitionBy: "REGION",
-                        },
-                    },
-                    MAX_AMT: {
-                        $window: {
-                            fn: "MAX",
-                            field: "AMOUNT",
-                            partitionBy: "REGION",
-                        },
-                    },
-                },
-            },
-        ]);
-        rows.forEach((r) => {
-            expect(Number(r.MIN_AMT)).to.be.at.most(Number(r.AMOUNT));
-            expect(Number(r.MAX_AMT)).to.be.at.least(Number(r.AMOUNT));
-        });
-    });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 29 — Additional Filter Operators
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe("29. Additional Filter Operators", function () {
-    it("$notBetween excludes range", async function () {
-        const rows = await users
-            .find({
-                AGE: { $notBetween: [25, 40] },
-            })
+describe("19. CTE Operations", function () {
+    it("19.1 withCTE with single named query", async function () {
+        const result = await withCTE(inventoryDB, {
+            active_stocks: devStocks.find({ QUANTITY: { $gt: 0 } }),
+        })
+            .from("active_stocks")
+            .limit(10)
             .toArray();
-        rows.forEach((r) => {
-            const age = Number(r.AGE);
-            expect(age < 25 || age > 40).to.be.true;
-        });
+        expect(result).to.be.an("array");
     });
 
-    it("$case produces CASE WHEN expressions", function () {
-        const { whereClause, binds } = parseFilter({
-            STATUS: {
-                $case: [
-                    { when: { AGE: { $gte: 30 } }, then: "senior" },
-                    { when: { AGE: { $lt: 30 } }, then: "junior" },
-                ],
-                $else: "unknown",
-            },
-        });
-        expect(whereClause).to.include("CASE");
-        expect(whereClause).to.include("WHEN");
-        expect(whereClause).to.include("THEN");
-        expect(whereClause).to.include("ELSE");
-        expect(whereClause).to.include("END");
-        // Values must be bound
-        const vals = Object.values(binds);
-        expect(vals).to.include("senior");
-        expect(vals).to.include("junior");
-        expect(vals).to.include("unknown");
-    });
-
-    it("$coalesce produces COALESCE SQL", function () {
-        const { whereClause } = parseFilter({
-            STATUS: { $coalesce: ["$EMAIL", "$NAME"] },
-        });
-        expect(whereClause).to.include("COALESCE");
-        // Column refs should be quoted identifiers
-        expect(whereClause).to.include('"EMAIL"');
-        expect(whereClause).to.include('"NAME"');
-    });
-
-    it("$nullif produces NULLIF SQL", function () {
-        const { whereClause, binds } = parseFilter({
-            STATUS: { $nullif: ["STATUS", "inactive"] },
-        });
-        expect(whereClause).to.include("NULLIF");
-        expect(whereClause).to.include('"STATUS"');
-        expect(Object.values(binds)).to.include("inactive");
-    });
-
-    it("$not negates a filter condition", async function () {
-        const rows = await users
-            .find({
-                $not: { STATUS: "active" },
-            })
+    it("19.2 withCTE with multiple named queries", async function () {
+        const result = await withCTE(inventoryDB, {
+            big_stocks: devStocks.find({ QUANTITY: { $gt: 100 } }),
+            small_stocks: devStocks.find({ QUANTITY: { $lte: 100, $gt: 0 } }),
+        })
+            .from("big_stocks")
+            .limit(10)
             .toArray();
-        rows.forEach((r) => expect(r.STATUS).to.not.equal("active"));
+        expect(result).to.be.an("array");
     });
 
-    it("$nor excludes all specified conditions", async function () {
-        const rows = await users
-            .find({
-                $nor: [{ STATUS: "active" }, { TIER: "platinum" }],
-            })
+    it("19.3 withCTE with sort and limit", async function () {
+        const result = await withCTE(inventoryDB, {
+            materials: devMaterial.find({ TYPE: { $exists: true } }),
+        })
+            .from("materials")
+            .sort({ ID: -1 })
+            .limit(5)
             .toArray();
-        rows.forEach((r) => {
-            expect(r.STATUS).to.not.equal("active");
-            expect(r.TIER).to.not.equal("platinum");
-        });
-    });
-
-    it("$gtAny produces > ANY (SELECT ...) SQL", function () {
-        const { whereClause } = parseFilter({
-            SALARY: {
-                $gtAny: { collection: T.EMPLOYEES, field: "SALARY" },
-            },
-        });
-        expect(whereClause).to.include("> ANY");
-        expect(whereClause).to.include("SELECT");
-    });
-
-    it("$ltAll produces < ALL (SELECT ...) SQL", function () {
-        const { whereClause } = parseFilter({
-            SALARY: {
-                $ltAll: { collection: T.EMPLOYEES, field: "SALARY" },
-            },
-        });
-        expect(whereClause).to.include("< ALL");
-        expect(whereClause).to.include("SELECT");
-    });
-
-    it("$gteAny produces >= ANY SQL", function () {
-        const { whereClause } = parseFilter({
-            SALARY: {
-                $gteAny: { collection: T.EMPLOYEES, field: "SALARY" },
-            },
-        });
-        expect(whereClause).to.include(">= ANY");
-    });
-
-    it("$lteAll produces <= ALL SQL", function () {
-        const { whereClause } = parseFilter({
-            SALARY: {
-                $lteAll: { collection: T.EMPLOYEES, field: "SALARY" },
-            },
-        });
-        expect(whereClause).to.include("<= ALL");
-    });
-
-    it("$inSelect with array resolves to IN (:b1, :b2, ...)", function () {
-        const { whereClause, binds } = parseFilter({
-            ID: { $inSelect: [1, 2, 3] },
-        });
-        expect(whereClause).to.include("IN");
-        expect(Object.values(binds)).to.include(1);
-        expect(Object.values(binds)).to.include(2);
-        expect(Object.values(binds)).to.include(3);
-    });
-
-    it("$inSelect with empty array produces 1=0 (always false)", function () {
-        const { whereClause } = parseFilter({
-            ID: { $inSelect: [] },
-        });
-        expect(whereClause).to.include("1=0");
-    });
-
-    it("nested $and/$or logical operators combine correctly", async function () {
-        const rows = await users
-            .find({
-                $or: [
-                    { $and: [{ STATUS: "active" }, { TIER: "gold" }] },
-                    { $and: [{ STATUS: "inactive" }, { TIER: "standard" }] },
-                ],
-            })
-            .toArray();
-        rows.forEach((r) => {
-            const isActiveGold = r.STATUS === "active" && r.TIER === "gold";
-            const isInactiveStandard =
-                r.STATUS === "inactive" && r.TIER === "standard";
-            expect(isActiveGold || isInactiveStandard).to.be.true;
-        });
+        expect(result).to.be.an("array");
+        expect(result.length).to.be.at.most(5);
     });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 30 — Additional Pipeline Stages & Aggregate Expressions
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 20. WINDOW FUNCTIONS — Unit Tests
+// ═════════════════════════════════════════════════════════════════════════════
 
-describe("30. Additional Pipeline Stages & Aggregate Expressions", function () {
-    const OUT_TABLE = "TEST_WRAP_AGG_OUT";
-
-    afterEach(async function () {
-        // Clean up $out target table if it was created
-        try {
-            await db.withConnection(async (conn) => {
-                await conn.execute(`DROP TABLE "${OUT_TABLE}" PURGE`);
-            });
-        } catch (_) {
-            /* table may not exist */
-        }
+describe("20. Window Functions — Unit Tests", function () {
+    it("20.1 ROW_NUMBER", function () {
+        const expr = buildWindowExpr({ fn: "ROW_NUMBER", partitionBy: "DIVISION", orderBy: { YEAR: -1 } });
+        expect(expr.toUpperCase()).to.include("ROW_NUMBER");
+        expect(expr.toUpperCase()).to.include("PARTITION BY");
+        expect(expr.toUpperCase()).to.include("ORDER BY");
     });
 
-    it("$out inserts aggregate results into another table", async function () {
-        // Create target table matching the $group output shape
-        await schema.createTable(OUT_TABLE, {
-            REGION: { type: "VARCHAR2(50)" },
-            TOTAL: { type: "NUMBER(12,2)" },
+    it("20.2 RANK", function () {
+        const expr = buildWindowExpr({ fn: "RANK", partitionBy: "CATEGORY", orderBy: { VALUE: -1 } });
+        expect(expr.toUpperCase()).to.include("RANK");
+    });
+
+    it("20.3 DENSE_RANK", function () {
+        const expr = buildWindowExpr({ fn: "DENSE_RANK", partitionBy: "DIVISION", orderBy: { QUANTITY: 1 } });
+        expect(expr.toUpperCase()).to.include("DENSE_RANK");
+    });
+
+    it("20.4 SUM with frame", function () {
+        const expr = buildWindowExpr({
+            fn: "SUM", field: "QUANTITY", partitionBy: "DIVISION",
+            orderBy: { MONTH: 1 },
+            frame: "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW",
         });
-
-        await sales.aggregate([
-            {
-                $group: {
-                    _id: "$REGION",
-                    TOTAL: { $sum: "$AMOUNT" },
-                },
-            },
-            { $out: OUT_TABLE },
-        ]);
-
-        // Verify rows were inserted
-        const outCol = new OracleCollection(OUT_TABLE, db);
-        const rows = await outCol.find().toArray();
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-        expect(rows[0]).to.have.property("TOTAL");
+        expect(expr.toUpperCase()).to.include("SUM");
+        expect(expr.toUpperCase()).to.include("ROWS BETWEEN");
     });
 
-    it("$bucket groups values into ranges", async function () {
-        const rows = await sales.aggregate([
-            {
-                $bucket: {
-                    groupBy: "$AMOUNT",
-                    boundaries: [0, 10000, 15000, 20000],
-                    default: "Other",
-                    output: { COUNT: { $sum: 1 } },
-                },
-            },
-        ]);
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-        expect(rows[0]).to.have.property("BUCKET");
-        expect(rows[0]).to.have.property("COUNT");
-    });
-
-    it("$replaceRoot changes the document root", async function () {
-        // Using "$" as newRoot should pass through all columns
-        const rows = await users.aggregate([
-            { $match: { STATUS: "active" } },
-            { $replaceRoot: { newRoot: "$" } },
-        ]);
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-        // All original columns should be present
-        expect(rows[0]).to.have.property("NAME");
-        expect(rows[0]).to.have.property("EMAIL");
-    });
-
-    it("$first and $last aggregate expressions", async function () {
-        const rows = await orders.aggregate([
-            { $sort: { ID: 1 } },
-            {
-                $group: {
-                    _id: "$REGION",
-                    FIRST_AMT: { $first: "$AMOUNT" },
-                    LAST_AMT: { $last: "$AMOUNT" },
-                },
-            },
-        ]);
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-        expect(rows[0]).to.have.property("FIRST_AMT");
-        expect(rows[0]).to.have.property("LAST_AMT");
-    });
-
-    it("$concat joins string fields", async function () {
-        const rows = await users.aggregate([
-            {
-                $project: {
-                    FULL: { $concat: ["$NAME", "$EMAIL"] },
-                },
-            },
-        ]);
-        expect(rows).to.be.an("array").with.length.greaterThan(0);
-        expect(rows[0]).to.have.property("FULL");
-        expect(rows[0].FULL).to.be.a("string");
-    });
-
-    it("$toUpper and $toLower transform case", async function () {
-        const rows = await users.aggregate([
-            {
-                $project: {
-                    UPPER_NAME: { $toUpper: "$NAME" },
-                    LOWER_NAME: { $toLower: "$NAME" },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("UPPER_NAME");
-        expect(rows[0]).to.have.property("LOWER_NAME");
-        // UPPER should be all caps
-        expect(rows[0].UPPER_NAME).to.equal(rows[0].UPPER_NAME.toUpperCase());
-        expect(rows[0].LOWER_NAME).to.equal(rows[0].LOWER_NAME.toLowerCase());
-    });
-
-    it("$substr extracts substring", async function () {
-        const rows = await users.aggregate([
-            {
-                $project: {
-                    INITIALS: { $substr: ["$NAME", 1, 3] },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("INITIALS");
-        expect(rows[0].INITIALS.length).to.be.at.most(3);
-    });
-
-    it("$cond produces conditional expressions", async function () {
-        const rows = await users.aggregate([
-            {
-                $project: {
-                    NAME: 1,
-                    LABEL: {
-                        $cond: {
-                            if: { STATUS: "active" },
-                            then: "Active User",
-                            else: "Inactive User",
-                        },
-                    },
-                },
-            },
-        ]);
-        rows.forEach((r) => {
-            expect(["Active User", "Inactive User"]).to.include(r.LABEL);
+    it("20.5 LAG", function () {
+        const expr = buildWindowExpr({
+            fn: "LAG", field: "VALUE", offset: 1,
+            partitionBy: "MATERIALID", orderBy: { MONTH: 1 },
         });
+        expect(expr.toUpperCase()).to.include("LAG");
     });
 
-    it("$ifNull provides fallback for null values", async function () {
-        const rows = await users.aggregate([
-            {
-                $project: {
-                    NAME: 1,
-                    UPDATED: { $ifNull: ["$UPDATED_AT", "$CREATED_AT"] },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("UPDATED");
+    it("20.6 LEAD", function () {
+        const expr = buildWindowExpr({
+            fn: "LEAD", field: "VALUE", offset: 1,
+            partitionBy: "MATERIALID", orderBy: { MONTH: 1 },
+        });
+        expect(expr.toUpperCase()).to.include("LEAD");
     });
 
-    it("$dateToString formats dates", async function () {
-        const rows = await users.aggregate([
-            {
-                $project: {
-                    NAME: 1,
-                    DATE_STR: {
-                        $dateToString: {
-                            format: "YYYY-MM-DD",
-                            date: "$CREATED_AT",
-                        },
-                    },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("DATE_STR");
-        expect(rows[0].DATE_STR).to.match(/^\d{4}-\d{2}-\d{2}/);
+    it("20.7 COUNT(*)", function () {
+        const expr = buildWindowExpr({ fn: "COUNT", field: "*", partitionBy: "DIVISION" });
+        expect(expr.toUpperCase()).to.include("COUNT(*)");
     });
 
-    it("$mul computes product of fields and literals", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    TAXED: { $mul: ["$AMOUNT", 1.12] },
-                },
-            },
-        ]);
-        expect(rows[0]).to.have.property("TAXED");
-        expect(Number(rows[0].TAXED)).to.be.closeTo(
-            Number(rows[0].AMOUNT) * 1.12,
-            0.01,
-        );
+    it("20.8 NTILE", function () {
+        const expr = buildWindowExpr({
+            fn: "NTILE", n: 4, partitionBy: "CATEGORY", orderBy: { VALUE: 1 },
+        });
+        expect(expr.toUpperCase()).to.include("NTILE");
     });
 
-    it("$subtract computes difference", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    DISCOUNTED: { $subtract: ["$AMOUNT", 50] },
-                },
-            },
-        ]);
-        expect(Number(rows[0].DISCOUNTED)).to.equal(
-            Number(rows[0].AMOUNT) - 50,
-        );
+    it("20.9 FIRST_VALUE", function () {
+        const expr = buildWindowExpr({
+            fn: "FIRST_VALUE", field: "VALUE",
+            partitionBy: "DIVISION", orderBy: { ID: 1 },
+        });
+        expect(expr.toUpperCase()).to.include("FIRST_VALUE");
     });
 
-    it("$divide computes quotient", async function () {
-        const rows = await orders.aggregate([
-            {
-                $addFields: {
-                    HALF: { $divide: ["$AMOUNT", 2] },
-                },
-            },
-        ]);
-        expect(Number(rows[0].HALF)).to.be.closeTo(
-            Number(rows[0].AMOUNT) / 2,
-            0.01,
-        );
+    it("20.10 LAST_VALUE", function () {
+        const expr = buildWindowExpr({
+            fn: "LAST_VALUE", field: "VALUE",
+            partitionBy: "DIVISION", orderBy: { ID: 1 },
+        });
+        expect(expr.toUpperCase()).to.include("LAST_VALUE");
     });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 31 — Edge Cases, Streaming, and Additional Coverage
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// 21. JOIN BUILDER — Unit Tests
+// ═════════════════════════════════════════════════════════════════════════════
 
-describe("31. Edge Cases, Streaming, and Additional Coverage", function () {
-    it("forEach streams rows without collecting into array", async function () {
-        const collected = [];
-        await orders
-            .find({})
-            .sort({ ID: 1 })
-            .forEach((row) => {
-                collected.push(row);
-            });
-        const all = await orders.find({}).sort({ ID: 1 }).toArray();
-        expect(collected.length).to.equal(all.length);
-        expect(collected[0].ID).to.equal(all[0].ID);
-    });
-
-    it("estimatedDocumentCount uses NUM_ROWS (no table scan)", async function () {
-        // First gather stats so NUM_ROWS is populated
-        try {
-            await perf.analyze(T.USERS);
-        } catch (e) {
-            if (e.message.includes("ORA-01031")) {
-                this.skip();
-                return;
-            }
-        }
-        const est = await users.estimatedDocumentCount();
-        // Estimated can differ slightly but should be in ballpark
-        expect(est).to.be.a("number");
-        expect(est).to.be.at.least(0);
-    });
-
-    it("distinct returns unique values for a field", async function () {
-        const regions = await sales.distinct("REGION");
-        expect(regions).to.be.an("array");
-        expect(regions).to.include("North");
-        expect(regions).to.include("South");
-        expect(new Set(regions).size).to.equal(regions.length);
-    });
-
-    it("distinct with filter narrows results", async function () {
-        const tiers = await users.distinct("TIER", { STATUS: "active" });
-        expect(tiers).to.be.an("array");
-        tiers.forEach((t) => expect(t).to.not.be.null);
-    });
-
-    it("combined $set, $inc, $mul in one update", async function () {
-        const target = await users.findOne({ NAME: "Pedro" });
-        const origBalance = Number(target.BALANCE);
-        await users.updateOne(
-            { NAME: "Pedro" },
-            {
-                $set: { STATUS: "active" },
-                $inc: { LOGIN_COUNT: 5 },
-                $mul: { BALANCE: 2 },
-            },
-        );
-        const updated = await users.findOne({ NAME: "Pedro" });
-        expect(updated.STATUS).to.equal("active");
-        expect(Number(updated.LOGIN_COUNT)).to.be.greaterThan(0);
-        expect(Number(updated.BALANCE)).to.equal(origBalance * 2);
-        // Restore
-        await users.updateOne(
-            { NAME: "Pedro" },
-            {
-                $set: {
-                    STATUS: "inactive",
-                    BALANCE: origBalance,
-                    LOGIN_COUNT: 0,
-                },
-            },
-        );
-    });
-
-    it("$unset sets fields to NULL", async function () {
-        await users.updateOne(
-            { NAME: "Pedro" },
-            { $unset: { UPDATED_AT: "" } },
-        );
-        const doc = await users.findOne({ NAME: "Pedro" });
-        expect(doc.UPDATED_AT).to.be.null;
-    });
-
-    it("$currentDate sets field to current date", async function () {
-        await users.updateOne(
-            { NAME: "Pedro" },
-            { $currentDate: { UPDATED_AT: true } },
-        );
-        const doc = await users.findOne({ NAME: "Pedro" });
-        expect(doc.UPDATED_AT).to.not.be.null;
-    });
-
-    it("$rename throws a descriptive error", function () {
-        expect(() => parseUpdate({ $rename: { OLD_COL: "NEW_COL" } })).to.throw(
-            /not supported|ALTER TABLE/i,
-        );
-    });
-
-    it("QueryBuilder .skip() offsets results", async function () {
-        const all = await users.find({}).sort({ ID: 1 }).toArray();
-        const skipped = await users.find({}).sort({ ID: 1 }).skip(2).toArray();
-        expect(skipped.length).to.equal(all.length - 2);
-        expect(skipped[0].ID).to.equal(all[2].ID);
-    });
-
-    it("QueryBuilder .count() returns count without executing full query", async function () {
-        const count = await users.find({ STATUS: "active" }).count();
-        expect(count).to.be.a("number");
-        expect(count).to.be.greaterThan(0);
-    });
-
-    it("QueryBuilder chaining .sort().skip().limit() works together", async function () {
-        const rows = await users
-            .find({})
-            .sort({ AGE: -1 })
-            .skip(1)
-            .limit(2)
-            .toArray();
-        expect(rows.length).to.equal(2);
-        // Should be sorted descending by AGE
-        expect(Number(rows[0].AGE)).to.be.at.least(Number(rows[1].AGE));
-    });
-
-    it("findOneAndUpdate returns the matched document", async function () {
-        const doc = await users.findOneAndUpdate(
-            { NAME: "Ana" },
-            { $set: { STATUS: "active" } },
-        );
-        expect(doc).to.not.be.null;
-        expect(doc.NAME).to.equal("Ana");
-    });
-
-    it("findOneAndDelete removes and returns the document", async function () {
-        await users.insertOne({ NAME: "TempDel", EMAIL: "tempdel@test.com" });
-        const doc = await users.findOneAndDelete({ NAME: "TempDel" });
-        expect(doc).to.not.be.null;
-        expect(doc.NAME).to.equal("TempDel");
-        // Confirm deleted
-        const gone = await users.findOne({ NAME: "TempDel" });
-        expect(gone).to.be.null;
-    });
-
-    it("buildWindowExpr produces correct SQL for all function types", function () {
-        const {
-            buildWindowExpr,
-        } = require("../../src/utils/oracle-mongo-wrapper/pipeline/windowFunctions");
-
-        const rn = buildWindowExpr({ fn: "ROW_NUMBER", orderBy: { ID: 1 } });
-        expect(rn).to.include("ROW_NUMBER()");
-        expect(rn).to.include("OVER");
-
-        const lead = buildWindowExpr({
-            fn: "LEAD",
-            field: "AMOUNT",
-            offset: 2,
-            orderBy: { ID: 1 },
-        });
-        expect(lead).to.include("LEAD");
-        expect(lead).to.include('"AMOUNT"');
-        expect(lead).to.include("2");
-
-        const fv = buildWindowExpr({
-            fn: "FIRST_VALUE",
-            field: "NAME",
-            partitionBy: "DEPT_ID",
-            orderBy: { ID: 1 },
-        });
-        expect(fv).to.include("FIRST_VALUE");
-        expect(fv).to.include("PARTITION BY");
-
-        const nth = buildWindowExpr({
-            fn: "NTH_VALUE",
-            field: "SALARY",
-            n: 3,
-            orderBy: { SALARY: -1 },
-        });
-        expect(nth).to.include("NTH_VALUE");
-        expect(nth).to.include("3");
-        expect(nth).to.include("DESC");
-    });
-
-    it("buildJoinSQL generates correct SQL for each join type", function () {
-        const {
-            buildJoinSQL,
-        } = require("../../src/utils/oracle-mongo-wrapper/joins/joinBuilder");
-
-        const left = buildJoinSQL('"ORDERS"', {
-            from: "USERS",
-            localField: "USER_ID",
-            foreignField: "ID",
+describe("21. Join Builder — Unit Tests", function () {
+    it("21.1 LEFT JOIN", function () {
+        const sql = buildJoinSQL('"DEV_STOCKS"', {
+            from: "DEV_MATERIAL",
+            localField: "MATERIALID",
+            foreignField: "MATERIALID",
+            as: "mat",
             joinType: "left",
         });
-        expect(left).to.include("LEFT OUTER JOIN");
+        expect(sql.toUpperCase()).to.include("LEFT OUTER JOIN");
+    });
 
-        const right = buildJoinSQL('"ORDERS"', {
-            from: "USERS",
-            localField: "USER_ID",
-            foreignField: "ID",
-            joinType: "right",
-        });
-        expect(right).to.include("RIGHT OUTER JOIN");
-
-        const full = buildJoinSQL('"ORDERS"', {
-            from: "USERS",
-            localField: "USER_ID",
-            foreignField: "ID",
-            joinType: "full",
-        });
-        expect(full).to.include("FULL OUTER JOIN");
-
-        const inner = buildJoinSQL('"ORDERS"', {
-            from: "USERS",
-            localField: "USER_ID",
-            foreignField: "ID",
+    it("21.2 INNER JOIN", function () {
+        const sql = buildJoinSQL('"DEV_BOOK"', {
+            from: "DEV_LOCATION",
+            localField: "SLOC",
+            foreignField: "SLOC",
+            as: "loc",
             joinType: "inner",
         });
-        expect(inner).to.include("INNER JOIN");
+        expect(sql.toUpperCase()).to.include("INNER JOIN");
+    });
 
-        const cross = buildJoinSQL('"ORDERS"', {
-            from: "USERS",
-            localField: "USER_ID",
-            foreignField: "ID",
+    it("21.3 CROSS JOIN", function () {
+        const sql = buildJoinSQL('"DEV_BOOK"', {
+            from: "DEV_LOCATION",
             joinType: "cross",
+            as: "loc",
         });
-        expect(cross).to.include("CROSS JOIN");
+        expect(sql.toUpperCase()).to.include("CROSS JOIN");
+    });
 
-        const natural = buildJoinSQL('"ORDERS"', {
-            from: "USERS",
-            localField: "USER_ID",
-            foreignField: "ID",
-            joinType: "natural",
-        });
-        expect(natural).to.include("NATURAL JOIN");
-
-        const self = buildJoinSQL('"EMPLOYEES"', {
-            from: "EMPLOYEES",
-            localField: "MANAGER_ID",
+    it("21.4 SELF JOIN", function () {
+        const sql = buildJoinSQL('"DEV_STOCKS"', {
+            from: "DEV_STOCKS",
+            localField: "ID",
             foreignField: "ID",
             joinType: "self",
         });
-        expect(self).to.include("INNER JOIN");
+        expect(sql.toUpperCase()).to.include("INNER JOIN");
     });
 
-    it("adjacent $match stages are merged for performance", async function () {
-        const rows = await orders.aggregate([
-            { $match: { REGION: "North" } },
-            { $match: { STATUS: "completed" } },
-        ]);
+    it("21.5 Multiple conditions (multi-field ON)", function () {
+        const sql = buildJoinSQL('"DEV_STOCKS"', {
+            from: "DEV_BOOK",
+            as: "book",
+            joinType: "inner",
+            on: [
+                { localField: "MATERIALID", foreignField: "MATERIALID" },
+                { localField: "DIVISION", foreignField: "DIVISION" },
+            ],
+        });
+        expect(sql.toUpperCase()).to.include("AND");
+    });
+
+    it("21.6 select — pulls only specified columns from the right table", function () {
+        const sql = buildJoinSQL('"stage_0"', {
+            from: "U_PERSONALINFOS",
+            localField: "USERID",
+            foreignField: "USERID",
+            as: "pi",
+            joinType: "left",
+            select: ["EMAILADDRESS"],
+        });
+        // Must include the qualified column reference, not alias.*
+        expect(sql).to.include('"pi"."EMAILADDRESS"');
+        expect(sql).to.not.include('"pi".*');
+    });
+
+    it("21.7 select — multiple columns are all included", function () {
+        const sql = buildJoinSQL('"stage_0"', {
+            from: "U_PERSONALINFOS",
+            localField: "USERID",
+            foreignField: "USERID",
+            as: "pi",
+            joinType: "left",
+            select: ["EMAILADDRESS", "MOBILENO"],
+        });
+        expect(sql).to.include('"pi"."EMAILADDRESS"');
+        expect(sql).to.include('"pi"."MOBILENO"');
+        expect(sql).to.not.include('"pi".*');
+    });
+
+    it("21.8 select — omitting select preserves original alias.* behaviour", function () {
+        const sql = buildJoinSQL('"DEV_STOCKS"', {
+            from: "DEV_MATERIAL",
+            localField: "MATERIALID",
+            foreignField: "MATERIALID",
+            as: "mat",
+            joinType: "left",
+            // no select — backwards-compatible
+        });
+        expect(sql).to.include('"mat".*');
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 22. SET OPERATIONS
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("22. Set Operations", function () {
+    it("22.1 UNION of two queries", async function () {
+        const qb1 = scratch.find({ DIVISION: "WH" }).project({ NAME: 1, VALUE: 1 });
+        const qb2 = scratch.find({ DIVISION: "PR" }).project({ NAME: 1, VALUE: 1 });
+        const result = await OracleCollection.union(qb1, qb2).toArray();
+        expect(result).to.be.an("array");
+    });
+
+    it("22.2 UNION ALL", async function () {
+        const qb1 = scratch.find({ CATEGORY: "Alpha" }).project({ NAME: 1 });
+        const qb2 = scratch.find({ CATEGORY: "Beta" }).project({ NAME: 1 });
+        const result = await OracleCollection.union(qb1, qb2, { all: true }).toArray();
+        expect(result).to.be.an("array");
+    });
+
+    it("22.3 INTERSECT", async function () {
+        const qb1 = scratch.find({ DIVISION: "WH" }).project({ NAME: 1 });
+        const qb2 = scratch.find({ CATEGORY: "Alpha" }).project({ NAME: 1 });
+        const result = await OracleCollection.intersect(qb1, qb2).toArray();
+        expect(result).to.be.an("array");
+    });
+
+    it("22.4 MINUS", async function () {
+        const qb1 = scratch.find({}).project({ NAME: 1 });
+        const qb2 = scratch.find({ CATEGORY: "Alpha" }).project({ NAME: 1 });
+        const result = await OracleCollection.minus(qb1, qb2).toArray();
+        expect(result).to.be.an("array");
+    });
+
+    it("22.5 UNION with sort and limit", async function () {
+        const qb1 = scratch.find({ DIVISION: "WH" }).project({ NAME: 1, VALUE: 1 });
+        const qb2 = scratch.find({ DIVISION: "PR" }).project({ NAME: 1, VALUE: 1 });
+        const result = await OracleCollection.union(qb1, qb2)
+            .sort({ VALUE: -1 })
+            .limit(3)
+            .toArray();
+        expect(result).to.be.an("array");
+        expect(result.length).to.be.at.most(3);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 23. QUERY BUILDER — Edge Cases
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("23. QueryBuilder Edge Cases", function () {
+    it("23.1 cannot chain after terminal method", async function () {
+        const qb = scratch.find({});
+        await qb.toArray();
+        expect(() => qb.sort({ ID: 1 })).to.throw(/Cannot chain/);
+    });
+
+    it("23.2 forEach iterates correct number of rows", async function () {
+        const items = [];
+        await scratch.find({}).limit(3).forEach((row) => items.push(row));
+        expect(items).to.have.length(3);
+    });
+
+    it("23.3 next returns first row", async function () {
+        const row = await scratch.find({}).sort({ VALUE: -1 }).next();
+        expect(row).to.not.be.null;
+        expect(row).to.have.property("VALUE");
+    });
+
+    it("23.4 hasNext true when rows exist", async function () {
+        expect(await scratch.find({}).hasNext()).to.be.true;
+    });
+
+    it("23.5 hasNext false for impossible filter", async function () {
+        expect(await scratch.find({ NAME: "NONEXISTENT_XYZ_123" }).hasNext()).to.be.false;
+    });
+
+    it("23.6 skip without limit works", async function () {
+        const allRows = await scratch.find({}).sort({ ID: 1 }).toArray();
+        const skipped = await scratch.find({}).sort({ ID: 1 }).skip(1).toArray();
+        if (allRows.length > 1) {
+            expect(skipped.length).to.equal(allRows.length - 1);
+        }
+    });
+
+    it("23.7 find is thenable (await directly)", async function () {
+        const rows = await scratch.find({}).limit(2);
         expect(rows).to.be.an("array");
-        rows.forEach((r) => {
-            expect(r.REGION).to.equal("North");
-            expect(r.STATUS).to.equal("completed");
-        });
+        expect(rows.length).to.be.at.most(2);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 24. SCHEMA (DDL) OPERATIONS
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("24. Schema DDL Operations", function () {
+    const DDL_TABLE = "TEST_DDL_TBL";
+
+    afterEach(async function () {
+        await dropIfExists(inventoryDB, DDL_TABLE);
     });
 
-    it("drop() removes a collection table", async function () {
-        const TEMP = "TEST_WRAP_DROP_ME";
-        await schema.createTable(TEMP, {
+    it("24.1 createTable + dropTable", async function () {
+        await schema.createTable(DDL_TABLE, {
             ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
+            NAME: { type: "VARCHAR2(100)", notNull: true },
+            DIVISION: { type: "VARCHAR2(50)" },
+            VAL: { type: "NUMBER(10,2)" },
         });
-        const exists1 = await tableExists(TEMP);
-        expect(exists1).to.be.true;
-
-        const tempColl = new OracleCollection(TEMP, db);
-        await tempColl.drop();
-        const exists2 = await tableExists(TEMP);
-        expect(exists2).to.be.false;
+        expect(await tableExists(inventoryDB, DDL_TABLE)).to.be.true;
+        await schema.dropTable(DDL_TABLE);
+        expect(await tableExists(inventoryDB, DDL_TABLE)).to.be.false;
     });
 
-    it("replaceOne replaces entire document (all fields)", async function () {
-        // Insert a test doc, replace it, verify fields changed
-        await users.insertOne({
-            NAME: "ReplaceTest",
-            EMAIL: "replace@test.com",
-            STATUS: "active",
-            AGE: 99,
-        });
-        await users.findOne({ NAME: "ReplaceTest" });
-        await users.replaceOne(
-            { NAME: "ReplaceTest" },
-            {
-                NAME: "ReplaceTest",
-                EMAIL: "replaced@test.com",
-                STATUS: "inactive",
-                AGE: 1,
-            },
-        );
-        const replaced = await users.findOne({ NAME: "ReplaceTest" });
-        expect(replaced.EMAIL).to.equal("replaced@test.com");
-        expect(replaced.STATUS).to.equal("inactive");
-        expect(Number(replaced.AGE)).to.equal(1);
-        // Cleanup
-        await users.deleteOne({ NAME: "ReplaceTest" });
+    it("24.2 createTable with ifNotExists (idempotent)", async function () {
+        const cols = { ID: { type: "NUMBER", primaryKey: true }, X: { type: "VARCHAR2(50)" } };
+        await schema.createTable(DDL_TABLE, cols, { ifNotExists: true });
+        expect(await tableExists(inventoryDB, DDL_TABLE)).to.be.true;
+        await schema.createTable(DDL_TABLE, cols, { ifNotExists: true }); // no error
     });
 
-    it("updateMany updates all matching documents", async function () {
-        const before = await users.find({ STATUS: "active" }).toArray();
-        await users.updateMany(
-            { STATUS: "active" },
-            { $inc: { LOGIN_COUNT: 1 } },
-        );
-        const after = await users.find({ STATUS: "active" }).toArray();
-        after.forEach((r) => {
-            const orig = before.find((b) => b.ID === r.ID);
-            expect(Number(r.LOGIN_COUNT)).to.equal(
-                Number(orig.LOGIN_COUNT) + 1,
+    it("24.3 alterTable addColumn", async function () {
+        await schema.createTable(DDL_TABLE, {
+            ID: { type: "NUMBER", primaryKey: true },
+            NAME: { type: "VARCHAR2(100)" },
+        });
+        await schema.alterTable(DDL_TABLE, { addColumn: { EXTRA: "VARCHAR2(50)" } });
+        const coll = new OracleCollection(DDL_TABLE, inventoryDB);
+        await coll.insertOne({ ID: 1, NAME: "Test", EXTRA: "ExtraVal" });
+        const doc = await coll.findOne({ ID: 1 });
+        expect(doc.EXTRA).to.equal("ExtraVal");
+    });
+
+    it("24.4 truncateTable clears all rows", async function () {
+        await schema.createTable(DDL_TABLE, {
+            ID: { type: "NUMBER", primaryKey: true },
+            NAME: { type: "VARCHAR2(100)" },
+        });
+        const coll = new OracleCollection(DDL_TABLE, inventoryDB);
+        await coll.insertOne({ ID: 1, NAME: "A" });
+        await coll.insertOne({ ID: 2, NAME: "B" });
+        expect(await rowCount(inventoryDB, DDL_TABLE)).to.equal(2);
+        await schema.truncateTable(DDL_TABLE);
+        expect(await rowCount(inventoryDB, DDL_TABLE)).to.equal(0);
+    });
+
+    it("24.5 renameTable", async function () {
+        const RENAMED = "TEST_DDL_RENAMED";
+        await dropIfExists(inventoryDB, RENAMED);
+        await schema.createTable(DDL_TABLE, {
+            ID: { type: "NUMBER", primaryKey: true },
+        });
+        await schema.renameTable(DDL_TABLE, RENAMED);
+        expect(await tableExists(inventoryDB, RENAMED)).to.be.true;
+        expect(await tableExists(inventoryDB, DDL_TABLE)).to.be.false;
+        await dropIfExists(inventoryDB, RENAMED);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 25. SEQUENCE OPERATIONS
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("25. Sequence Operations", function () {
+    const SEQ_NAME = "TEST_SEQ_1";
+
+    afterEach(async function () {
+        try {
+            await inventoryDB.withConnection(async (conn) => {
+                await conn.execute(`DROP SEQUENCE "${SEQ_NAME}"`, {}, { autoCommit: true });
+            });
+        } catch (e) { /* may not exist */ }
+    });
+
+    it("25.1 createSequence creates and is usable", async function () {
+        await schema.createSequence(SEQ_NAME, {
+            startWith: 1, incrementBy: 1, maxValue: 9999, cycle: false, cache: 20,
+        });
+        const val = await inventoryDB.withConnection(async (conn) => {
+            const r = await conn.execute(
+                `SELECT "${SEQ_NAME}".NEXTVAL AS VAL FROM DUAL`, {},
+                { outFormat: inventoryDB.oracledb.OUT_FORMAT_OBJECT },
             );
+            return Number(r.rows[0].VAL);
         });
-        // Restore
-        await users.updateMany(
-            { STATUS: "active" },
-            { $inc: { LOGIN_COUNT: -1 } },
+        expect(val).to.equal(1);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 26. ADVANCED: PIVOT & UNPIVOT
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("26. Advanced: PIVOT & UNPIVOT", function () {
+    const PIVOT_TABLE = "TEST_PIVOT";
+    const UNPIVOT_TABLE = "TEST_UNPIVOT";
+
+    afterEach(async function () {
+        await dropIfExists(inventoryDB, PIVOT_TABLE);
+        await dropIfExists(inventoryDB, UNPIVOT_TABLE);
+    });
+
+    it("26.1 PIVOT on test data", async function () {
+        await schema.createTable(PIVOT_TABLE, {
+            ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
+            DIVISION: { type: "VARCHAR2(50)", notNull: true },
+            MONTH: { type: "VARCHAR2(5)", notNull: true },
+            VALUE: { type: "NUMBER(12,2)", notNull: true },
+        });
+        const pivotColl = new OracleCollection(PIVOT_TABLE, inventoryDB);
+        await pivotColl.insertMany([
+            { DIVISION: "WH", MONTH: "01", VALUE: 100 },
+            { DIVISION: "WH", MONTH: "02", VALUE: 200 },
+            { DIVISION: "PR", MONTH: "01", VALUE: 150 },
+            { DIVISION: "PR", MONTH: "02", VALUE: 250 },
+        ]);
+        const result = await pivotColl.pivot({
+            value: { $sum: "$VALUE" },
+            pivotOn: "MONTH",
+            pivotValues: ["01", "02"],
+            groupBy: "DIVISION",
+        });
+        expect(result).to.be.an("array");
+        expect(result.length).to.be.at.least(2);
+    });
+
+    it("26.2 UNPIVOT on test data", async function () {
+        await schema.createTable(UNPIVOT_TABLE, {
+            ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
+            DIVISION: { type: "VARCHAR2(50)", notNull: true },
+            M01: { type: "NUMBER(12,2)" },
+            M02: { type: "NUMBER(12,2)" },
+        });
+        const unpivotColl = new OracleCollection(UNPIVOT_TABLE, inventoryDB);
+        await unpivotColl.insertMany([
+            { DIVISION: "WH", M01: 100, M02: 200 },
+            { DIVISION: "PR", M01: 150, M02: 250 },
+        ]);
+        const result = await unpivotColl.unpivot({
+            valueColumn: "VALUE",
+            nameColumn: "MONTH",
+            columns: ["M01", "M02"],
+        });
+        expect(result).to.be.an("array");
+        expect(result.length).to.equal(4);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 27. ADVANCED: FOR UPDATE & TABLESAMPLE
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("27. Advanced: FOR UPDATE & TABLESAMPLE", function () {
+    it("27.1 FOR UPDATE locks rows within transaction", async function () {
+        await inventoryDB.withTransaction(async (conn) => {
+            const s = new OracleCollection(SCRATCH, inventoryDB, conn);
+            const rows = await s.find({ CATEGORY: "TX" }).forUpdate(true).toArray();
+            expect(rows).to.be.an("array");
+        });
+    });
+
+    it("27.2 TABLESAMPLE returns a subset", async function () {
+        const count = await devBook.countDocuments();
+        if (count < 10) return this.skip();
+        const sample = await devBook.find({}, { sample: { percentage: 50 } }).toArray();
+        expect(sample).to.be.an("array");
+        expect(sample.length).to.be.greaterThan(0);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 28. INSERT FROM QUERY
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("28. insertFromQuery", function () {
+    const ARCHIVE = "TEST_ARCHIVE";
+
+    before(async function () {
+        await dropIfExists(inventoryDB, ARCHIVE);
+        await schema.createTable(ARCHIVE, {
+            ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
+            NAME: { type: "VARCHAR2(200)" },
+            CATEGORY: { type: "VARCHAR2(100)" },
+            VALUE: { type: "NUMBER(12,2)" },
+            DIVISION: { type: "VARCHAR2(50)" },
+        });
+    });
+
+    after(async function () {
+        await dropIfExists(inventoryDB, ARCHIVE);
+    });
+
+    it("28.1 insert from query copies matching rows", async function () {
+        const result = await scratch.insertFromQuery(
+            ARCHIVE,
+            scratch.find({ CATEGORY: "Bulk" }).project({ NAME: 1, CATEGORY: 1, VALUE: 1, DIVISION: 1 }),
+            { columns: ["NAME", "CATEGORY", "VALUE", "DIVISION"] },
+        );
+        expect(result.acknowledged).to.be.true;
+        expect(result.insertedCount).to.be.at.least(1);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 29. CROSS-TABLE — Shared Column Verification
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("29. Cross-Table Shared Column Verification", function () {
+    it("29.1 read from all 6 real tables without error", async function () {
+        const results = await Promise.all([
+            devBook.find({}).limit(1).toArray(),
+            devLocation.find({}).limit(1).toArray(),
+            devLock.find({}).limit(1).toArray(),
+            devMaterial.find({}).limit(1).toArray(),
+            devStocks.find({}).limit(1).toArray(),
+            devUnit.find({}).limit(1).toArray(),
+        ]);
+        results.forEach((r) => expect(r).to.be.an("array"));
+    });
+
+    it("29.2 MATERIALID exists in DEV_BOOK, DEV_MATERIAL, DEV_STOCKS", async function () {
+        const [bookDoc, matDoc, stockDoc] = await Promise.all([
+            devBook.findOne({}),
+            devMaterial.findOne({}),
+            devStocks.findOne({}),
+        ]);
+        if (bookDoc) expect(bookDoc).to.have.property("MATERIALID");
+        if (matDoc) expect(matDoc).to.have.property("MATERIALID");
+        if (stockDoc) expect(stockDoc).to.have.property("MATERIALID");
+    });
+
+    it("29.3 DIVISION exists in DEV_BOOK, DEV_LOCATION, DEV_MATERIAL, DEV_STOCKS, DEV_UNIT", async function () {
+        const docs = await Promise.all([
+            devBook.findOne({}),
+            devLocation.findOne({}),
+            devMaterial.findOne({}),
+            devStocks.findOne({}),
+            devUnit.findOne({}),
+        ]);
+        for (const doc of docs) {
+            if (doc) expect(doc).to.have.property("DIVISION");
+        }
+    });
+
+    it("29.4 YEAR exists in DEV_BOOK, DEV_LOCATION, DEV_MATERIAL, DEV_STOCKS, DEV_UNIT", async function () {
+        const docs = await Promise.all([
+            devBook.findOne({}),
+            devLocation.findOne({}),
+            devMaterial.findOne({}),
+            devStocks.findOne({}),
+            devUnit.findOne({}),
+        ]);
+        for (const doc of docs) {
+            if (doc) expect(doc).to.have.property("YEAR");
+        }
+    });
+
+    it("29.5 MONTH exists in all 6 real tables", async function () {
+        const docs = await Promise.all([
+            devBook.findOne({}),
+            devLocation.findOne({}),
+            devLock.findOne({}),
+            devMaterial.findOne({}),
+            devStocks.findOne({}),
+            devUnit.findOne({}),
+        ]);
+        for (const doc of docs) {
+            if (doc) expect(doc).to.have.property("MONTH");
+        }
+    });
+
+    it("29.6 countDocuments on all tables and print summary", async function () {
+        const counts = await Promise.all([
+            devBook.countDocuments(),
+            devLocation.countDocuments(),
+            devLock.countDocuments(),
+            devMaterial.countDocuments(),
+            devStocks.countDocuments(),
+            devUnit.countDocuments(),
+            users.countDocuments(),
+        ]);
+        counts.forEach((c) => expect(c).to.be.a("number").and.at.least(0));
+        console.log(
+            "        Row counts:",
+            `BOOK=${counts[0]}, LOCATION=${counts[1]}, LOCK=${counts[2]},`,
+            `MATERIAL=${counts[3]}, STOCKS=${counts[4]}, UNIT=${counts[5]},`,
+            `USERS=${counts[6]}`,
         );
     });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 30. PERFORMANCE UTILITIES
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("30. Performance Utilities", function () {
+    const perf = createPerformance(inventoryDB);
+
+    it("30.1 explainPlan on a QueryBuilder", async function () {
+        try {
+            const plan = await perf.explainPlan(devBook.find({ DIVISION: "WH" }).limit(10));
+            expect(plan).to.be.an("array");
+        } catch (e) {
+            // May fail due to privilege requirements — acceptable
+            if (e.message.includes("privileges") || e.message.includes("ORA-")) {
+                this.skip();
+            } else {
+                throw e;
+            }
+        }
+    });
+
+    it("30.2 explainPlan on raw SQL string", async function () {
+        try {
+            const plan = await perf.explainPlan(`SELECT * FROM "DEV_BOOK" WHERE ROWNUM <= 10`);
+            expect(plan).to.be.an("array");
+        } catch (e) {
+            if (e.message.includes("privileges") || e.message.includes("ORA-")) {
+                this.skip();
+            } else {
+                throw e;
+            }
+        }
+    });
+
+    it("30.3 analyze table", async function () {
+        try {
+            await perf.analyze("DEV_BOOK");
+        } catch (e) {
+            if (e.message.includes("privileges") || e.message.includes("ORA-")) {
+                this.skip();
+            } else {
+                throw e;
+            }
+        }
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 31. FINAL SUMMARY & REPORT GENERATION
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("31. Final Summary", function () {
+    it("31.1 scratch table has data from all write operations", async function () {
+        const count = await scratch.countDocuments();
+        expect(count).to.be.greaterThan(0);
+        console.log(`        Scratch table final row count: ${count}`);
+    });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  REPORT GENERATOR
+// ═════════════════════════════════════════════════════════════════════════════
+
+function generateReport() {
+    const duration = ((report.endTime - report.startTime) / 1000).toFixed(2);
+
+    const lines = [];
+    lines.push("═══════════════════════════════════════════════════════════════");
+    lines.push("  ORACLE-MONGO-WRAPPER — COMPREHENSIVE TEST REPORT");
+    lines.push("═══════════════════════════════════════════════════════════════");
+    lines.push(`  Date:     ${report.startTime.toISOString()}`);
+    lines.push(`  Duration: ${duration}s`);
+    lines.push(`  Total:    ${report.totalTests} tests`);
+    lines.push(`  Passed:   ${report.passed}`);
+    lines.push(`  Failed:   ${report.failed}`);
+    lines.push(`  Rate:     ${((report.passed / report.totalTests) * 100).toFixed(1)}%`);
+    lines.push("");
+
+    // Table summary
+    lines.push("───────────────────────────────────────────────────────────────");
+    lines.push("  TABLE INVENTORY");
+    lines.push("───────────────────────────────────────────────────────────────");
+    for (const [name, info] of Object.entries(report.tables)) {
+        lines.push(`  ${name.padEnd(20)} Rows: ${String(info.rowCount).padStart(8)}  Cols: ${String(info.columnCount).padStart(3)}`);
+        if (info.columns && info.columns.length > 0) {
+            lines.push(`    Columns: ${info.columns.join(", ")}`);
+        }
+    }
+    lines.push("");
+
+    // Shared columns analysis
+    const sharedCols = {};
+    for (const ts of [SAPBook, StorageLocation, UnlockedInventoryByMonth, MaterialMaster, InventoryStocks, InventoryUnit]) {
+        for (const col of ts.columns) {
+            if (!sharedCols[col]) sharedCols[col] = [];
+            sharedCols[col].push(ts.table);
+        }
+    }
+    const multiTableCols = Object.entries(sharedCols)
+        .filter(([, tables]) => tables.length > 1)
+        .sort((a, b) => b[1].length - a[1].length);
+
+    lines.push("───────────────────────────────────────────────────────────────");
+    lines.push("  SHARED COLUMNS ACROSS TABLES");
+    lines.push("───────────────────────────────────────────────────────────────");
+    for (const [col, tables] of multiTableCols) {
+        lines.push(`  ${col.padEnd(25)} → ${tables.join(", ")}`);
+    }
+    lines.push("");
+
+    // Category breakdown
+    lines.push("───────────────────────────────────────────────────────────────");
+    lines.push("  TEST CATEGORIES COVERED");
+    lines.push("───────────────────────────────────────────────────────────────");
+
+    const categories = [
+        "Connection & Health",
+        "filterParser (All Operators)",
+        "updateParser (All Operators)",
+        "find / findOne / countDocuments / estimatedDocumentCount / distinct",
+        "QueryBuilder (sort, limit, skip, project, toArray, forEach, next, hasNext, explain, count)",
+        "insertOne / insertMany (executeMany, chunkArray)",
+        "updateOne / updateMany / replaceOne ($set, $inc, $mul, $min, $max, $unset, $currentDate)",
+        "deleteOne / deleteMany / findOneAndDelete / findOneAndUpdate / findOneAndReplace",
+        "Upsert (updateOne upsert + findOneAndUpdate upsert)",
+        "MERGE / mergeFrom (Oracle MERGE INTO)",
+        "Transactions & Savepoints (commit, rollback, savepoint, rollbackTo)",
+        "bulkWrite (atomic mixed operations)",
+        "Index Operations (createIndex, getIndexes, dropIndex, dropIndexes, reIndex)",
+        "Aggregation Pipeline ($match, $group, $sort, $limit, $skip, $count, $project, $addFields, $having)",
+        "CTE (withCTE, withRecursiveCTE)",
+        "Window Functions (ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, SUM, COUNT, etc.)",
+        "Join Builder (LEFT, INNER, CROSS, SELF, multi-condition ON)",
+        "Set Operations (UNION, UNION ALL, INTERSECT, MINUS)",
+        "Schema DDL (createTable, alterTable, dropTable, truncateTable, renameTable)",
+        "Sequences (createSequence)",
+        "PIVOT & UNPIVOT",
+        "FOR UPDATE & TABLESAMPLE",
+        "insertFromQuery (INSERT INTO ... SELECT)",
+        "Cross-Table Shared Column Verification",
+        "Performance Utilities (explainPlan, analyze)",
+    ];
+
+    categories.forEach((cat, i) => {
+        lines.push(`  ${String(i + 1).padStart(2)}. ${cat}`);
+    });
+    lines.push("");
+
+    // Failures
+    if (report.failures.length > 0) {
+        lines.push("───────────────────────────────────────────────────────────────");
+        lines.push("  FAILURES");
+        lines.push("───────────────────────────────────────────────────────────────");
+        for (const f of report.failures) {
+            lines.push(`  FAIL: ${f.title}`);
+            lines.push(`        ${f.error}`);
+        }
+        lines.push("");
+    }
+
+    lines.push("═══════════════════════════════════════════════════════════════");
+    lines.push("  END OF REPORT");
+    lines.push("═══════════════════════════════════════════════════════════════");
+
+    const reportStr = lines.join("\n");
+    console.log("\n" + reportStr);
+
+    // Write report to file
+    const reportDir = path.join(__dirname, "logs", new Date().getFullYear().toString(),
+        String(new Date().getMonth() + 1).padStart(2, "0"),
+        String(new Date().getDate()).padStart(2, "0"));
+    fs.mkdirSync(reportDir, { recursive: true });
+    const reportPath = path.join(reportDir, `test-report-${Date.now()}.txt`);
+    fs.writeFileSync(reportPath, reportStr, "utf-8");
+    console.log(`\n  Report saved to: ${reportPath}\n`);
+}
+

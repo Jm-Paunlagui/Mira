@@ -596,6 +596,64 @@ await employees.aggregate([
 ]);
 ```
 
+#### `select` — Avoid ORA-00918 When Tables Share Column Names
+
+When two tables have a column with the same name (e.g. both have `USERID`), the default
+`SELECT left.*, right.*` produces a duplicate column in the result set. Oracle then raises
+**ORA-00918: column ambiguously defined** when a later `$project` references that column.
+
+Use `select` to list only the columns you need from the **right-hand (joined) table**.
+The left table is always included in full.
+
+```js
+// Without select — raises ORA-00918 if U_USERS and U_PERSONALINFOS both have USERID
+await users.aggregate([
+    { $match: { USERID: "48022603" } },
+    {
+        $lookup: {
+            from: "U_PERSONALINFOS",
+            localField: "USERID",
+            foreignField: "USERID",
+            as: "pi",
+            joinType: "left",
+            // ← no select: both tables expose USERID → ambiguous
+        },
+    },
+    { $project: { USERID: 1, EMAILADDRESS: 1 } }, // ORA-00918 ❌
+]);
+
+// With select — only EMAILADDRESS is pulled from U_PERSONALINFOS
+await users.aggregate([
+    { $match: { USERID: "48022603" } },
+    {
+        $lookup: {
+            from: "U_PERSONALINFOS",
+            localField: "USERID",
+            foreignField: "USERID",
+            as: "pi",
+            joinType: "left",
+            select: ["EMAILADDRESS"], // ← pull only this column from the right side ✅
+        },
+    },
+    { $project: { USERID: 1, EMAILADDRESS: 1 } }, // unambiguous ✅
+]);
+```
+
+Generated SQL comparison:
+
+```sql
+-- Without select (ambiguous USERID):
+SELECT "stage_0".*, "pi".*
+FROM "stage_0" LEFT OUTER JOIN "U_PERSONALINFOS" "pi" ON "stage_0"."USERID" = "pi"."USERID"
+
+-- With select: ["EMAILADDRESS"] (no duplicate columns):
+SELECT "stage_0".*, "pi"."EMAILADDRESS"
+FROM "stage_0" LEFT OUTER JOIN "U_PERSONALINFOS" "pi" ON "stage_0"."USERID" = "pi"."USERID"
+```
+
+> **Rule of thumb:** Any time the joined table shares a column name with the left table,
+> use `select` to list only the columns you actually need from the right side.
+
 ### Transactions with Savepoints
 
 Transactions ensure **all-or-nothing** execution. If anything fails, everything rolls back.

@@ -46,6 +46,7 @@ const { quoteIdentifier } = require("../utils");
  * @param {string} [lookup.as] - Alias for the joined table (defaults to `from`)
  * @param {string} [lookup.joinType='left'] - Join type: left, right, inner, full, cross, self, natural
  * @param {Array} [lookup.on] - Multi-condition join: [{ localField, foreignField }, ...]
+ * @param {string[]} [lookup.select] - Columns to take from the joined table (omit to take all)
  * @returns {string} Complete SELECT ... JOIN ... ON ... SQL
  */
 function buildJoinSQL(source, lookup) {
@@ -56,9 +57,16 @@ function buildJoinSQL(source, lookup) {
         as,
         joinType = "left",
         on,
+        select,
     } = lookup;
     const joinAlias = as || from;
     const jt = _resolveJoinType(joinType);
+
+    // When `select` is provided, pull only those columns from the right side.
+    // This avoids ORA-00918 when the two tables share column names (e.g. USERID).
+    const rightCols = Array.isArray(select) && select.length > 0
+        ? select.map((col) => `${quoteIdentifier(joinAlias)}.${quoteIdentifier(col)}`).join(", ")
+        : `${quoteIdentifier(joinAlias)}.*`;
 
     let onClause;
     if (on && Array.isArray(on)) {
@@ -80,7 +88,7 @@ function buildJoinSQL(source, lookup) {
         onClause = `${source}.${quoteIdentifier(localField)} = ${quoteIdentifier(joinAlias)}.${quoteIdentifier(foreignField)}`;
     }
 
-    return `SELECT ${source}.*, ${quoteIdentifier(joinAlias)}.* FROM ${source} ${jt} ${quoteIdentifier(from)} ${quoteIdentifier(joinAlias)} ON ${onClause}`;
+    return `SELECT ${source}.*, ${rightCols} FROM ${source} ${jt} ${quoteIdentifier(from)} ${quoteIdentifier(joinAlias)} ON ${onClause}`;
 }
 
 /** Map a join type string to Oracle JOIN keyword */
