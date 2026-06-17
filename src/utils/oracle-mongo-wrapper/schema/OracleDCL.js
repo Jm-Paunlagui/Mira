@@ -46,7 +46,7 @@ class OracleDCL {
      *
      * @param {string[]} privileges - Privileges to grant: ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'ALL']
      * @param {string} on - Table or object name
-     * @param {string} to - User or role name
+     * @param {string} to - USER or role name
      * @returns {Promise<{ acknowledged: boolean }>}
      *
      * @example
@@ -75,7 +75,7 @@ class OracleDCL {
      *
      * @param {string[]} privileges - Privileges to revoke: ['DELETE', 'UPDATE', etc.]
      * @param {string} on - Table or object name
-     * @param {string} from - User or role name
+     * @param {string} from - USER or role name
      * @returns {Promise<{ acknowledged: boolean }>}
      *
      * @example

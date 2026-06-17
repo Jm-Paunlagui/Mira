@@ -515,7 +515,7 @@ class QueryBuilder {
      *
      * @example
      *   const exists = await coll.find({ email: "ana@test.com" }).hasNext();
-     *   if (!exists) console.log("User not found");
+     *   if (!exists) console.log("USER not found");
      */
     async hasNext() {
         this._terminated = true;

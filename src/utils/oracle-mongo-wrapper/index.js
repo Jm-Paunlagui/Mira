@@ -51,19 +51,19 @@ const { withCTE, withRecursiveCTE } = require("./pipeline/cteBuilder"); // Named
 
 // ─── Subquery helpers ────────────────────────────────────────────
 const {
-    buildScalarSubquery, // Single-value subquery in SELECT
-    buildExistsSubquery, // EXISTS (SELECT 1 FROM ...)
-    buildNotExistsSubquery, // NOT EXISTS (SELECT 1 FROM ...)
-    buildCorrelatedSubquery, // Subquery that references the outer query
-    buildInSelectSubquery, // WHERE col IN (SELECT ...)
-    buildAnyAllSubquery, // WHERE col > ANY/ALL (SELECT ...)
+  buildScalarSubquery, // Single-value subquery in SELECT
+  buildExistsSubquery, // EXISTS (SELECT 1 FROM ...)
+  buildNotExistsSubquery, // NOT EXISTS (SELECT 1 FROM ...)
+  buildCorrelatedSubquery, // Subquery that references the outer query
+  buildInSelectSubquery, // WHERE col IN (SELECT ...)
+  buildAnyAllSubquery, // WHERE col > ANY/ALL (SELECT ...)
 } = require("./pipeline/subqueryBuilder");
 
 // ─── Oracle-specific advanced features ───────────────────────────
 const {
-    buildConnectBy, // Hierarchical queries (tree/graph traversal)
-    buildPivot, // Rotate rows → columns
-    buildUnpivot, // Rotate columns → rows
+  buildConnectBy, // Hierarchical queries (tree/graph traversal)
+  buildPivot, // Rotate rows → columns
+  buildUnpivot, // Rotate columns → rows
 } = require("./advanced/oracleAdvanced");
 
 // ─── Performance & DBA utilities ─────────────────────────────────
@@ -71,60 +71,60 @@ const { createPerformance } = require("./advanced/performanceUtils"); // EXPLAIN
 
 // ─── Shared utility functions ────────────────────────────────────
 const {
-    quoteIdentifier, // Wrap names in double-quotes for Oracle safety
-    convertTypes, // Convert Oracle string-numbers to JS numbers
-    rowToDoc, // Alias for convertTypes
-    mergeBinds, // Safely combine two bind objects
-    buildOrderBy, // { col: 1 } → ORDER BY "col" ASC
-    buildProjection, // { col: 1 } → column list for SELECT
+  quoteIdentifier, // Wrap names in double-quotes for Oracle safety
+  convertTypes, // Convert Oracle string-numbers to JS numbers
+  rowToDoc, // Alias for convertTypes
+  mergeBinds, // Safely combine two bind objects
+  buildOrderBy, // { col: 1 } → ORDER BY "col" ASC
+  buildProjection, // { col: 1 } → column list for SELECT
 } = require("./utils");
 
 module.exports = {
-    // Core
-    createDb,
-    OracleCollection,
-    OracleSchema,
-    OracleDCL,
-    QueryBuilder,
-    Transaction,
+  // Core
+  createDb,
+  OracleCollection,
+  OracleSchema,
+  OracleDCL,
+  QueryBuilder,
+  Transaction,
 
-    // Parsers
-    parseFilter,
-    parseUpdate,
+  // Parsers
+  parseFilter,
+  parseUpdate,
 
-    // Aggregation
-    buildAggregateSQL,
-    buildWindowExpr,
+  // Aggregation
+  buildAggregateSQL,
+  buildWindowExpr,
 
-    // Joins & Set Operations
-    buildJoinSQL,
-    SetResultBuilder,
+  // Joins & Set Operations
+  buildJoinSQL,
+  SetResultBuilder,
 
-    // CTEs
-    withCTE,
-    withRecursiveCTE,
+  // CTEs
+  withCTE,
+  withRecursiveCTE,
 
-    // Subqueries
-    buildScalarSubquery,
-    buildExistsSubquery,
-    buildNotExistsSubquery,
-    buildCorrelatedSubquery,
-    buildInSelectSubquery,
-    buildAnyAllSubquery,
+  // Subqueries
+  buildScalarSubquery,
+  buildExistsSubquery,
+  buildNotExistsSubquery,
+  buildCorrelatedSubquery,
+  buildInSelectSubquery,
+  buildAnyAllSubquery,
 
-    // Oracle Advanced
-    buildConnectBy,
-    buildPivot,
-    buildUnpivot,
+  // Oracle Advanced
+  buildConnectBy,
+  buildPivot,
+  buildUnpivot,
 
-    // Performance
-    createPerformance,
+  // Performance
+  createPerformance,
 
-    // Utils
-    quoteIdentifier,
-    convertTypes,
-    rowToDoc,
-    mergeBinds,
-    buildOrderBy,
-    buildProjection,
+  // Utils
+  quoteIdentifier,
+  convertTypes,
+  rowToDoc,
+  mergeBinds,
+  buildOrderBy,
+  buildProjection,
 };

@@ -85,6 +85,24 @@ const {
     oracleMongoWrapperMessages: MSG,
 } = require("../../../constants/messages");
 
+/**
+ * Deep-clone an object/array while preserving Date instances.
+ * JSON.parse(JSON.stringify(...)) converts Dates to ISO strings, which then
+ * fail Oracle's NLS_DATE_FORMAT implicit conversion (ORA-01843) when passed
+ * as bind values against DATE columns.
+ *
+ * @param {*} value
+ * @returns {*}
+ */
+function _deepClone(value) {
+    if (value === null || typeof value !== "object") return value;
+    if (value instanceof Date) return new Date(value.getTime());
+    if (Array.isArray(value)) return value.map(_deepClone);
+    const out = {};
+    for (const k of Object.keys(value)) out[k] = _deepClone(value[k]);
+    return out;
+}
+
 class OracleCollection {
     /**
      * Create an OracleCollection instance for a specific table.
@@ -509,7 +527,7 @@ class OracleCollection {
      * Runs SELECT COUNT(*) — scans the actual data. For a faster
      * approximate count, use estimatedDocumentCount() instead.
      *
-     * @param {Object} [filter] - Filter criteria (omit or {} for all rows)
+     * @param {Object} [filter] - Filter criticaleria (omit or {} for all rows)
      * @returns {Promise<number>} The count of matching rows
      *
      * @example
@@ -734,14 +752,35 @@ class OracleCollection {
      * Insert multiple documents atomically using executeMany.
      *
      * All documents are inserted in a SINGLE TRANSACTION — if any one fails,
-     * none of them are inserted. Much faster than calling insertOne() in a loop
-     * because it uses Oracle's executeMany() for bulk insertion.
+     * none of them are inserted (unless `options.batchErrors` is enabled —
+     * see below). Much faster than calling insertOne() in a loop because it
+     * uses Oracle's executeMany() for bulk insertion.
      *
      * IMPORTANT: All documents must have the same set of keys (columns).
      * The keys from the FIRST document define the columns for all rows.
      *
+     * Session binding: when the collection was constructed with an explicit
+     * connection (session.collection() inside a Transaction), the inserts run
+     * on THAT connection and join the surrounding transaction — exactly like
+     * insertOne. Otherwise a dedicated transaction is opened as before.
+     *
      * @param {Array<Object>} documents - Array of documents to insert
-     * @returns {Promise<{ acknowledged: boolean, insertedCount: number, insertedIds: Array }>}
+     * @param {Object} [options]
+     *   - returning: Array of column names to RETURN per inserted row
+     *     (e.g. ['WALLET_ID']). Defaults to ['ID'] for backward compatibility.
+     *     Pass [] for tables without a returnable key column. RETURNING is
+     *     intended for NUMBER key columns (IDENTITY / sequence values).
+     *   - batchErrors: When true, row-level errors (e.g. ORA-00001) do NOT
+     *     abort the batch — failed rows are reported in result.batchErrors
+     *     as { offset, message } while the remaining rows are still inserted.
+     *     Mutually exclusive with a non-empty `returning` list.
+     * @returns {Promise<{
+     *   acknowledged: boolean,
+     *   insertedCount: number,
+     *   insertedIds: Array,
+     *   returning?: Array<Object>,
+     *   batchErrors?: Array<{ offset: number, message: string }>,
+     * }>}
      *
      * @example
      *   const result = await users.insertMany([
@@ -751,16 +790,41 @@ class OracleCollection {
      *   ]);
      *   console.log(result.insertedCount); // → 3
      *   console.log(result.insertedIds);   // → [1, 2, 3]
+     *
+     * @example
+     *   // Custom key column + per-row error isolation
+     *   const r1 = await wallets.insertMany(rows, { returning: ["WALLET_ID"] });
+     *   console.log(r1.returning); // → [{ WALLET_ID: 7 }, { WALLET_ID: 8 }]
+     *
+     *   const r2 = await subsidies.insertMany(rows, {
+     *     returning: [],
+     *     batchErrors: true,
+     *   });
+     *   console.log(r2.batchErrors); // → [{ offset: 3, message: "ORA-00001: …" }]
      */
-    async insertMany(documents) {
+    async insertMany(documents, options = {}) {
         if (!Array.isArray(documents) || documents.length === 0) {
             throw new Error(MSG.INSERT_MANY_EMPTY);
         }
 
-        return this.db.withTransaction(async (conn) => {
+        const returningCols = options.returning ?? ["ID"];
+        const batchErrors = options.batchErrors === true;
+        if (batchErrors && returningCols.length > 0) {
+            throw new Error(MSG.INSERT_MANY_RETURNING_WITH_BATCH_ERRORS);
+        }
+
+        const run = async (conn) => {
             const cols = Object.keys(documents[0]);
             const placeholders = cols.map((_, i) => `:v${i}`).join(", ");
-            const returningSql = ` RETURNING "ID" INTO :out_id`;
+
+            let returningSql = "";
+            if (returningCols.length > 0) {
+                const retCols = returningCols.map(quoteIdentifier).join(", ");
+                const retOuts = returningCols
+                    .map((c) => `:out_${c}`)
+                    .join(", ");
+                returningSql = ` RETURNING ${retCols} INTO ${retOuts}`;
+            }
             const sql = `INSERT INTO ${quoteIdentifier(this.tableName)} (${cols.map(quoteIdentifier).join(", ")}) VALUES (${placeholders})${returningSql}`;
 
             // Build bind arrays for executeMany
@@ -779,23 +843,31 @@ class OracleCollection {
                 } else if (sampleVal instanceof Date) {
                     bindDefs[`v${i}`] = { type: this.db.oracledb.DATE };
                 } else {
-                    const maxLen = Math.max(
+                    // maxSize is in BYTES, not characters. Multi-byte UTF-8
+                    // (e.g. Filipino/Spanish names with ñ, é) would be
+                    // truncated/ORA-06502 if sized by char length, so measure
+                    // true byte length over every row's value for this column.
+                    const maxBytes = Math.max(
                         ...documents.map((d) => {
                             const v = d[c];
-                            return v != null ? String(v).length : 1;
+                            return v != null
+                                ? Buffer.byteLength(String(v), "utf8")
+                                : 1;
                         }),
                         1,
                     );
                     bindDefs[`v${i}`] = {
                         type: this.db.oracledb.STRING,
-                        maxSize: Math.max(maxLen * 2, 100),
+                        maxSize: Math.max(maxBytes, 100),
                     };
                 }
             });
-            bindDefs.out_id = {
-                type: this.db.oracledb.NUMBER,
-                dir: this.db.oracledb.BIND_OUT,
-            };
+            for (const c of returningCols) {
+                bindDefs[`out_${c}`] = {
+                    type: this.db.oracledb.NUMBER,
+                    dir: this.db.oracledb.BIND_OUT,
+                };
+            }
 
             const bindRows = documents.map((doc) => {
                 const row = {};
@@ -809,23 +881,183 @@ class OracleCollection {
                 const result = await conn.executeMany(sql, bindRows, {
                     autoCommit: false,
                     bindDefs,
+                    ...(batchErrors ? { batchErrors: true } : {}),
                 });
 
-                const insertedIds = result.outBinds
-                    ? result.outBinds.map((ob) => ob.out_id?.[0] ?? null)
-                    : [];
-
-                return {
+                const response = {
                     acknowledged: true,
                     insertedCount: result.rowsAffected,
-                    insertedIds,
+                    insertedIds: [],
                 };
+
+                if (returningCols.length > 0 && result.outBinds) {
+                    response.returning = result.outBinds.map((ob) => {
+                        const rowOut = {};
+                        for (const c of returningCols) {
+                            const val = ob[`out_${c}`];
+                            rowOut[c] = Array.isArray(val) ? val[0] : val;
+                        }
+                        return rowOut;
+                    });
+                    if (returningCols.includes("ID")) {
+                        response.insertedIds = response.returning.map(
+                            (r) => r.ID ?? null,
+                        );
+                    }
+                }
+                if (batchErrors) {
+                    response.batchErrors = (result.batchErrors ?? []).map(
+                        (e) => ({
+                            offset: Number(e.offset),
+                            message: e.message ?? String(e),
+                        }),
+                    );
+                }
+
+                return response;
             } catch (err) {
                 throw new Error(
                     MSG.wrapError("OracleCollection.insertMany", err, sql),
                 );
             }
+        };
+
+        // Session-bound collections join the surrounding transaction;
+        // unbound collections keep the original dedicated-transaction shape.
+        return this._conn ? run(this._conn) : this.db.withTransaction(run);
+    }
+
+    /**
+     * Update MANY rows in ONE executeMany round trip, each row matched by its
+     * own key values — the set-based counterpart of calling updateOne() in a
+     * loop when every row carries different values.
+     *
+     * Each row object supplies BOTH the key columns (options.keys — become
+     * the WHERE clause) and the value columns (every other property — become
+     * the SET clause). All rows must share the same set of properties; the
+     * FIRST row defines the column layout. Every value flows through bind
+     * variables — no caller data is ever interpolated into the SQL string.
+     *
+     * Session binding: identical to insertMany — runs on the bound connection
+     * inside a Transaction, or in its own dedicated transaction otherwise.
+     *
+     * O(1) Oracle round trips, O(n) bind-array space — n = row count.
+     *
+     * @param {Array<Object>} rows - Key + value columns per row (same shape)
+     * @param {Object} options
+     *   - keys: Array of property names that identify the target row
+     *     (e.g. ['WALLET_ID'] or ['GID', 'CARD_NUMBER'])
+     * @returns {Promise<{ acknowledged: boolean, modifiedCount: number }>}
+     *
+     * @example
+     *   // Stamp freshly signed ROW_HASH values onto 1,000 wallets at once
+     *   await wallets.bulkUpdateByKeys(
+     *     [
+     *       { WALLET_ID: 7, ROW_HASH: "ab…" },
+     *       { WALLET_ID: 8, ROW_HASH: "cd…" },
+     *     ],
+     *     { keys: ["WALLET_ID"] },
+     *   );
+     *   // → UPDATE "TAP_WALLET" SET "ROW_HASH" = :s0 WHERE "WALLET_ID" = :k0
+     */
+    async bulkUpdateByKeys(rows, options = {}) {
+        if (!Array.isArray(rows) || rows.length === 0) {
+            throw new Error(MSG.BULK_UPDATE_EMPTY);
+        }
+        const keys = options.keys;
+        if (!Array.isArray(keys) || keys.length === 0) {
+            throw new Error(MSG.BULK_UPDATE_KEYS_REQUIRED);
+        }
+
+        const allCols = Object.keys(rows[0]);
+        const setCols = allCols.filter((c) => !keys.includes(c));
+        if (setCols.length === 0) {
+            throw new Error(MSG.BULK_UPDATE_NO_SET_COLUMNS);
+        }
+
+        // Positional bind names (s0…, k0…) keep bind identifiers valid for any
+        // column name; column identifiers themselves are quoted as everywhere
+        // else in the wrapper.
+        const setClause = setCols
+            .map((c, i) => `${quoteIdentifier(c)} = :s${i}`)
+            .join(", ");
+        const whereClause = keys
+            .map((c, i) => `${quoteIdentifier(c)} = :k${i}`)
+            .join(" AND ");
+        const sql = `UPDATE ${quoteIdentifier(this.tableName)} SET ${setClause} WHERE ${whereClause}`;
+
+        // Bind definitions: same type-scan approach as insertMany.
+        const bindDefs = {};
+        const defFor = (col) => {
+            let sampleVal = null;
+            for (const row of rows) {
+                if (row[col] != null) {
+                    sampleVal = row[col];
+                    break;
+                }
+            }
+            if (typeof sampleVal === "number") {
+                return { type: this.db.oracledb.NUMBER };
+            }
+            if (sampleVal instanceof Date) {
+                return { type: this.db.oracledb.DATE };
+            }
+            // maxSize is in BYTES — measure true UTF-8 byte length so
+            // multi-byte values (e.g. names with ñ/é) are never truncated.
+            const maxBytes = Math.max(
+                ...rows.map((r) => {
+                    const v = r[col];
+                    return v != null
+                        ? Buffer.byteLength(String(v), "utf8")
+                        : 1;
+                }),
+                1,
+            );
+            return {
+                type: this.db.oracledb.STRING,
+                maxSize: Math.max(maxBytes, 100),
+            };
+        };
+        setCols.forEach((c, i) => {
+            bindDefs[`s${i}`] = defFor(c);
         });
+        keys.forEach((c, i) => {
+            bindDefs[`k${i}`] = defFor(c);
+        });
+
+        const bindRows = rows.map((row) => {
+            const bound = {};
+            setCols.forEach((c, i) => {
+                bound[`s${i}`] = row[c] ?? null;
+            });
+            keys.forEach((c, i) => {
+                bound[`k${i}`] = row[c] ?? null;
+            });
+            return bound;
+        });
+
+        const run = async (conn) => {
+            try {
+                const result = await conn.executeMany(sql, bindRows, {
+                    autoCommit: false,
+                    bindDefs,
+                });
+                return {
+                    acknowledged: true,
+                    modifiedCount: result.rowsAffected,
+                };
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.bulkUpdateByKeys",
+                        err,
+                        sql,
+                    ),
+                );
+            }
+        };
+
+        return this._conn ? run(this._conn) : this.db.withTransaction(run);
     }
 
     // ─── Update Operations ───────────────────────────────────────
@@ -1282,7 +1514,10 @@ class OracleCollection {
      */
     aggregate(pipeline) {
         const { buildAggregateSQL } = require("../pipeline/aggregatePipeline");
-        const pipelineCopy = JSON.parse(JSON.stringify(pipeline));
+        // Deep-clone preserving Date instances — JSON round-trip converts Dates to
+        // ISO strings which then fail Oracle's NLS_DATE_FORMAT implicit conversion
+        // (ORA-01843) when used as bind values against DATE columns.
+        const pipelineCopy = _deepClone(pipeline);
         const { sql, binds } = buildAggregateSQL(
             this.tableName,
             pipelineCopy,

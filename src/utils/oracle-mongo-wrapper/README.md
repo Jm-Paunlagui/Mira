@@ -217,6 +217,27 @@ await users.insertMany([
     { name: "Maria", email: "maria@email.com" },
     { name: "Pedro", email: "pedro@email.com" },
 ]);
+
+// insertMany options:
+//   returning    — column names to RETURN per inserted row. Defaults to
+//                  ["ID"] (backward compatible). Pass [] for tables whose
+//                  key column is not named ID. Intended for NUMBER keys.
+//   batchErrors  — when true, a row-level error (e.g. ORA-00001) rejects
+//                  ONLY that row; the rest of the batch still inserts and
+//                  result.batchErrors lists { offset, message } per failure.
+//                  Mutually exclusive with a non-empty `returning`.
+const r1 = await wallets.insertMany(rows, { returning: ["WALLET_ID"] });
+// r1.returning → [{ WALLET_ID: 7 }, { WALLET_ID: 8 }, …]
+
+const r2 = await subsidies.insertMany(rows, {
+    returning: [],
+    batchErrors: true,
+});
+// r2.batchErrors → [{ offset: 3, message: "ORA-00001: …" }]
+
+// Session binding: inside Transaction sessions, insertMany joins the
+// surrounding transaction (same rule as insertOne):
+//   await session.collection("TAP_WALLET").insertMany(rows, { returning: [] });
 ```
 
 ### Find Data
@@ -246,6 +267,19 @@ await users.updateOne(
 
 // Update all rows matching a filter
 await users.updateMany({ status: "trial" }, { $set: { status: "expired" } });
+
+// Update MANY rows in ONE round trip, each matched by its own key values —
+// the bulk counterpart of looping updateOne when every row carries different
+// values. options.keys names the WHERE columns; every other property of each
+// row becomes the SET clause. All rows must share the same property set.
+await wallets.bulkUpdateByKeys(
+    [
+        { WALLET_ID: 7, ROW_HASH: "ab…" },
+        { WALLET_ID: 8, ROW_HASH: "cd…" },
+    ],
+    { keys: ["WALLET_ID"] },
+);
+// → UPDATE "TAP_WALLET" SET "ROW_HASH" = :s0 WHERE "WALLET_ID" = :k0  (executeMany)
 ```
 
 ### Delete Data
@@ -632,10 +666,10 @@ await users.aggregate([
             foreignField: "USERID",
             as: "pi",
             joinType: "left",
-            select: ["EMAILADDRESS"], // ← pull only this column from the right side ✅
+            select: ["EMAILADDRESS"], // ← pull only this column from the right side
         },
     },
-    { $project: { USERID: 1, EMAILADDRESS: 1 } }, // unambiguous ✅
+    { $project: { USERID: 1, EMAILADDRESS: 1 } }, // unambiguous
 ]);
 ```
 

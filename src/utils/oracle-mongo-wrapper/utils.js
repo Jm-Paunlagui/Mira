@@ -39,9 +39,9 @@ const { oracleMongoWrapperMessages: MSG } = require("../../constants/messages");
  *   quoteIdentifier("ORDER")   // → '"ORDER"'   (ORDER is a reserved word)
  */
 function quoteIdentifier(name) {
-    // Escape embedded double-quotes to prevent identifier injection (CWE-116)
-    const sanitized = String(name).replace(/"/g, '""');
-    return `"${sanitized}"`;
+  // Escape embedded double-quotes to prevent identifier injection (CWE-116)
+  const sanitized = String(name).replace(/"/g, '""');
+  return `"${sanitized}"`;
 }
 
 // ─── convertTypes ───────────────────────────────────────────────
@@ -63,22 +63,22 @@ function quoteIdentifier(name) {
  *   // → { NAME: "Juan", AGE: 25, SALARY: 50000.5 }
  */
 function convertTypes(row) {
-    if (!row || typeof row !== "object") return row;
-    const out = {};
-    for (const [key, val] of Object.entries(row)) {
-        if (
-            typeof val === "string" &&
-            val !== "" &&
-            !isNaN(val) &&
-            val.trim() !== ""
-        ) {
-            const n = Number(val);
-            out[key] = isFinite(n) ? n : val;
-        } else {
-            out[key] = val;
-        }
+  if (!row || typeof row !== "object") return row;
+  const out = {};
+  for (const [key, val] of Object.entries(row)) {
+    if (
+      typeof val === "string" &&
+      val !== "" &&
+      !isNaN(val) &&
+      val.trim() !== ""
+    ) {
+      const n = Number(val);
+      out[key] = isFinite(n) ? n : val;
+    } else {
+      out[key] = val;
     }
-    return out;
+  }
+  return out;
 }
 
 // ─── rowToDoc ───────────────────────────────────────────────────
@@ -93,7 +93,7 @@ function convertTypes(row) {
  * @returns {Object} Cleaned document with proper types
  */
 function rowToDoc(row) {
-    return convertTypes(row);
+  return convertTypes(row);
 }
 
 // ─── mergeBinds ─────────────────────────────────────────────────
@@ -125,14 +125,14 @@ function rowToDoc(row) {
  *   // → { where_name_0: "Juan", upd_status_0: "active" }
  */
 function mergeBinds(a, b) {
-    const merged = { ...a };
-    for (const [k, v] of Object.entries(b)) {
-        if (k in merged) {
-            throw new Error(MSG.MERGE_BINDS_KEY_COLLISION(k));
-        }
-        merged[k] = v;
+  const merged = { ...a };
+  for (const [k, v] of Object.entries(b)) {
+    if (k in merged) {
+      throw new Error(MSG.MERGE_BINDS_KEY_COLLISION(k));
     }
-    return merged;
+    merged[k] = v;
+  }
+  return merged;
 }
 
 // ─── buildOrderBy ───────────────────────────────────────────────
@@ -154,17 +154,17 @@ function mergeBinds(a, b) {
  *   buildOrderBy(null)  // → ""  (no sorting)
  */
 function buildOrderBy(sortSpec) {
-    if (
-        !sortSpec ||
-        typeof sortSpec !== "object" ||
-        Object.keys(sortSpec).length === 0
-    ) {
-        return "";
-    }
-    const parts = Object.entries(sortSpec).map(([col, dir]) => {
-        return `${quoteIdentifier(col)} ${dir === -1 ? "DESC" : "ASC"}`;
-    });
-    return `ORDER BY ${parts.join(", ")}`;
+  if (
+    !sortSpec ||
+    typeof sortSpec !== "object" ||
+    Object.keys(sortSpec).length === 0
+  ) {
+    return "";
+  }
+  const parts = Object.entries(sortSpec).map(([col, dir]) => {
+    return `${quoteIdentifier(col)} ${dir === -1 ? "DESC" : "ASC"}`;
+  });
+  return `ORDER BY ${parts.join(", ")}`;
 }
 
 // ─── buildProjection ────────────────────────────────────────────
@@ -206,39 +206,39 @@ function buildOrderBy(sortSpec) {
  *   // → { columns: '*', isExclusion: false, excludedCols: [] }
  */
 function buildProjection(projection) {
-    if (
-        !projection ||
-        typeof projection !== "object" ||
-        Object.keys(projection).length === 0
-    ) {
-        return { columns: "*", isExclusion: false, excludedCols: [] };
-    }
+  if (
+    !projection ||
+    typeof projection !== "object" ||
+    Object.keys(projection).length === 0
+  ) {
+    return { columns: "*", isExclusion: false, excludedCols: [] };
+  }
 
-    const entries = Object.entries(projection);
-    const isExclusion = entries.some(([, v]) => v === 0);
+  const entries = Object.entries(projection);
+  const isExclusion = entries.some(([, v]) => v === 0);
 
-    if (isExclusion) {
-        const excludedCols = entries.filter(([, v]) => v === 0).map(([k]) => k);
-        return { columns: "*", isExclusion: true, excludedCols };
-    }
+  if (isExclusion) {
+    const excludedCols = entries.filter(([, v]) => v === 0).map(([k]) => k);
+    return { columns: "*", isExclusion: true, excludedCols };
+  }
 
-    // Inclusion mode — only include listed columns
-    const cols = entries
-        .filter(([, v]) => v === 1 || typeof v === "object")
-        .map(([k]) => quoteIdentifier(k));
+  // Inclusion mode — only include listed columns
+  const cols = entries
+    .filter(([, v]) => v === 1 || typeof v === "object")
+    .map(([k]) => quoteIdentifier(k));
 
-    return {
-        columns: cols.length > 0 ? cols.join(", ") : "*",
-        isExclusion: false,
-        excludedCols: [],
-    };
+  return {
+    columns: cols.length > 0 ? cols.join(", ") : "*",
+    isExclusion: false,
+    excludedCols: [],
+  };
 }
 
 module.exports = {
-    quoteIdentifier,
-    convertTypes,
-    rowToDoc,
-    mergeBinds,
-    buildOrderBy,
-    buildProjection,
+  quoteIdentifier,
+  convertTypes,
+  rowToDoc,
+  mergeBinds,
+  buildOrderBy,
+  buildProjection,
 };

@@ -59,74 +59,71 @@ const { parseFilter } = require("../parsers/filterParser");
  *   })
  */
 function buildConnectBy(tableName, spec) {
-    const {
-        startWith,
-        connectBy,
-        orderSiblings,
-        maxLevel,
-        includeLevel,
-        includePath,
-    } = spec;
-    const binds = {};
+  const {
+    startWith,
+    connectBy,
+    orderSiblings,
+    maxLevel,
+    includeLevel,
+    includePath,
+  } = spec;
+  const binds = {};
 
-    // SELECT clause
-    const selectParts = [];
-    if (includeLevel) selectParts.push("LEVEL");
-    if (includePath) {
-        selectParts.push(
-            `SYS_CONNECT_BY_PATH(${quoteIdentifier(_getNameColumn(spec))}, '/') AS "PATH"`,
+  // SELECT clause
+  const selectParts = [];
+  if (includeLevel) selectParts.push("LEVEL");
+  if (includePath) {
+    selectParts.push(
+      `SYS_CONNECT_BY_PATH(${quoteIdentifier(_getNameColumn(spec))}, '/') AS "PATH"`,
+    );
+  }
+  selectParts.push(`${quoteIdentifier(tableName)}.*`);
+
+  // START WITH
+  let startWithClause = "";
+  if (startWith) {
+    const { whereClause: sw, binds: swBinds } = parseFilter(startWith);
+    Object.assign(binds, swBinds);
+    startWithClause = `START WITH ${sw.replace(/^WHERE\s+/i, "")}`;
+  }
+
+  // CONNECT BY
+  let connectByClause = "";
+  if (connectBy) {
+    const parts = [];
+    for (const [childCol, priorRef] of Object.entries(connectBy)) {
+      if (typeof priorRef === "string" && priorRef.includes("$PRIOR")) {
+        const parentCol = priorRef.replace("$PRIOR ", "").replace("$PRIOR", "");
+        parts.push(
+          `PRIOR ${quoteIdentifier(parentCol)} = ${quoteIdentifier(childCol)}`,
         );
-    }
-    selectParts.push(`${quoteIdentifier(tableName)}.*`);
-
-    // START WITH
-    let startWithClause = "";
-    if (startWith) {
-        const { whereClause: sw, binds: swBinds } = parseFilter(startWith);
-        Object.assign(binds, swBinds);
-        startWithClause = `START WITH ${sw.replace(/^WHERE\s+/i, "")}`;
-    }
-
-    // CONNECT BY
-    let connectByClause = "";
-    if (connectBy) {
-        const parts = [];
-        for (const [childCol, priorRef] of Object.entries(connectBy)) {
-            if (typeof priorRef === "string" && priorRef.includes("$PRIOR")) {
-                const parentCol = priorRef
-                    .replace("$PRIOR ", "")
-                    .replace("$PRIOR", "");
-                parts.push(
-                    `PRIOR ${quoteIdentifier(parentCol)} = ${quoteIdentifier(childCol)}`,
-                );
-            } else {
-                parts.push(
-                    `${quoteIdentifier(childCol)} = ${quoteIdentifier(priorRef)}`,
-                );
-            }
-        }
-        connectByClause = `CONNECT BY NOCYCLE ${parts.join(" AND ")}`;
-        if (maxLevel) {
-            connectByClause += ` AND LEVEL <= ${Number(maxLevel)}`;
-        }
-    }
-
-    // ORDER SIBLINGS BY
-    let orderSiblingsClause = "";
-    if (orderSiblings) {
-        const parts = Object.entries(orderSiblings).map(
-            ([col, dir]) =>
-                `${quoteIdentifier(col)} ${dir === -1 ? "DESC" : "ASC"}`,
+      } else {
+        parts.push(
+          `${quoteIdentifier(childCol)} = ${quoteIdentifier(priorRef)}`,
         );
-        orderSiblingsClause = `ORDER SIBLINGS BY ${parts.join(", ")}`;
+      }
     }
+    connectByClause = `CONNECT BY NOCYCLE ${parts.join(" AND ")}`;
+    if (maxLevel) {
+      connectByClause += ` AND LEVEL <= ${Number(maxLevel)}`;
+    }
+  }
 
-    const sql =
-        `SELECT ${selectParts.join(", ")} FROM ${quoteIdentifier(tableName)} ${startWithClause} ${connectByClause} ${orderSiblingsClause}`
-            .replace(/\s+/g, " ")
-            .trim();
+  // ORDER SIBLINGS BY
+  let orderSiblingsClause = "";
+  if (orderSiblings) {
+    const parts = Object.entries(orderSiblings).map(
+      ([col, dir]) => `${quoteIdentifier(col)} ${dir === -1 ? "DESC" : "ASC"}`,
+    );
+    orderSiblingsClause = `ORDER SIBLINGS BY ${parts.join(", ")}`;
+  }
 
-    return { sql, binds };
+  const sql =
+    `SELECT ${selectParts.join(", ")} FROM ${quoteIdentifier(tableName)} ${startWithClause} ${connectByClause} ${orderSiblingsClause}`
+      .replace(/\s+/g, " ")
+      .trim();
+
+  return { sql, binds };
 }
 
 /**
@@ -153,31 +150,31 @@ function buildConnectBy(tableName, spec) {
  *   // Each year gets a row, each region becomes a column with SUM(amount)
  */
 function buildPivot(tableName, spec) {
-    const { value, pivotOn, pivotValues, groupBy } = spec;
-    const binds = {};
+  const { value, pivotOn, pivotValues, groupBy } = spec;
+  const binds = {};
 
-    // Determine aggregate function and field
-    const [aggOp, aggField] = Object.entries(value)[0];
-    const aggFn = aggOp.replace("$", "").toUpperCase();
-    const field = aggField.startsWith("$") ? aggField.substring(1) : aggField;
+  // Determine aggregate function and field
+  const [aggOp, aggField] = Object.entries(value)[0];
+  const aggFn = aggOp.replace("$", "").toUpperCase();
+  const field = aggField.startsWith("$") ? aggField.substring(1) : aggField;
 
-    // Build inner SELECT — only the columns needed for pivot
-    const innerCols = [groupBy, pivotOn, field]
-        .filter(Boolean)
-        .map(quoteIdentifier)
-        .join(", ");
+  // Build inner SELECT — only the columns needed for pivot
+  const innerCols = [groupBy, pivotOn, field]
+    .filter(Boolean)
+    .map(quoteIdentifier)
+    .join(", ");
 
-    // Build pivot IN clause — sanitize values (PIVOT IN cannot use bind variables)
-    const pivotIn = pivotValues
-        .map((v) => {
-            const safe = String(v).replace(/'/g, "''");
-            return `'${safe}' AS ${quoteIdentifier(v)}`;
-        })
-        .join(", ");
+  // Build pivot IN clause — sanitize values (PIVOT IN cannot use bind variables)
+  const pivotIn = pivotValues
+    .map((v) => {
+      const safe = String(v).replace(/'/g, "''");
+      return `'${safe}' AS ${quoteIdentifier(v)}`;
+    })
+    .join(", ");
 
-    const sql = `SELECT * FROM (SELECT ${innerCols} FROM ${quoteIdentifier(tableName)}) PIVOT (${aggFn}(${quoteIdentifier(field)}) FOR ${quoteIdentifier(pivotOn)} IN (${pivotIn}))`;
+  const sql = `SELECT * FROM (SELECT ${innerCols} FROM ${quoteIdentifier(tableName)}) PIVOT (${aggFn}(${quoteIdentifier(field)}) FOR ${quoteIdentifier(pivotOn)} IN (${pivotIn}))`;
 
-    return { sql, binds };
+  return { sql, binds };
 }
 
 /**
@@ -203,26 +200,26 @@ function buildPivot(tableName, spec) {
  *   // Each Q1/Q2/Q3/Q4 column becomes a row: { quarter: "Q1", revenue: 1000 }
  */
 function buildUnpivot(tableName, spec) {
-    const { valueColumn, nameColumn, columns, includeNulls = false } = spec;
-    const nullHandling = includeNulls ? "INCLUDE NULLS" : "EXCLUDE NULLS";
-    const colList = columns.map(quoteIdentifier).join(", ");
+  const { valueColumn, nameColumn, columns, includeNulls = false } = spec;
+  const nullHandling = includeNulls ? "INCLUDE NULLS" : "EXCLUDE NULLS";
+  const colList = columns.map(quoteIdentifier).join(", ");
 
-    const sql = `SELECT * FROM ${quoteIdentifier(tableName)} UNPIVOT ${nullHandling} (${quoteIdentifier(valueColumn)} FOR ${quoteIdentifier(nameColumn)} IN (${colList}))`;
+  const sql = `SELECT * FROM ${quoteIdentifier(tableName)} UNPIVOT ${nullHandling} (${quoteIdentifier(valueColumn)} FOR ${quoteIdentifier(nameColumn)} IN (${colList}))`;
 
-    return { sql, binds: {} };
+  return { sql, binds: {} };
 }
 
 /**
  * Try to determine a name column from spec for SYS_CONNECT_BY_PATH.
  */
 function _getNameColumn(spec) {
-    if (spec.connectBy) {
-        const keys = Object.keys(spec.connectBy);
-        // Use a heuristic: first key that looks like 'name'
-        const nameCol = keys.find((k) => k.toLowerCase().includes("name"));
-        if (nameCol) return nameCol;
-    }
-    return "NAME";
+  if (spec.connectBy) {
+    const keys = Object.keys(spec.connectBy);
+    // Use a heuristic: first key that looks like 'name'
+    const nameCol = keys.find((k) => k.toLowerCase().includes("name"));
+    if (nameCol) return nameCol;
+  }
+  return "NAME";
 }
 
 module.exports = { buildConnectBy, buildPivot, buildUnpivot };

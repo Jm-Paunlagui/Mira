@@ -99,6 +99,33 @@ class Session {
     }
 
     /**
+     * Run a raw SQL statement on this session's connection, inside the
+     * current transaction. Use this for statements that have no collection
+     * equivalent — e.g. table locks (LOCK TABLE ... NOWAIT) or sequence
+     * reads (SELECT my_seq.NEXTVAL FROM DUAL) — that must share the same
+     * transaction as your collection operations.
+     *
+     * It is a thin passthrough to the underlying oracledb connection's
+     * execute(); the result is whatever oracledb returns (rows are in
+     * result.rows). Nothing is committed until the transaction completes.
+     *
+     * @param {string} sql          - The SQL statement to execute
+     * @param {object} [binds={}]   - Bind variables
+     * @param {object} [opts={}]    - oracledb execute options
+     * @returns {Promise<object>} The raw oracledb execute result
+     *
+     * @example
+     *   await session.execute(
+     *     'LOCK TABLE "MEAL"."T_CUTOFF_DATE" IN EXCLUSIVE MODE NOWAIT',
+     *   );
+     *   const r = await session.execute("SELECT MY_SEQ.NEXTVAL FROM DUAL");
+     *   const nextId = Number(r.rows[0][0]);
+     */
+    async execute(sql, binds = {}, opts = {}) {
+        return this._conn.execute(sql, binds, opts);
+    }
+
+    /**
      * Create a savepoint — a "bookmark" you can roll back to later.
      *
      * Savepoints let you undo part of a transaction without losing everything.

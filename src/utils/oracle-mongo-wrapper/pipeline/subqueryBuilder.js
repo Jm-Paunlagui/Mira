@@ -50,44 +50,44 @@ const { quoteIdentifier } = require("../utils");
  *   // → '(SELECT SUM("total") FROM "orders" WHERE "userId" = t0."id")'
  */
 function buildScalarSubquery(spec, outerAlias = "t0") {
-    const { collection, fn, filter = {}, field } = spec;
-    const fnUpper = (fn || "count").toUpperCase();
+  const { collection, fn, filter = {}, field } = spec;
+  const fnUpper = (fn || "count").toUpperCase();
 
-    // Build WHERE clause, replacing $-refs with outer alias
-    const whereParts = [];
-    for (const [col, val] of Object.entries(filter)) {
-        if (typeof val === "string" && val.startsWith("$")) {
-            const outerCol = val.substring(1);
-            whereParts.push(
-                `${quoteIdentifier(col)} = ${outerAlias}.${quoteIdentifier(outerCol)}`,
-            );
-        }
+  // Build WHERE clause, replacing $-refs with outer alias
+  const whereParts = [];
+  for (const [col, val] of Object.entries(filter)) {
+    if (typeof val === "string" && val.startsWith("$")) {
+      const outerCol = val.substring(1);
+      whereParts.push(
+        `${quoteIdentifier(col)} = ${outerAlias}.${quoteIdentifier(outerCol)}`,
+      );
     }
-    const whereClause =
-        whereParts.length > 0 ? `WHERE ${whereParts.join(" AND ")}` : "";
+  }
+  const whereClause =
+    whereParts.length > 0 ? `WHERE ${whereParts.join(" AND ")}` : "";
 
-    let aggExpr;
-    switch (fnUpper) {
-        case "COUNT":
-            aggExpr = "COUNT(*)";
-            break;
-        case "SUM":
-            aggExpr = `SUM(${quoteIdentifier(field)})`;
-            break;
-        case "AVG":
-            aggExpr = `AVG(${quoteIdentifier(field)})`;
-            break;
-        case "MIN":
-            aggExpr = `MIN(${quoteIdentifier(field)})`;
-            break;
-        case "MAX":
-            aggExpr = `MAX(${quoteIdentifier(field)})`;
-            break;
-        default:
-            aggExpr = "COUNT(*)";
-    }
+  let aggExpr;
+  switch (fnUpper) {
+    case "COUNT":
+      aggExpr = "COUNT(*)";
+      break;
+    case "SUM":
+      aggExpr = `SUM(${quoteIdentifier(field)})`;
+      break;
+    case "AVG":
+      aggExpr = `AVG(${quoteIdentifier(field)})`;
+      break;
+    case "MIN":
+      aggExpr = `MIN(${quoteIdentifier(field)})`;
+      break;
+    case "MAX":
+      aggExpr = `MAX(${quoteIdentifier(field)})`;
+      break;
+    default:
+      aggExpr = "COUNT(*)";
+  }
 
-    return `(SELECT ${aggExpr} FROM ${quoteIdentifier(collection)} ${whereClause})`;
+  return `(SELECT ${aggExpr} FROM ${quoteIdentifier(collection)} ${whereClause})`;
 }
 
 /**
@@ -101,19 +101,19 @@ function buildScalarSubquery(spec, outerAlias = "t0") {
  * @returns {string} e.g. 'EXISTS (SELECT 1 FROM "orders" WHERE "userId" = t0."id")'
  */
 function buildExistsSubquery(spec, outerAlias = "t0") {
-    const { collection, match } = spec;
-    const whereParts = [];
-    for (const [col, val] of Object.entries(match)) {
-        if (typeof val === "string" && val.startsWith("$")) {
-            const outerCol = val.substring(1);
-            whereParts.push(
-                `${quoteIdentifier(col)} = ${outerAlias}.${quoteIdentifier(outerCol)}`,
-            );
-        }
+  const { collection, match } = spec;
+  const whereParts = [];
+  for (const [col, val] of Object.entries(match)) {
+    if (typeof val === "string" && val.startsWith("$")) {
+      const outerCol = val.substring(1);
+      whereParts.push(
+        `${quoteIdentifier(col)} = ${outerAlias}.${quoteIdentifier(outerCol)}`,
+      );
     }
-    const whereClause =
-        whereParts.length > 0 ? `WHERE ${whereParts.join(" AND ")}` : "";
-    return `EXISTS (SELECT 1 FROM ${quoteIdentifier(collection)} ${whereClause})`;
+  }
+  const whereClause =
+    whereParts.length > 0 ? `WHERE ${whereParts.join(" AND ")}` : "";
+  return `EXISTS (SELECT 1 FROM ${quoteIdentifier(collection)} ${whereClause})`;
 }
 
 /**
@@ -125,8 +125,8 @@ function buildExistsSubquery(spec, outerAlias = "t0") {
  * @returns {string} e.g. 'NOT EXISTS (SELECT 1 FROM "orders" WHERE ...)'
  */
 function buildNotExistsSubquery(spec, outerAlias = "t0") {
-    const inner = buildExistsSubquery(spec, outerAlias);
-    return `NOT ${inner}`;
+  const inner = buildExistsSubquery(spec, outerAlias);
+  return `NOT ${inner}`;
 }
 
 /**
@@ -142,23 +142,23 @@ function buildNotExistsSubquery(spec, outerAlias = "t0") {
  * @returns {string} e.g. '(SELECT AVG("salary") FROM "employees" WHERE "dept" = t0."dept")'
  */
 function buildCorrelatedSubquery(spec, outerAlias = "t0") {
-    const { collection, field, aggregate, where = {} } = spec;
-    const aggFn = (aggregate || "$avg").replace("$", "").toUpperCase();
-    const aggExpr = `${aggFn}(${quoteIdentifier(field)})`;
+  const { collection, field, aggregate, where = {} } = spec;
+  const aggFn = (aggregate || "$avg").replace("$", "").toUpperCase();
+  const aggExpr = `${aggFn}(${quoteIdentifier(field)})`;
 
-    const whereParts = [];
-    for (const [col, val] of Object.entries(where)) {
-        if (typeof val === "string" && val.startsWith("$outer.")) {
-            const outerCol = val.replace("$outer.", "");
-            whereParts.push(
-                `${quoteIdentifier(col)} = ${outerAlias}.${quoteIdentifier(outerCol)}`,
-            );
-        }
+  const whereParts = [];
+  for (const [col, val] of Object.entries(where)) {
+    if (typeof val === "string" && val.startsWith("$outer.")) {
+      const outerCol = val.replace("$outer.", "");
+      whereParts.push(
+        `${quoteIdentifier(col)} = ${outerAlias}.${quoteIdentifier(outerCol)}`,
+      );
     }
-    const whereClause =
-        whereParts.length > 0 ? `WHERE ${whereParts.join(" AND ")}` : "";
+  }
+  const whereClause =
+    whereParts.length > 0 ? `WHERE ${whereParts.join(" AND ")}` : "";
 
-    return `(SELECT ${aggExpr} FROM ${quoteIdentifier(collection)} ${whereClause})`;
+  return `(SELECT ${aggExpr} FROM ${quoteIdentifier(collection)} ${whereClause})`;
 }
 
 /**
@@ -169,8 +169,8 @@ function buildCorrelatedSubquery(spec, outerAlias = "t0") {
  * @returns {string} e.g. 'IN (SELECT "id" FROM "users" WHERE ...)'
  */
 function buildInSelectSubquery(queryBuilder) {
-    const { sql } = queryBuilder._buildSQL();
-    return `IN (${sql})`;
+  const { sql } = queryBuilder._buildSQL();
+  return `IN (${sql})`;
 }
 
 /**
@@ -182,15 +182,15 @@ function buildInSelectSubquery(queryBuilder) {
  * @returns {string} e.g. 'ANY (SELECT "salary" FROM "employees")'
  */
 function buildAnyAllSubquery(spec, comparison = "ANY") {
-    const { collection, field } = spec;
-    return `${comparison} (SELECT ${quoteIdentifier(field)} FROM ${quoteIdentifier(collection)})`;
+  const { collection, field } = spec;
+  return `${comparison} (SELECT ${quoteIdentifier(field)} FROM ${quoteIdentifier(collection)})`;
 }
 
 module.exports = {
-    buildScalarSubquery,
-    buildExistsSubquery,
-    buildNotExistsSubquery,
-    buildCorrelatedSubquery,
-    buildInSelectSubquery,
-    buildAnyAllSubquery,
+  buildScalarSubquery,
+  buildExistsSubquery,
+  buildNotExistsSubquery,
+  buildCorrelatedSubquery,
+  buildInSelectSubquery,
+  buildAnyAllSubquery,
 };

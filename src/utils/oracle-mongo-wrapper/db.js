@@ -58,72 +58,72 @@ const { oracleMongoWrapperMessages: MSG } = require("../../constants/messages");
  *   const schema = new OracleSchema(db);
  */
 function createDb(connectionName = "userAccount") {
-    if (!connectionName || typeof connectionName !== "string") {
-        throw new TypeError(MSG.CREATEDB_INVALID_CONNECTION_NAME);
-    }
+  if (!connectionName || typeof connectionName !== "string") {
+    throw new TypeError(MSG.CREATEDB_INVALID_CONNECTION_NAME);
+  }
 
-    return {
-        /** The pool name this db is bound to */
-        connectionName,
+  return {
+    /** The pool name this db is bound to */
+    connectionName,
 
-        /**
-         * Borrow a connection, run your callback, then auto-release.
-         *
-         * The connection is automatically returned to the pool when your
-         * callback finishes (or throws). You never need to call conn.close().
-         *
-         * @param {Function} callback - async (conn) => result
-         * @returns {Promise<*>} Whatever your callback returns
-         *
-         * @example
-         *   const rows = await db.withConnection(async (conn) => {
-         *     const result = await conn.execute("SELECT 1 FROM DUAL");
-         *     return result.rows;
-         *   });
-         */
-        withConnection: (callback) =>
-            config.withConnection(connectionName, callback),
+    /**
+     * Borrow a connection, run your callback, then auto-release.
+     *
+     * The connection is automatically returned to the pool when your
+     * callback finishes (or throws). You never need to call conn.close().
+     *
+     * @param {Function} callback - async (conn) => result
+     * @returns {Promise<*>} Whatever your callback returns
+     *
+     * @example
+     *   const rows = await db.withConnection(async (conn) => {
+     *     const result = await conn.execute("SELECT 1 FROM DUAL");
+     *     return result.rows;
+     *   });
+     */
+    withConnection: (callback) =>
+      config.withConnection(connectionName, callback),
 
-        /**
-         * Like withConnection, but wraps everything in a transaction.
-         *
-         * If your callback succeeds → COMMIT (changes are saved)
-         * If your callback throws   → ROLLBACK (changes are undone)
-         *
-         * @param {Function} callback - async (conn) => result
-         * @returns {Promise<*>} Whatever your callback returns
-         */
-        withTransaction: (callback) =>
-            config.withTransaction(connectionName, callback),
+    /**
+     * Like withConnection, but wraps everything in a transaction.
+     *
+     * If your callback succeeds → COMMIT (changes are saved)
+     * If your callback throws   → ROLLBACK (changes are undone)
+     *
+     * @param {Function} callback - async (conn) => result
+     * @returns {Promise<*>} Whatever your callback returns
+     */
+    withTransaction: (callback) =>
+      config.withTransaction(connectionName, callback),
 
-        /**
-         * Run multiple operations on a single borrowed connection.
-         * Useful for batch work where you don't need a full transaction
-         * but want to avoid borrowing/releasing for each operation.
-         *
-         * @param {Function[]} operations - Array of async (conn) => result
-         */
-        withBatchConnection: (operations) =>
-            config.withBatchConnection(connectionName, operations),
+    /**
+     * Run multiple operations on a single borrowed connection.
+     * Useful for batch work where you don't need a full transaction
+     * but want to avoid borrowing/releasing for each operation.
+     *
+     * @param {Function[]} operations - Array of async (conn) => result
+     */
+    withBatchConnection: (operations) =>
+      config.withBatchConnection(connectionName, operations),
 
-        /** Gracefully close ALL database pools. Call during app shutdown. */
-        closePool: () => config.closeAll(),
+    /** Gracefully close ALL database pools. Call during app shutdown. */
+    closePool: () => config.closeAll(),
 
-        /** Get statistics about the connection pool (open, in-use, etc.) */
-        getPoolStats: () => config.getPoolStats(),
+    /** Get statistics about the connection pool (open, in-use, etc.) */
+    getPoolStats: () => config.getPoolStats(),
 
-        /** Returns true if this pool is healthy and accepting connections */
-        isHealthy: () => config.isPoolHealthy(connectionName),
+    /** Returns true if this pool is healthy and accepting connections */
+    isHealthy: () => config.isPoolHealthy(connectionName),
 
-        /**
-         * The raw oracledb driver module.
-         * Needed when you need to reference Oracle-specific type constants like:
-         *   - db.oracledb.OUT_FORMAT_OBJECT (return rows as objects, not arrays)
-         *   - db.oracledb.BIND_OUT (for output bind variables in RETURNING clauses)
-         *   - db.oracledb.NUMBER, db.oracledb.STRING (data type constants)
-         */
-        oracledb: config.oracledb,
-    };
+    /**
+     * The raw oracledb driver module.
+     * Needed when you need to reference Oracle-specific type constants like:
+     *   - db.oracledb.OUT_FORMAT_OBJECT (return rows as objects, not arrays)
+     *   - db.oracledb.BIND_OUT (for output bind variables in RETURNING clauses)
+     *   - db.oracledb.NUMBER, db.oracledb.STRING (data type constants)
+     */
+    oracledb: config.oracledb,
+  };
 }
 
 module.exports = { createDb };
