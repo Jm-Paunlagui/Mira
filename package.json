@@ -27,7 +27,7 @@
   "dependencies": {
     "chai": "^6.2.2",
     "dotenv": "^17.4.0",
-    "mocha": "^11.7.5",
+    "mocha": "^11.7.6",
     "oracledb": "^6.10.0"
   }
 }
