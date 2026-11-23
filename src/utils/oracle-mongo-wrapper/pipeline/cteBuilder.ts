@@ -1,4 +1,4 @@
-"use strict";
+
 
 /**
  * ============================================================================
@@ -45,10 +45,10 @@
  * ============================================================================
  */
 
-const { quoteIdentifier } = require("../utils");
-const {
-  oracleMongoWrapperMessages: MSG,
-} = require("../../../constants/messages");
+import type { DbConnection } from "../db";
+import type { QueryBuilder } from "../core/QueryBuilder";
+import { quoteIdentifier } from "../utils";
+import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
  * Create a regular CTE from named QueryBuilder instances.
@@ -68,7 +68,12 @@ const {
  *     .join({ from: "activity", localField: "id", foreignField: "userId" })
  *     .toArray();
  */
-function withCTE(db, cteDefs) {
+/** A join from the CTE's FROM to another CTE: `localField = <cte>.foreignField`. */
+type CteJoin = { from: string; localField: string; foreignField: string; joinType?: string };
+/** A recursive CTE: anchor query plus the self-join that walks the hierarchy. */
+type RecursiveDef = { anchor: QueryBuilder; recursive: { collection: string; joinOn: Record<string, unknown> } };
+
+function withCTE(db: import("../db").WrapperDb, cteDefs: Record<string, QueryBuilder>): CTEResult {
   return new CTEResult(db, cteDefs);
 }
 
@@ -94,7 +99,7 @@ function withCTE(db, cteDefs) {
  *     }
  *   }).sort({ LVL: 1, name: 1 }).toArray();
  */
-function withRecursiveCTE(db, cteName, def) {
+function withRecursiveCTE(db: import("../db").WrapperDb, cteName: string, def: RecursiveDef): RecursiveCTEResult {
   return new RecursiveCTEResult(db, cteName, def);
 }
 
@@ -112,7 +117,14 @@ function withRecursiveCTE(db, cteName, def) {
  *   .toArray()      — Execute and return rows
  */
 class CTEResult {
-  constructor(db, cteDefs) {
+  declare _skipVal: unknown;
+  declare _limitVal: unknown;
+  declare _sort: unknown;
+  declare _join: CteJoin | null;
+  declare _from: string | null;
+  declare _cteDefs: Record<string, QueryBuilder>;
+  declare _db: import("../db").WrapperDb;
+  constructor(db: import("../db").WrapperDb, cteDefs: Record<string, QueryBuilder>) {
     this._db = db;
     this._cteDefs = cteDefs;
     this._from = null;
@@ -122,34 +134,34 @@ class CTEResult {
     this._skipVal = null;
   }
 
-  from(cteName) {
+  from(cteName: string) {
     this._from = cteName;
     return this;
   }
 
-  join(joinSpec) {
+  join(joinSpec: CteJoin) {
     this._join = joinSpec;
     return this;
   }
 
-  sort(sortSpec) {
+  sort(sortSpec: unknown) {
     this._sort = sortSpec;
     return this;
   }
 
-  limit(n) {
+  limit(n: unknown) {
     this._limitVal = n;
     return this;
   }
 
-  skip(n) {
+  skip(n: unknown) {
     this._skipVal = n;
     return this;
   }
 
   _buildSQL() {
-    const withParts = [];
-    const allBinds = {};
+    const withParts: string[] = [];
+    const allBinds: Record<string, unknown> = {};
 
     for (const [name, qb] of Object.entries(this._cteDefs)) {
       const { sql, binds } = qb._buildSQL();
@@ -197,7 +209,7 @@ class CTEResult {
 
   async toArray() {
     const { sql, binds } = this._buildSQL();
-    return this._db.withConnection(async (conn) => {
+    return this._db.withConnection(async (conn: DbConnection) => {
       try {
         const result = await conn.execute(sql, binds, {
           outFormat: this._db.oracledb.OUT_FORMAT_OBJECT,
@@ -221,7 +233,13 @@ class CTEResult {
  * Terminal method: .toArray()
  */
 class RecursiveCTEResult {
-  constructor(db, cteName, def) {
+  declare _skipVal: unknown;
+  declare _limitVal: unknown;
+  declare _sort: unknown;
+  declare _def: RecursiveDef;
+  declare _cteName: string;
+  declare _db: import("../db").WrapperDb;
+  constructor(db: import("../db").WrapperDb, cteName: string, def: RecursiveDef) {
     this._db = db;
     this._cteName = cteName;
     this._def = def;
@@ -230,24 +248,24 @@ class RecursiveCTEResult {
     this._skipVal = null;
   }
 
-  sort(sortSpec) {
+  sort(sortSpec: unknown) {
     this._sort = sortSpec;
     return this;
   }
 
-  limit(n) {
+  limit(n: unknown) {
     this._limitVal = n;
     return this;
   }
 
-  skip(n) {
+  skip(n: unknown) {
     this._skipVal = n;
     return this;
   }
 
-  _buildSQL(colNames = []) {
+  _buildSQL(colNames: string[] = []) {
     const { anchor, recursive } = this._def;
-    const allBinds = {};
+    const allBinds: Record<string, unknown> = {};
 
     // Anchor query
     const { sql: anchorSql, binds: anchorBinds } = anchor._buildSQL();
@@ -257,7 +275,7 @@ class RecursiveCTEResult {
     const recTable = recursive.collection;
     const joinParts = Object.entries(recursive.joinOn)
       .map(([childCol, parentRef]) => {
-        const parentCol = parentRef.replace(`$${this._cteName}.`, "");
+        const parentCol = (parentRef as string).replace(`$${this._cteName}.`, "");
         return `e.${quoteIdentifier(childCol)} = o.${quoteIdentifier(parentCol)}`;
       })
       .join(" AND ");
@@ -333,17 +351,17 @@ class RecursiveCTEResult {
   async toArray() {
     // Fetch column names from anchor table to build CTE column alias list
     const anchorTableName = this._def.anchor.tableName;
-    const colNames = await this._db.withConnection(async (conn) => {
-      const result = await conn.execute(
+    const colNames = await this._db.withConnection(async (conn: DbConnection) => {
+      const result = await conn.execute<{ COLUMN_NAME: string }>(
         `SELECT COLUMN_NAME FROM USER_TAB_COLUMNS WHERE TABLE_NAME = UPPER(:t) ORDER BY COLUMN_ID`,
         { t: anchorTableName },
         { outFormat: this._db.oracledb.OUT_FORMAT_OBJECT },
       );
-      return result.rows.map((r) => r.COLUMN_NAME);
+      return (result.rows ?? []).map((r) => r.COLUMN_NAME);
     });
 
     const { sql, binds } = this._buildSQL(colNames);
-    return this._db.withConnection(async (conn) => {
+    return this._db.withConnection(async (conn: DbConnection) => {
       try {
         const result = await conn.execute(sql, binds, {
           outFormat: this._db.oracledb.OUT_FORMAT_OBJECT,
@@ -358,7 +376,7 @@ class RecursiveCTEResult {
 }
 
 /** Map a join type string to Oracle JOIN keyword */
-function _resolveJoinType(type) {
+function _resolveJoinType(type: string | undefined) {
   switch ((type || "inner").toLowerCase()) {
     case "left":
       return "LEFT OUTER JOIN";
@@ -375,4 +393,4 @@ function _resolveJoinType(type) {
   }
 }
 
-module.exports = { withCTE, withRecursiveCTE };
+export { withCTE, withRecursiveCTE };

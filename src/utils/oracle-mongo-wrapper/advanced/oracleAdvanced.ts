@@ -1,4 +1,4 @@
-"use strict";
+
 
 /**
  * ============================================================================
@@ -30,8 +30,8 @@
  * ============================================================================
  */
 
-const { quoteIdentifier } = require("../utils");
-const { parseFilter } = require("../parsers/filterParser");
+import { quoteIdentifier } from "../utils";
+import { parseFilter } from "../parsers/filterParser";
 
 /**
  * Build a CONNECT BY hierarchical query.
@@ -58,7 +58,7 @@ const { parseFilter } = require("../parsers/filterParser");
  *     maxLevel: 5
  *   })
  */
-function buildConnectBy(tableName, spec) {
+function buildConnectBy(tableName: string, spec: { startWith?: Record<string, unknown>; connectBy: Record<string, any>; orderSiblings?: Record<string, unknown>; maxLevel?: number; includeLevel?: boolean; includePath?: boolean; }): { sql: string; binds: Record<string, unknown>; } {
   const {
     startWith,
     connectBy,
@@ -67,10 +67,10 @@ function buildConnectBy(tableName, spec) {
     includeLevel,
     includePath,
   } = spec;
-  const binds = {};
+  const binds: Record<string, unknown> = {};
 
   // SELECT clause
-  const selectParts = [];
+  const selectParts: string[] = [];
   if (includeLevel) selectParts.push("LEVEL");
   if (includePath) {
     selectParts.push(
@@ -90,7 +90,7 @@ function buildConnectBy(tableName, spec) {
   // CONNECT BY
   let connectByClause = "";
   if (connectBy) {
-    const parts = [];
+    const parts: string[] = [];
     for (const [childCol, priorRef] of Object.entries(connectBy)) {
       if (typeof priorRef === "string" && priorRef.includes("$PRIOR")) {
         const parentCol = priorRef.replace("$PRIOR ", "").replace("$PRIOR", "");
@@ -149,9 +149,9 @@ function buildConnectBy(tableName, spec) {
  *   })
  *   // Each year gets a row, each region becomes a column with SUM(amount)
  */
-function buildPivot(tableName, spec) {
+function buildPivot(tableName: string, spec: { value: Record<string, any>; pivotOn: string; pivotValues: string[]; groupBy: string; }): { sql: string; binds: Record<string, unknown>; } {
   const { value, pivotOn, pivotValues, groupBy } = spec;
-  const binds = {};
+  const binds: Record<string, unknown> = {};
 
   // Determine aggregate function and field
   const [aggOp, aggField] = Object.entries(value)[0];
@@ -199,7 +199,7 @@ function buildPivot(tableName, spec) {
  *   })
  *   // Each Q1/Q2/Q3/Q4 column becomes a row: { quarter: "Q1", revenue: 1000 }
  */
-function buildUnpivot(tableName, spec) {
+function buildUnpivot(tableName: string, spec: { valueColumn: string; nameColumn: string; columns: string[]; includeNulls?: boolean; }): { sql: string; binds: Record<string, unknown>; } {
   const { valueColumn, nameColumn, columns, includeNulls = false } = spec;
   const nullHandling = includeNulls ? "INCLUDE NULLS" : "EXCLUDE NULLS";
   const colList = columns.map(quoteIdentifier).join(", ");
@@ -212,7 +212,7 @@ function buildUnpivot(tableName, spec) {
 /**
  * Try to determine a name column from spec for SYS_CONNECT_BY_PATH.
  */
-function _getNameColumn(spec) {
+function _getNameColumn(spec: any) {
   if (spec.connectBy) {
     const keys = Object.keys(spec.connectBy);
     // Use a heuristic: first key that looks like 'name'
@@ -222,4 +222,4 @@ function _getNameColumn(spec) {
   return "NAME";
 }
 
-module.exports = { buildConnectBy, buildPivot, buildUnpivot };
+export { buildConnectBy, buildPivot, buildUnpivot };

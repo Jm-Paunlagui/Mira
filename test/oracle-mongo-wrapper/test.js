@@ -110,8 +110,10 @@ const InventoryUnit = {
 };
 
 // ─── DB binding ───────────────────────────────────────────────────────────────
-const inventoryDB = createDb("unitInventory");
-const userdb = createDb("userAccount");
+// Both handles use the appDb pool (src/config/database.ts): the inventory tables
+// and T_OPITS_USERS must be reachable from the APP_DB_USERNAME schema.
+const inventoryDB = createDb("appDb");
+const userdb = createDb("appDb");
 
 // ─── Collection handles ───────────────────────────────────────────────────────
 const devBook = new OracleCollection(SAPBook.table, inventoryDB);

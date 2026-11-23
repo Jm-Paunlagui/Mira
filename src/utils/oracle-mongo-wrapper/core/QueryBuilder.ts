@@ -1,4 +1,4 @@
-"use strict";
+
 
 /**
  * ============================================================================
@@ -65,13 +65,70 @@
  * ============================================================================
  */
 
-const { quoteIdentifier, buildOrderBy, buildProjection } = require("../utils");
-const { parseFilter } = require("../parsers/filterParser");
-const {
-    oracleMongoWrapperMessages: MSG,
-} = require("../../../constants/messages");
+import type { DbConnection } from "../db";
+import { quoteIdentifier, buildOrderBy, buildProjection } from "../utils";
+import { parseFilter } from "../parsers/filterParser";
+import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
+
+/** A `{ $subquery }` projection value: a correlated scalar subquery column. */
+interface ProjectionSubquery {
+    collection: string;
+    fn?: string;
+    filter?: Record<string, unknown>;
+}
+
+/** Lock options accepted by {@link QueryBuilder.forUpdate}. */
+type ForUpdateOptions = { of?: string[]; wait?: number; nowait?: boolean; skipLocked?: boolean };
+type ForUpdateMode = boolean | "nowait" | "skip locked" | ForUpdateOptions;
+/** Initial cursor options (what OracleCollection.find() passes through). */
+type QueryBuilderOptions = {
+    sort?: Record<string, unknown>;
+    limit?: number;
+    skip?: number;
+    projection?: Record<string, unknown>;
+    forUpdate?: ForUpdateMode;
+    sample?: { percentage: number; seed?: number };
+    asOf?: { scn?: number | string; timestamp?: string };
+};
+
+/**
+ * The FOR UPDATE clause for a lock mode. Throws on an unknown mode so a typo
+ * ("no wait") fails loudly instead of silently waiting forever. Column names
+ * in `of` are quoted identifiers; `wait` must be a whole number of seconds.
+ */
+function _forUpdateClause(mode: unknown): string {
+    if (mode === true) return " FOR UPDATE";
+    if (mode === "nowait") return " FOR UPDATE NOWAIT";
+    if (mode === "skip locked") return " FOR UPDATE SKIP LOCKED";
+    if (!mode || typeof mode !== "object" || Array.isArray(mode)) {
+        throw new TypeError(MSG.FOR_UPDATE_INVALID_MODE(mode));
+    }
+    const { of, wait, nowait, skipLocked } = mode as ForUpdateOptions;
+    const waits = [wait !== undefined, nowait === true, skipLocked === true].filter(Boolean).length;
+    const ofOk = of === undefined || (Array.isArray(of) && of.length > 0 && of.every((c) => typeof c === "string" && c !== ""));
+    const waitOk = wait === undefined || (Number.isInteger(wait) && wait >= 0);
+    if (waits > 1 || !ofOk || !waitOk) throw new TypeError(MSG.FOR_UPDATE_INVALID_MODE(mode));
+    let clause = " FOR UPDATE";
+    if (of) clause += ` OF ${of.map((c) => `t0.${quoteIdentifier(c)}`).join(", ")}`;
+    if (wait !== undefined) clause += ` WAIT ${wait}`;
+    else if (nowait) clause += " NOWAIT";
+    else if (skipLocked) clause += " SKIP LOCKED";
+    return clause;
+}
 
 class QueryBuilder {
+    declare _terminated: boolean;
+    declare _asOf: { scn?: number | string; timestamp?: string } | null;
+    declare _sample: { percentage: number; seed?: number } | null;
+    declare _forUpdate: unknown;
+    declare _projection: Record<string, unknown> | null;
+    declare _skip: unknown;
+    declare _limit: unknown;
+    declare _sort: Record<string, unknown> | null;
+    declare _conn: import("../db").DbConnection | null;
+    declare db: import("../db").WrapperDb;
+    declare filter: Record<string, unknown>;
+    declare tableName: string;
     /**
      * Create a new QueryBuilder. Usually called internally by OracleCollection.find().
      *
@@ -81,7 +138,7 @@ class QueryBuilder {
      * @param {Object} [conn] - Raw connection (if inside a transaction/session)
      * @param {Object} [options] - Initial options: sort, limit, skip, projection, etc.
      */
-    constructor(tableName, filter, db, conn = null, options = {}) {
+    constructor(tableName: string, filter: Record<string, unknown>, db: import("../db").WrapperDb, conn: import("../db").DbConnection | null = null, options: QueryBuilderOptions = {}) {
         this.tableName = tableName;
         this.filter = filter || {};
         this.db = db;
@@ -115,7 +172,7 @@ class QueryBuilder {
      * @param {Object} sortSpec - e.g. { name: 1, age: -1 } (1=ASC, -1=DESC)
      * @returns {QueryBuilder} this (for chaining)
      */
-    sort(sortSpec) {
+    sort(sortSpec: Record<string, unknown>): QueryBuilder {
         this._checkTerminated();
         this._sort = sortSpec;
         return this;
@@ -126,7 +183,7 @@ class QueryBuilder {
      * @param {number} n - Maximum number of rows
      * @returns {QueryBuilder} this (for chaining)
      */
-    limit(n) {
+    limit(n: number): QueryBuilder {
         this._checkTerminated();
         this._limit = n;
         return this;
@@ -144,7 +201,7 @@ class QueryBuilder {
      *   // Page 2 (rows 11-20)
      *   const page2 = await users.find().skip(10).limit(10).toArray();
      */
-    skip(n) {
+    skip(n: number): QueryBuilder {
         this._checkTerminated();
         this._skip = n;
         return this;
@@ -162,7 +219,7 @@ class QueryBuilder {
      * @param {Object} projectionSpec - Columns to include (1) or exclude (0)
      * @returns {QueryBuilder} this (for chaining)
      */
-    project(projectionSpec) {
+    project(projectionSpec: Record<string, unknown>): QueryBuilder {
         this._checkTerminated();
         this._projection = projectionSpec;
         return this;
@@ -174,15 +231,25 @@ class QueryBuilder {
      * Used inside transactions to prevent other sessions from modifying
      * the rows you're reading until you commit/rollback.
      *
-     * @param {boolean|string} mode
-     *   - true         → FOR UPDATE (wait indefinitely for lock)
-     *   - "nowait"     → FOR UPDATE NOWAIT (fail immediately if locked)
+     * Combined with .limit()/.skip() (and .next()/.hasNext(), which set
+     * limit 1), the page is chosen in a ROWID subquery and the outer query
+     * takes the lock: Oracle rejects FETCH FIRST together with FOR UPDATE
+     * (ORA-02014). With "skip locked" a page can then return FEWER rows than
+     * the limit (locked rows inside the page are skipped, not replaced).
+     *
+     * @param {boolean|string|Object} mode
+     *   - true          → FOR UPDATE (wait indefinitely for lock)
+     *   - "nowait"      → FOR UPDATE NOWAIT (fail immediately if locked)
      *   - "skip locked" → FOR UPDATE SKIP LOCKED (skip locked rows)
+     *   - { of?: string[], wait?: number, nowait?: boolean, skipLocked?: boolean }
+     *       of:   lock only these columns' table (FOR UPDATE OF t0."COL", ...)
+     *       wait: seconds to wait before ORA-30006 (FOR UPDATE WAIT n)
+     *       at most one of wait / nowait / skipLocked
      * @returns {QueryBuilder} this (for chaining)
      */
-    forUpdate(mode) {
+    forUpdate(mode: ForUpdateMode): QueryBuilder {
         this._checkTerminated();
-        this._forUpdate = mode === true ? true : mode;
+        this._forUpdate = mode === false ? null : (_forUpdateClause(mode), mode);
         return this;
     }
 
@@ -202,7 +269,7 @@ class QueryBuilder {
      *
      * @returns {{ sql: string, binds: Object }} The SQL string and bind variables
      */
-    _buildSQL() {
+    _buildSQL(): { sql: string; binds: Record<string, unknown>; } {
         const { whereClause, binds } = parseFilter(this.filter, "t0");
 
         // Projection
@@ -211,11 +278,11 @@ class QueryBuilder {
 
         // Handle subquery projections
         if (this._projection && typeof this._projection === "object") {
-            const subParts = [];
-            const regularParts = [];
+            const subParts: string[] = [];
+            const regularParts: string[] = [];
             for (const [key, val] of Object.entries(this._projection)) {
-                if (typeof val === "object" && val !== null && val.$subquery) {
-                    const sub = val.$subquery;
+                if (typeof val === "object" && val !== null && "$subquery" in val && val.$subquery) {
+                    const sub = val.$subquery as ProjectionSubquery;
                     const subColl = quoteIdentifier(sub.collection);
                     const fnMap = {
                         count: "COUNT(*)",
@@ -224,10 +291,10 @@ class QueryBuilder {
                         min: "MIN",
                         max: "MAX",
                     };
-                    const fnExpr = fnMap[sub.fn] || "COUNT(*)";
+                    const fnExpr = fnMap[sub.fn as keyof typeof fnMap] || "COUNT(*)";
 
                     // Build correlated WHERE
-                    const subWhere = [];
+                    const subWhere: string[] = [];
                     if (sub.filter) {
                         for (const [fk, fv] of Object.entries(sub.filter)) {
                             if (typeof fv === "string" && fv.startsWith("$")) {
@@ -294,36 +361,30 @@ class QueryBuilder {
             tableRef = `${quoteIdentifier(this.tableName)} SAMPLE(${pct})${seedStr} t0`;
         }
 
-        let sql = `SELECT ${selectCols} FROM ${tableRef}`;
+        const orderBy = this._sort ? ` ${buildOrderBy(this._sort)}` : "";
+        let paging = "";
+        if (this._skip != null) paging += ` OFFSET ${Number(this._skip)} ROWS`;
+        if (this._limit != null) paging += ` FETCH FIRST ${Number(this._limit)} ROWS ONLY`;
+        const where = whereClause ? ` ${whereClause}` : "";
 
-        if (whereClause) sql += ` ${whereClause}`;
-
-        // ORDER BY
-        if (this._sort) {
-            sql += ` ${buildOrderBy(this._sort)}`;
+        if (!this._forUpdate) {
+            return { sql: `SELECT ${selectCols} FROM ${tableRef}${where}${orderBy}${paging}`, binds };
         }
 
-        // OFFSET
-        if (this._skip != null) {
-            sql += ` OFFSET ${Number(this._skip)} ROWS`;
+        const lock = _forUpdateClause(this._forUpdate);
+        if (!paging) {
+            return { sql: `SELECT ${selectCols} FROM ${tableRef}${where}${orderBy}${lock}`, binds };
         }
 
-        // LIMIT
-        if (this._limit != null) {
-            sql += ` FETCH FIRST ${Number(this._limit)} ROWS ONLY`;
-        }
-
-        // FOR UPDATE
-        if (this._forUpdate) {
-            if (this._forUpdate === "nowait") {
-                sql += " FOR UPDATE NOWAIT";
-            } else if (this._forUpdate === "skip locked") {
-                sql += " FOR UPDATE SKIP LOCKED";
-            } else {
-                sql += " FOR UPDATE";
-            }
-        }
-
+        // Oracle rejects FETCH FIRST / OFFSET together with FOR UPDATE
+        // (ORA-02014): pick the page's ROWIDs in a subquery, lock in the outer
+        // query. The filter is repeated outside so a row changed between the
+        // pick and the lock is re-checked (Oracle re-evaluates the outer
+        // predicate on a locked row it had to wait for). A repeated named
+        // bind resolves to the one value, so `binds` is unchanged.
+        const page = `SELECT t0.ROWID FROM ${tableRef}${where}${orderBy}${paging}`;
+        const outerWhere = whereClause ? `${whereClause} AND` : "WHERE";
+        const sql = `SELECT ${selectCols} FROM ${tableRef} ${outerWhere} t0.ROWID IN (${page})${orderBy}${lock}`;
         return { sql, binds };
     }
 
@@ -342,11 +403,11 @@ class QueryBuilder {
      * where a filter value is itself a Promise that needs to be awaited.
      */
     async _resolveFilterPromises() {
-        const resolve = async (obj) => {
-            if (obj && typeof obj.then === "function") return await obj;
+        const resolve = async (obj: unknown): Promise<unknown> => {
+            if (obj && typeof obj === "object" && "then" in obj && typeof obj.then === "function") return await obj;
             if (Array.isArray(obj)) return Promise.all(obj.map(resolve));
             if (obj && typeof obj === "object" && !(obj instanceof Date)) {
-                const result = {};
+                const result: Record<string, unknown> = {};
                 for (const [k, v] of Object.entries(obj)) {
                     result[k] = await resolve(v);
                 }
@@ -354,7 +415,7 @@ class QueryBuilder {
             }
             return obj;
         };
-        this.filter = await resolve(this.filter);
+        this.filter = (await resolve(this.filter)) as Record<string, unknown>;
     }
 
     /**
@@ -364,7 +425,7 @@ class QueryBuilder {
      * .toArray(). JavaScript's `await` calls .then() on any thenable object,
      * and this method delegates to .toArray().
      */
-    then(resolve, reject) {
+    then<R1 = Array<Record<string, unknown>>, R2 = never>(resolve?: ((rows: Array<Record<string, unknown>>) => R1 | PromiseLike<R1>) | null, reject?: ((reason: unknown) => R2 | PromiseLike<R2>) | null): Promise<R1 | R2> {
         return this.toArray().then(resolve, reject);
     }
 
@@ -376,23 +437,22 @@ class QueryBuilder {
      *
      * @returns {Promise<Array>} Array of row objects
      */
-    async _execute() {
+    async _execute(): Promise<Array<any>> {
         await this._resolveFilterPromises();
         const { sql, binds } = this._buildSQL();
-        const self = this;
 
-        const fn = async (conn) => {
+        const fn = async (conn: DbConnection) => {
             try {
                 const result = await conn.execute(sql, binds, {
-                    outFormat: self.db.oracledb.OUT_FORMAT_OBJECT,
-                    autoCommit: !self._conn,
+                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                    autoCommit: !this._conn,
                 });
                 let rows = result.rows || [];
 
                 // Handle exclusion projection post-processing
-                const proj = buildProjection(self._projection);
+                const proj = buildProjection(this._projection);
                 if (proj.isExclusion && proj.excludedCols.length > 0) {
-                    rows = rows.map((row) => {
+                    rows = rows.map((row: Record<string, unknown>) => {
                         const doc = { ...row };
                         for (const col of proj.excludedCols) {
                             delete doc[col];
@@ -428,7 +488,7 @@ class QueryBuilder {
      * @example
      *   const users = await coll.find({ active: true }).sort({ name: 1 }).toArray();
      */
-    async toArray() {
+    async toArray<T = Record<string, unknown>>(): Promise<T[]> {
         this._terminated = true;
         return this._execute();
     }
@@ -448,25 +508,24 @@ class QueryBuilder {
      *     console.log(`Order ${row.id}: $${row.amount}`);
      *   });
      */
-    async forEach(fn) {
+    async forEach(fn: ((...args: unknown[]) => unknown)): Promise<void> {
         this._terminated = true;
         await this._resolveFilterPromises();
         const { sql, binds } = this._buildSQL();
-        const self = this;
-        const proj = buildProjection(self._projection);
+        const proj = buildProjection(this._projection);
 
-        const run = (conn) =>
-            new Promise((resolve, reject) => {
+        const run = (conn: DbConnection) =>
+            new Promise<void>((resolve, reject) => {
                 const stream = conn.queryStream(sql, binds, {
-                    outFormat: self.db.oracledb.OUT_FORMAT_OBJECT,
+                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
                 });
-                stream.on("data", (row) => {
+                stream.on("data", (row: Record<string, unknown>) => {
                     if (proj.isExclusion && proj.excludedCols.length > 0) {
                         for (const col of proj.excludedCols) delete row[col];
                     }
                     fn(row);
                 });
-                stream.on("error", (err) => {
+                stream.on("error", (err: unknown) => {
                     reject(
                         new Error(
                             MSG.wrapError(
@@ -497,7 +556,7 @@ class QueryBuilder {
      * @example
      *   const user = await coll.find({ email: "ana@test.com" }).next();
      */
-    async next() {
+    async next<T = Record<string, unknown>>(): Promise<T | null> {
         this._terminated = true;
         const original = this._limit;
         this._limit = 1;
@@ -517,7 +576,7 @@ class QueryBuilder {
      *   const exists = await coll.find({ email: "ana@test.com" }).hasNext();
      *   if (!exists) console.log("USER not found");
      */
-    async hasNext() {
+    async hasNext(): Promise<boolean> {
         this._terminated = true;
         const original = this._limit;
         this._limit = 1;
@@ -536,18 +595,21 @@ class QueryBuilder {
      * @example
      *   const total = await coll.find({ status: "active" }).count();
      */
-    async count() {
+    async count(): Promise<number> {
         this._terminated = true;
         const { whereClause, binds } = parseFilter(this.filter, "t0");
         const sql = `SELECT COUNT(*) AS CNT FROM ${quoteIdentifier(this.tableName)} t0 ${whereClause}`;
 
-        const fn = async (conn) => {
+        const fn = async (conn: DbConnection) => {
             try {
-                const result = await conn.execute(sql, binds, {
+                // Never commit on a session connection: that would end the
+                // caller's transaction and release its row locks mid-flight.
+                const result = await conn.execute<{ CNT: number }>(sql, binds, {
                     outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
-                    autoCommit: true,
+                    autoCommit: !this._conn,
                 });
-                return Number(result.rows[0].CNT);
+                // COUNT(*) with no GROUP BY always returns exactly one row.
+                return Number(result.rows?.[0]?.CNT ?? 0);
             } catch (err) {
                 throw new Error(
                     MSG.wrapError("QueryBuilder.count", err, sql, binds),
@@ -571,11 +633,12 @@ class QueryBuilder {
      *   console.log(sql);
      *   // → SELECT * FROM "users" t0 WHERE "status" = :where_status_0 ORDER BY "name" ASC
      */
-    async explain() {
+    async explain(): Promise<string> {
         this._terminated = true;
         const { sql } = this._buildSQL();
         return sql;
     }
 }
 
-module.exports = { QueryBuilder };
+export { QueryBuilder };
+export type { ForUpdateMode, QueryBuilderOptions };

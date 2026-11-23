@@ -1,4 +1,4 @@
-"use strict";
+
 
 /**
  * ============================================================================
@@ -34,10 +34,10 @@
  * ============================================================================
  */
 
-const { quoteIdentifier } = require("../utils");
-const {
-  oracleMongoWrapperMessages: MSG,
-} = require("../../../constants/messages");
+import type { DbConnection } from "../db";
+import type { QueryBuilder } from "../core/QueryBuilder";
+import { quoteIdentifier } from "../utils";
+import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
  * Wraps two QueryBuilder instances with a SQL set operator.
@@ -49,20 +49,24 @@ const {
  *   to prevent collisions with the first query's binds.
  */
 class SetResultBuilder {
+  declare _skipVal: unknown;
+  declare _limitVal: unknown;
+  declare _sort: unknown;
+  declare _operator: string;
+  declare _qb2: QueryBuilder;
+  declare _qb1: QueryBuilder;
   /**
    * @param {QueryBuilder} qb1
    * @param {QueryBuilder} qb2
    * @param {string} operator - 'UNION' | 'UNION ALL' | 'INTERSECT' | 'MINUS'
    */
-  constructor(qb1, qb2, operator) {
+  constructor(qb1: QueryBuilder, qb2: QueryBuilder, operator: string) {
     // Validate column counts if projections are set
-    if (qb1._projection && qb2._projection) {
-      const count1 = Object.keys(qb1._projection).filter(
-        (k) => qb1._projection[k] === 1,
-      ).length;
-      const count2 = Object.keys(qb2._projection).filter(
-        (k) => qb2._projection[k] === 1,
-      ).length;
+    const p1 = qb1._projection;
+    const p2 = qb2._projection;
+    if (p1 && p2) {
+      const count1 = Object.keys(p1).filter((k) => p1[k] === 1).length;
+      const count2 = Object.keys(p2).filter((k) => p2[k] === 1).length;
       if (count1 !== count2) {
         throw new Error(MSG.SET_OP_COLUMN_COUNT_MISMATCH);
       }
@@ -79,7 +83,7 @@ class SetResultBuilder {
    * @param {Object} sortSpec - { col: 1|-1 }
    * @returns {SetResultBuilder}
    */
-  sort(sortSpec) {
+  sort(sortSpec: Record<string, unknown>): SetResultBuilder {
     this._sort = sortSpec;
     return this;
   }
@@ -88,7 +92,7 @@ class SetResultBuilder {
    * @param {number} n
    * @returns {SetResultBuilder}
    */
-  limit(n) {
+  limit(n: number): SetResultBuilder {
     this._limitVal = n;
     return this;
   }
@@ -97,7 +101,7 @@ class SetResultBuilder {
    * @param {number} n
    * @returns {SetResultBuilder}
    */
-  skip(n) {
+  skip(n: number): SetResultBuilder {
     this._skipVal = n;
     return this;
   }
@@ -106,13 +110,13 @@ class SetResultBuilder {
    * Build the combined SQL.
    * @returns {{ sql: string, binds: Object }}
    */
-  _buildSQL() {
+  _buildSQL(): { sql: string; binds: Record<string, unknown>; } {
     const { sql: sql1, binds: binds1 } = this._qb1._buildSQL();
     const { sql: sql2, binds: binds2Raw } = this._qb2._buildSQL();
 
     // Re-key binds2 to avoid collisions with binds1
-    const binds2 = {};
-    const keyMap = {};
+    const binds2: Record<string, unknown> = {};
+    const keyMap: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(binds2Raw)) {
       const newKey = `set2_${k}`;
       binds2[newKey] = v;
@@ -157,7 +161,7 @@ class SetResultBuilder {
   /**
    * Make SetResultBuilder thenable so `await union(...)` returns rows directly.
    */
-  then(resolve, reject) {
+  then(resolve: any, reject: any) {
     return this.toArray().then(resolve, reject);
   }
 
@@ -165,16 +169,18 @@ class SetResultBuilder {
    * Execute the set operation and return all rows.
    * @returns {Promise<Array>}
    */
-  async toArray() {
+  async toArray(): Promise<Array<unknown>> {
     const db = this._qb1.db;
     const conn = this._qb1._conn;
     const { sql, binds } = this._buildSQL();
 
-    const exec = async (connection) => {
+    const exec = async (connection: DbConnection) => {
       try {
+        // On a session connection, committing would end the caller's
+        // transaction (and release its locks); only a pooled conn commits.
         const result = await connection.execute(sql, binds, {
           outFormat: db.oracledb.OUT_FORMAT_OBJECT,
-          autoCommit: true,
+          autoCommit: !conn,
         });
         return result.rows || [];
       } catch (err) {
@@ -187,4 +193,4 @@ class SetResultBuilder {
   }
 }
 
-module.exports = { SetResultBuilder };
+export { SetResultBuilder };

@@ -1,4 +1,4 @@
-"use strict";
+
 
 /**
  * ============================================================================
@@ -60,10 +60,8 @@
  * ============================================================================
  */
 
-const { quoteIdentifier } = require("../utils");
-const {
-  oracleMongoWrapperMessages: MSG,
-} = require("../../../constants/messages");
+import { quoteIdentifier } from "../utils";
+import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
  * Oracle's hard cap on expressions inside a single IN (...) list (ORA-01795).
@@ -94,7 +92,7 @@ const ORACLE_IN_LIST_MAX = 1000;
  *   counter.next("where_name")   // → "where_name_1"
  *   counter.next("where_status") // → "where_status_2"
  */
-function _createCounter() {
+function _createCounter(): { next: (prefix: string) => string; } {
   let _count = 0;
   return {
     next(prefix) {
@@ -118,7 +116,7 @@ function resetBindCounter() {
  * Maps MongoDB comparison operator names to their SQL equivalents.
  * Used by _parseFieldExpr to translate operators like $gt → ">".
  */
-const COMPARISON_OPS = {
+const COMPARISON_OPS: Record<string, string> = {
   $eq: "=", // Equal
   $ne: "<>", // Not equal
   $gt: ">", // Greater than
@@ -128,6 +126,46 @@ const COMPARISON_OPS = {
 };
 
 // ─── _parseFieldExpr ────────────────────────────────────────────
+/** Units `$now` arithmetic accepts, with the NUMTODSINTERVAL unit each maps to. */
+const NOW_UNITS: Readonly<Record<string, string>> = Object.freeze({ days: "DAY", hours: "HOUR", minutes: "MINUTE", seconds: "SECOND" });
+
+/**
+ * Server-time operand: `{ $now: true }` is SYSTIMESTAMP; `{ $now: { minus: { days: 7 } } }`
+ * (and `plus`, with days / hours / minutes / seconds) shifts it by bound
+ * NUMTODSINTERVAL amounts, so the comparison uses the DATABASE clock, never the app's.
+ *
+ *   { CREATED_AT: { $lt: { $now: { minus: { days: 30 } } } } }
+ *   → "CREATED_AT" < SYSTIMESTAMP - NUMTODSINTERVAL(:where_CREATED_AT_now_0, 'DAY')
+ *
+ * Amounts are bound (never interpolated); unknown keys or non-finite / negative
+ * amounts throw instead of guessing.
+ */
+function _nowExpr(field: string, spec: unknown, binds: Record<string, unknown>, counter: Record<string, any>): string {
+  if (spec === true || (spec && typeof spec === "object" && Object.keys(spec).length === 0)) return "SYSTIMESTAMP";
+  if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
+    throw new TypeError(`$now on "${field}" must be true or { minus | plus: { days, hours, minutes, seconds } }`);
+  }
+  let sql = "SYSTIMESTAMP";
+  for (const [dir, amounts] of Object.entries(spec as Record<string, unknown>)) {
+    const sign = dir === "minus" ? "-" : dir === "plus" ? "+" : null;
+    if (!sign) throw new TypeError(`$now on "${field}": unknown key "${dir}" (use minus or plus)`);
+    if (!amounts || typeof amounts !== "object" || Array.isArray(amounts)) {
+      throw new TypeError(`$now.${dir} on "${field}" must be an object of units`);
+    }
+    for (const [unit, n] of Object.entries(amounts as Record<string, unknown>)) {
+      const oracleUnit = NOW_UNITS[unit];
+      if (!oracleUnit) throw new TypeError(`$now.${dir} on "${field}": unknown unit "${unit}" (use days, hours, minutes or seconds)`);
+      if (typeof n !== "number" || !Number.isFinite(n) || n < 0) {
+        throw new TypeError(`$now.${dir}.${unit} on "${field}" must be a finite, non-negative number`);
+      }
+      const bname = counter.next(`where_${field}_now`);
+      binds[bname] = n;
+      sql += ` ${sign} NUMTODSINTERVAL(:${bname}, '${oracleUnit}')`;
+    }
+  }
+  return sql;
+}
+
 /**
  * Converts a SINGLE field's filter expression into an SQL condition string.
  *
@@ -161,7 +199,7 @@ const COMPARISON_OPS = {
  *   _parseFieldExpr("age", { $gte: 18, $lt: 65 }, binds, null, counter)
  *   // → '("age" >= :where_age_0 AND "age" < :where_age_1)'
  */
-function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
+function _parseFieldExpr(field: string, expr: any, binds: Record<string, unknown>, outerAlias: string | null | undefined, counter: Record<string, any>): string {
   const qField = quoteIdentifier(field);
 
   // Simple equality: { field: value }
@@ -185,9 +223,11 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
   }
 
   // Operator object: { field: { $gt: 5, $lt: 10 } }
-  const conditions = [];
+  const conditions: string[] = [];
 
-  for (const [op, val] of Object.entries(expr)) {
+  // An operand's shape depends on its operator (Mongo-style DSL), so it stays
+  // loosely typed here; each branch below checks what it needs.
+  for (const [op, val] of Object.entries(expr as Record<string, any>)) {
     if (COMPARISON_OPS[op]) {
       // Check if val is a correlated $subquery object
       if (
@@ -205,6 +245,8 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
           counter,
         );
         conditions.push(`${qField} ${COMPARISON_OPS[op]} ${subExpr}`);
+      } else if (val && typeof val === "object" && !Array.isArray(val) && !(val instanceof Date) && "$now" in val) {
+        conditions.push(`${qField} ${COMPARISON_OPS[op]} ${_nowExpr(field, val.$now, binds, counter)}`);
       } else {
         const bname = counter.next(`where_${field}`);
         binds[bname] = val;
@@ -218,7 +260,7 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
         // oversized value lists into OR-joined IN groups of ≤1,000 binds so
         // bulk callers (e.g. 10k-row Excel uploads batching by GID) never hit
         // the cap. Semantics are identical: x IN (a..) OR x IN (b..) ≡ x IN (a..b..).
-        const groups = [];
+        const groups: string[] = [];
         for (let i = 0; i < val.length; i += ORACLE_IN_LIST_MAX) {
           const placeholders = val.slice(i, i + ORACLE_IN_LIST_MAX).map((v) => {
             const bname = counter.next(`where_${field}`);
@@ -237,7 +279,7 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
       } else {
         // Same ORA-01795 cap as $in. De Morgan: NOT(x IN a OR x IN b)
         // ≡ x NOT IN a AND x NOT IN b — so groups join with AND.
-        const groups = [];
+        const groups: string[] = [];
         for (let i = 0; i < val.length; i += ORACLE_IN_LIST_MAX) {
           const placeholders = val.slice(i, i + ORACLE_IN_LIST_MAX).map((v) => {
             const bname = counter.next(`where_${field}`);
@@ -283,14 +325,14 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
       binds[bname] = val;
       conditions.push(`${qField} LIKE :${bname}`);
     } else if (op === "$any") {
-      const placeholders = val.map((v) => {
+      const placeholders = val.map((v: unknown) => {
         const bname = counter.next(`where_${field}`);
         binds[bname] = v;
         return `:${bname}`;
       });
       conditions.push(`${qField} = ANY(${placeholders.join(", ")})`);
     } else if (op === "$all") {
-      const placeholders = val.map((v) => {
+      const placeholders = val.map((v: unknown) => {
         const bname = counter.next(`where_${field}`);
         binds[bname] = v;
         return `:${bname}`;
@@ -298,7 +340,7 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
       conditions.push(`${qField} = ALL(${placeholders.join(", ")})`);
     } else if (op === "$case") {
       // { $case: [{when, then}], $else: v }
-      const whenParts = val.map((c) => {
+      const whenParts = val.map((c: any) => {
         const { whereClause: wWhen, binds: wBinds } = parseFilter(
           c.when,
           null,
@@ -321,7 +363,7 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
     } else if (op === "$else") {
       // Handled inside $case
     } else if (op === "$coalesce") {
-      const parts = val.map((v) => {
+      const parts = val.map((v: any) => {
         if (typeof v === "string" && !v.startsWith("$")) {
           const bname = counter.next(`where_${field}`);
           binds[bname] = v;
@@ -377,7 +419,7 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
       op === "$lteAny"
     ) {
       const cmpOp = op.replace(/Any/g, "").replace(/\$/g, "");
-      const cmpMap = { gt: ">", lt: "<", gte: ">=", lte: "<=" };
+      const cmpMap: Record<string, string> = { gt: ">", lt: "<", gte: ">=", lte: "<=" };
       const subCollection = quoteIdentifier(val.collection);
       const subField = quoteIdentifier(val.field);
       conditions.push(
@@ -390,7 +432,7 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
       op === "$lteAll"
     ) {
       const cmpOp = op.replace(/All/g, "").replace(/\$/g, "");
-      const cmpMap = { gt: ">", lt: "<", gte: ">=", lte: "<=" };
+      const cmpMap: Record<string, string> = { gt: ">", lt: "<", gte: ">=", lte: "<=" };
       const subCollection = quoteIdentifier(val.collection);
       const subField = quoteIdentifier(val.field);
       conditions.push(
@@ -440,7 +482,7 @@ function _parseFieldExpr(field, expr, binds, outerAlias, counter) {
  *   }, binds, "t0", counter)
  *   // → '(SELECT AVG("salary") FROM "employees" WHERE "dept_id" = t0."dept_id")'
  */
-function _buildCorrelatedSubquery(field, spec, binds, outerAlias, counter) {
+function _buildCorrelatedSubquery(field: string, spec: Record<string, any>, binds: Record<string, unknown>, outerAlias: string | null | undefined, counter: Record<string, any>): string {
   const collection = quoteIdentifier(spec.collection);
   const aggFn = spec.aggregate
     ? spec.aggregate.replace("$", "").toUpperCase()
@@ -454,7 +496,7 @@ function _buildCorrelatedSubquery(field, spec, binds, outerAlias, counter) {
 
   let whereStr = "";
   if (spec.where && Object.keys(spec.where).length > 0) {
-    const subconditions = [];
+    const subconditions: string[] = [];
     for (const [k, v] of Object.entries(spec.where)) {
       if (typeof v === "string" && v.startsWith("$outer.")) {
         const outerCol = v.replace("$outer.", "");
@@ -525,7 +567,7 @@ function _buildCorrelatedSubquery(field, spec, binds, outerAlias, counter) {
  *   // → { whereClause: 'WHERE "status" = :where_status_0 AND ("age" >= :where_age_1 OR "vip" = :where_vip_2)',
  *   //     binds: { where_status_0: "active", where_age_1: 18, where_vip_2: true } }
  */
-function parseFilter(filter, tableAlias, _counter) {
+function parseFilter(filter: Record<string, any>, tableAlias?: string | null, _counter?: Record<string, any>): { whereClause: string; binds: Record<string, unknown>; } {
   if (
     !filter ||
     typeof filter !== "object" ||
@@ -537,12 +579,12 @@ function parseFilter(filter, tableAlias, _counter) {
   // Create counter once at the top-level call; reuse for recursive calls
   const counter = _counter || _createCounter();
 
-  const binds = {};
-  const conditions = [];
+  const binds: Record<string, unknown> = {};
+  const conditions: string[] = [];
 
   for (const [key, value] of Object.entries(filter)) {
     if (key === "$and") {
-      const parts = value.map((sub) => {
+      const parts = value.map((sub: any) => {
         const { whereClause: wc, binds: wb } = parseFilter(
           sub,
           tableAlias,
@@ -553,7 +595,7 @@ function parseFilter(filter, tableAlias, _counter) {
       });
       conditions.push(`(${parts.join(" AND ")})`);
     } else if (key === "$or") {
-      const parts = value.map((sub) => {
+      const parts = value.map((sub: any) => {
         const { whereClause: wc, binds: wb } = parseFilter(
           sub,
           tableAlias,
@@ -564,7 +606,7 @@ function parseFilter(filter, tableAlias, _counter) {
       });
       conditions.push(`(${parts.join(" OR ")})`);
     } else if (key === "$nor") {
-      const parts = value.map((sub) => {
+      const parts = value.map((sub: any) => {
         const { whereClause: wc, binds: wb } = parseFilter(
           sub,
           tableAlias,
@@ -585,7 +627,7 @@ function parseFilter(filter, tableAlias, _counter) {
     } else if (key === "$exists") {
       // EXISTS subquery: { $exists: { collection, match } }
       const subColl = quoteIdentifier(value.collection);
-      const matchParts = [];
+      const matchParts: string[] = [];
       for (const [mk, mv] of Object.entries(value.match || {})) {
         if (typeof mv === "string" && mv.startsWith("$")) {
           const outerCol = mv.slice(1);
@@ -604,7 +646,7 @@ function parseFilter(filter, tableAlias, _counter) {
       conditions.push(`EXISTS (SELECT 1 FROM ${subColl}${matchWhere})`);
     } else if (key === "$notExists") {
       const subColl = quoteIdentifier(value.collection);
-      const matchParts = [];
+      const matchParts: string[] = [];
       for (const [mk, mv] of Object.entries(value.match || {})) {
         if (typeof mv === "string" && mv.startsWith("$")) {
           const outerCol = mv.slice(1);
@@ -631,4 +673,4 @@ function parseFilter(filter, tableAlias, _counter) {
   return { whereClause, binds };
 }
 
-module.exports = { parseFilter, resetBindCounter };
+export { parseFilter, resetBindCounter };

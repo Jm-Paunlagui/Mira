@@ -1,4 +1,4 @@
-"use strict";
+
 
 /**
  * ============================================================================
@@ -36,10 +36,10 @@
  * ============================================================================
  */
 
-const { quoteIdentifier } = require("../utils");
-const {
-  oracleMongoWrapperMessages: MSG,
-} = require("../../../constants/messages");
+import type { DbConnection } from "../db";
+import type { QueryBuilder } from "../core/QueryBuilder";
+import { quoteIdentifier } from "../utils";
+import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
  * Oracle error codes that indicate missing privileges or inaccessible objects.
@@ -56,9 +56,9 @@ const PRIVILEGE_ERROR_CODES = [1031, 942, 1039, 1219, 12003];
  * @param {string} sql - SQL that was attempted
  * @param {string} requiredPrivilege - Description of the required privilege
  */
-function _wrapPrivilegeError(method, err, sql, requiredPrivilege) {
+function _wrapPrivilegeError(method: string, err: Error & { errorNum?: number; code?: string }, sql: string, requiredPrivilege: string) {
   const code = err.errorNum || err.code;
-  if (PRIVILEGE_ERROR_CODES.includes(code)) {
+  if (typeof code === "number" && PRIVILEGE_ERROR_CODES.includes(code)) {
     throw new Error(
       MSG.INSUFFICIENT_PRIVILEGES(method, requiredPrivilege, err, sql),
     );
@@ -77,17 +77,17 @@ function _wrapPrivilegeError(method, err, sql, requiredPrivilege) {
  *   const perf = createPerformance(db);
  *   const plan = await perf.explainPlan(users.find({ active: true }));
  */
-function createPerformance(db) {
+function createPerformance(db: Record<string, any>): Record<string, unknown> {
   return {
     /**
      * Get the execution plan for a query.
      * @param {QueryBuilder|string} queryBuilderOrSQL
      * @returns {Promise<Array>}
      */
-    async explainPlan(queryBuilderOrSQL) {
-      return db.withConnection(async (conn) => {
+    async explainPlan(queryBuilderOrSQL: QueryBuilder | string): Promise<Array<unknown>> {
+      return db.withConnection(async (conn: DbConnection) => {
         let sql;
-        let binds = {};
+        let binds: Record<string, unknown> = {};
 
         if (typeof queryBuilderOrSQL === "string") {
           sql = queryBuilderOrSQL;
@@ -133,8 +133,8 @@ function createPerformance(db) {
      * @param {string} tableName
      * @returns {Promise<void>}
      */
-    async analyze(tableName) {
-      return db.withConnection(async (conn) => {
+    async analyze(tableName: string): Promise<void> {
+      return db.withConnection(async (conn: DbConnection) => {
         const sql = `BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, UPPER(:tbl), CASCADE => TRUE); END;`;
         try {
           await conn.execute(sql, { tbl: tableName }, { autoCommit: true });
@@ -156,10 +156,10 @@ function createPerformance(db) {
      * @param {Object} [options] - refreshMode, refreshOn, buildMode, orReplace
      * @returns {Promise<{ acknowledged: boolean }>}
      */
-    async createMaterializedView(name, queryBuilderOrSQL, options = {}) {
-      return db.withConnection(async (conn) => {
+    async createMaterializedView(name: string, queryBuilderOrSQL: QueryBuilder | string, options: { refreshMode?: "fast" | "complete" | "force"; refreshOn?: "commit" | "demand"; buildMode?: "immediate" | "deferred"; orReplace?: boolean } = {}): Promise<{ acknowledged: boolean; }> {
+      return db.withConnection(async (conn: DbConnection) => {
         let selectSql;
-        let binds = {};
+        let binds: Record<string, unknown> = {};
 
         if (typeof queryBuilderOrSQL === "string") {
           selectSql = queryBuilderOrSQL;
@@ -236,8 +236,8 @@ function createPerformance(db) {
      * @param {string} [mode='complete'] - 'fast' | 'complete' | 'force'
      * @returns {Promise<void>}
      */
-    async refreshMaterializedView(name, mode = "complete") {
-      return db.withConnection(async (conn) => {
+    async refreshMaterializedView(name: string, mode: string = "complete"): Promise<void> {
+      return db.withConnection(async (conn: DbConnection) => {
         const modeChar = { fast: "F", complete: "C", force: "?" }[mode] || "C";
         const sql = `BEGIN DBMS_MVIEW.REFRESH(:mvName, :mvMode); END;`;
         try {
@@ -262,8 +262,8 @@ function createPerformance(db) {
      * @param {string} name
      * @returns {Promise<{ acknowledged: boolean }>}
      */
-    async dropMaterializedView(name) {
-      return db.withConnection(async (conn) => {
+    async dropMaterializedView(name: string): Promise<{ acknowledged: boolean; }> {
+      return db.withConnection(async (conn: DbConnection) => {
         const sql = `DROP MATERIALIZED VIEW ${quoteIdentifier(name)}`;
         try {
           await conn.execute(sql, {}, { autoCommit: true });
@@ -281,4 +281,4 @@ function createPerformance(db) {
   };
 }
 
-module.exports = { createPerformance };
+export { createPerformance };

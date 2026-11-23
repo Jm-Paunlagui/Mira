@@ -1,4 +1,4 @@
-"use strict";
+
 
 /**
  * ============================================================================
@@ -19,7 +19,7 @@
  *   a clean interface to use that pool without managing connections manually.
  *
  * HOW TO USE:
- *   const db = createDb("userAccount");
+ *   const db = createDb("appDb");
  *   // Now pass `db` to OracleCollection, OracleSchema, Transaction, etc.
  *   // You NEVER need to open or close connections yourself.
  *
@@ -29,17 +29,17 @@
  * ============================================================================
  */
 
-const config = require("../../config");
-const { oracleMongoWrapperMessages: MSG } = require("../../constants/messages");
+import config from "../../config";
+import { oracleMongoWrapperMessages as MSG } from "../../constants/messages";
 
 /**
  * Creates a db interface bound to a named database connection pool.
  *
- * The connectionName maps to a pool configured in src/config/database.js.
+ * The connectionName maps to a pool configured in src/config/database.ts.
  * The returned object provides methods to safely borrow connections,
  * run transactions, check pool health, etc.
  *
- * @param {string} connectionName - Which database pool to use (e.g. "userAccount")
+ * @param {string} connectionName - Which database pool to use (e.g. "appDb")
  *   This name must match a key in your database.js configuration.
  * @returns {Object} The db interface with the following methods:
  *   - withConnection(fn)      — Borrow a connection, run fn(conn), auto-release
@@ -51,13 +51,13 @@ const { oracleMongoWrapperMessages: MSG } = require("../../constants/messages");
  *   - oracledb                — Direct access to the oracledb driver (for type constants)
  *
  * @example
- *   const db = createDb("userAccount");
+ *   const db = createDb("appDb");
  *   // Use it with OracleCollection:
  *   const users = new OracleCollection("users", db);
  *   // Use it with OracleSchema:
  *   const schema = new OracleSchema(db);
  */
-function createDb(connectionName = "userAccount") {
+function createDb(connectionName: string = "appDb") {
   if (!connectionName || typeof connectionName !== "string") {
     throw new TypeError(MSG.CREATEDB_INVALID_CONNECTION_NAME);
   }
@@ -81,7 +81,7 @@ function createDb(connectionName = "userAccount") {
      *     return result.rows;
      *   });
      */
-    withConnection: (callback) =>
+    withConnection: <T>(callback: (conn: DbConnection) => T | Promise<T>): Promise<T> =>
       config.withConnection(connectionName, callback),
 
     /**
@@ -93,7 +93,7 @@ function createDb(connectionName = "userAccount") {
      * @param {Function} callback - async (conn) => result
      * @returns {Promise<*>} Whatever your callback returns
      */
-    withTransaction: (callback) =>
+    withTransaction: <T>(callback: (conn: DbConnection) => T | Promise<T>): Promise<T> =>
       config.withTransaction(connectionName, callback),
 
     /**
@@ -103,7 +103,7 @@ function createDb(connectionName = "userAccount") {
      *
      * @param {Function[]} operations - Array of async (conn) => result
      */
-    withBatchConnection: (operations) =>
+    withBatchConnection: (operations: ((...args: unknown[]) => unknown)[]) =>
       config.withBatchConnection(connectionName, operations),
 
     /** Gracefully close ALL database pools. Call during app shutdown. */
@@ -126,4 +126,39 @@ function createDb(connectionName = "userAccount") {
   };
 }
 
-module.exports = { createDb };
+/** Bind values as the wrapper builds them from caller filters / documents. */
+type DbBinds = Record<string, unknown> | unknown[];
+
+/**
+ * The connection a wrapper method (or a model's raw SQL) receives from withConnection /
+ * withTransaction: node-oracledb's Connection, with `execute` narrowed to the promise form.
+ *
+ * - `binds` takes the wrapper's `DbBinds`. Bind values come from callers, and node-oracledb
+ *   checks each one's type at execute time (NJS-011 / NJS-044 …), so the static type does not
+ *   pretend to know them.
+ * - Rows default to `Record<string, unknown>` (every pool uses OUT_FORMAT_OBJECT); pass `T`
+ *   for a known row shape, e.g. `conn.execute<{ CNT: number }>(…)`.
+ */
+type DbConnection = Omit<import("oracledb").Connection, "execute" | "executeMany" | "queryStream"> & {
+  execute<T = Record<string, unknown>>(
+    sql: string,
+    binds?: DbBinds,
+    options?: import("oracledb").ExecuteOptions,
+  ): Promise<import("oracledb").Result<T>>;
+  executeMany<T = Record<string, unknown>>(
+    sql: string,
+    binds: DbBinds[] | number,
+    options?: import("oracledb").ExecuteManyOptions,
+  ): Promise<import("oracledb").Results<T>>;
+  queryStream<T = Record<string, unknown>>(
+    sql: string,
+    binds?: DbBinds,
+    options?: import("oracledb").QueryStreamOptions,
+  ): import("oracledb").QueryStream<T>;
+};
+
+export { createDb };
+/** The db handle createDb() returns. */
+type WrapperDb = ReturnType<typeof createDb>;
+
+export type { DbConnection, DbBinds, WrapperDb };

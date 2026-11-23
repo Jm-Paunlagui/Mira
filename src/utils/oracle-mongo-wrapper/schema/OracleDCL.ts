@@ -1,4 +1,4 @@
-"use strict";
+
 
 /**
  * ============================================================================
@@ -23,10 +23,9 @@
  * ============================================================================
  */
 
-const { quoteIdentifier } = require("../utils");
-const {
-    oracleMongoWrapperMessages: MSG,
-} = require("../../../constants/messages");
+import type { DbConnection } from "../db";
+import { quoteIdentifier } from "../utils";
+import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 const PRIVILEGE_ERROR_CODES = [1031, 942, 1917, 1919];
 
 /**
@@ -34,10 +33,11 @@ const PRIVILEGE_ERROR_CODES = [1031, 942, 1917, 1919];
  * Handles GRANT and REVOKE operations for database permissions.
  */
 class OracleDCL {
+    declare db: Record<string, any>;
     /**
      * @param {Object} db - db interface from createDb
      */
-    constructor(db) {
+    constructor(db: Record<string, unknown>) {
         this.db = db;
     }
 
@@ -52,8 +52,8 @@ class OracleDCL {
      * @example
      *   await dcl.grant(["SELECT", "INSERT"], "orders", "app_readonly");
      */
-    async grant(privileges, on, to) {
-        return this.db.withConnection(async (conn) => {
+    async grant(privileges: string[], on: string, to: string): Promise<{ acknowledged: boolean; }> {
+        return this.db.withConnection(async (conn: DbConnection) => {
             const privList = privileges.join(", ");
             const sql = `GRANT ${privList} ON ${quoteIdentifier(on)} TO ${quoteIdentifier(to)}`;
 
@@ -81,8 +81,8 @@ class OracleDCL {
      * @example
      *   await dcl.revoke(["DELETE", "UPDATE"], "orders", "intern_user");
      */
-    async revoke(privileges, on, from) {
-        return this.db.withConnection(async (conn) => {
+    async revoke(privileges: string[], on: string, from: string): Promise<{ acknowledged: boolean; }> {
+        return this.db.withConnection(async (conn: DbConnection) => {
             const privList = privileges.join(", ");
             const sql = `REVOKE ${privList} ON ${quoteIdentifier(on)} FROM ${quoteIdentifier(from)}`;
 
@@ -100,4 +100,4 @@ class OracleDCL {
     }
 }
 
-module.exports = { OracleDCL };
+export { OracleDCL };

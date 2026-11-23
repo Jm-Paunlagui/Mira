@@ -1,4 +1,4 @@
-"use strict";
+
 
 /**
  * ============================================================================
@@ -37,7 +37,7 @@
  * ============================================================================
  */
 
-const { quoteIdentifier } = require("../utils");
+import { quoteIdentifier } from "../utils";
 
 /**
  * Build a window/analytic function expression.
@@ -52,11 +52,11 @@ const { quoteIdentifier } = require("../utils");
  * @param {string} [spec.frame] - Custom frame clause (e.g., 'ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING')
  * @returns {string} The complete SQL analytic expression
  */
-function buildWindowExpr(spec) {
+function buildWindowExpr(spec: { fn: string; field?: string; partitionBy?: string | string[]; orderBy?: Record<string, unknown>; offset?: number; n?: number; frame?: string; }): string {
   const { fn, field, partitionBy, orderBy, offset, n, frame } = spec;
 
   // Build OVER clause
-  const overParts = [];
+  const overParts: string[] = [];
   if (partitionBy) {
     const partCols = Array.isArray(partitionBy)
       ? partitionBy.map(quoteIdentifier).join(", ")
@@ -91,28 +91,28 @@ function buildWindowExpr(spec) {
     case "NTILE":
       return `NTILE(${n || 4}) ${overClause}`;
     case "LAG":
-      return `LAG(${quoteIdentifier(field)}, ${offset || 1}) ${overClause}`;
+      return `LAG(${quoteIdentifier(field as string)}, ${offset || 1}) ${overClause}`;
     case "LEAD":
-      return `LEAD(${quoteIdentifier(field)}, ${offset || 1}) ${overClause}`;
+      return `LEAD(${quoteIdentifier(field as string)}, ${offset || 1}) ${overClause}`;
     case "FIRST_VALUE":
-      return `FIRST_VALUE(${quoteIdentifier(field)}) ${overClause}`;
+      return `FIRST_VALUE(${quoteIdentifier(field as string)}) ${overClause}`;
     case "LAST_VALUE":
-      return `LAST_VALUE(${quoteIdentifier(field)}) ${overClause}`;
+      return `LAST_VALUE(${quoteIdentifier(field as string)}) ${overClause}`;
     case "NTH_VALUE":
-      return `NTH_VALUE(${quoteIdentifier(field)}, ${n || 1}) ${overClause}`;
+      return `NTH_VALUE(${quoteIdentifier(field as string)}, ${n || 1}) ${overClause}`;
     case "SUM":
-      return `SUM(${field === "*" ? "*" : quoteIdentifier(field)}) ${overClause}`;
+      return `SUM(${field === "*" ? "*" : quoteIdentifier(field as string)}) ${overClause}`;
     case "AVG":
-      return `AVG(${field === "*" ? "*" : quoteIdentifier(field)}) ${overClause}`;
+      return `AVG(${field === "*" ? "*" : quoteIdentifier(field as string)}) ${overClause}`;
     case "COUNT":
-      return `COUNT(${field === "*" ? "*" : quoteIdentifier(field)}) ${overClause}`;
+      return `COUNT(${field === "*" ? "*" : quoteIdentifier(field as string)}) ${overClause}`;
     case "MIN":
-      return `MIN(${quoteIdentifier(field)}) ${overClause}`;
+      return `MIN(${quoteIdentifier(field as string)}) ${overClause}`;
     case "MAX":
-      return `MAX(${quoteIdentifier(field)}) ${overClause}`;
+      return `MAX(${quoteIdentifier(field as string)}) ${overClause}`;
     default:
-      return `${fnUpper}(${field ? quoteIdentifier(field) : ""}) ${overClause}`;
+      return `${fnUpper}(${field ? quoteIdentifier(field as string) : ""}) ${overClause}`;
   }
 }
 
-module.exports = { buildWindowExpr };
+export { buildWindowExpr };
