@@ -1,13 +1,21 @@
 
 
-// Environment variables are loaded once at process startup by server.ts (and by
-// each standalone script in scripts/, which call dotenv.config before requiring
-// this module). Config files MUST NOT call dotenv themselves — re-loading .env on
-// every require re-injects values the caller deliberately unset (e.g. unit tests
-// that delete an env var to assert a default). See Backend CLAUDE.md
-// "Environment Variables".
+// Environment variables are loaded once by the entry point (Bun loads .env
+// automatically). Config files MUST NOT call dotenv themselves — re-loading .env
+// on every require re-injects values the caller deliberately unset (e.g. a test
+// that deletes an env var to assert a default).
 
-// const isDevelopment = process.env.NODE_ENV === "development";
+const isDevelopment = process.env.NODE_ENV === "development";
+
+/**
+ * Test-database switch. With NODE_ENV=development AND APP_TEST_DB_USERNAME set,
+ * appDb and appDbBulk connect with the APP_TEST_DB_* credentials instead of
+ * APP_DB_*. DB_TEST_HOST / DB_TEST_PORT / DB_TEST_SID each fall back to the
+ * main DB_HOST / DB_PORT / DB_APP_SERVICE_NAME, so a test schema on the same
+ * server needs only its credentials. Without APP_TEST_DB_USERNAME nothing
+ * changes: development alone never redirects the pools.
+ */
+const usingTestDb = isDevelopment && Boolean(process.env.APP_TEST_DB_USERNAME);
 
 function buildSimpleConnectString(host: unknown, port: unknown, service: unknown) {
     return `${host}:${port}/${service}`;
@@ -55,20 +63,28 @@ function buildTNSConnectString(host: unknown, port: unknown, sid: unknown) {
  *   queueMax       {number}  optional — bounds the acquire queue (NJS-076 when full)
  *   poolTimeout    {number}  optional — idle seconds above poolMin before close (0 = never)
  */
-const appDbCredentials = {
-    user: process.env.APP_DB_USERNAME,
-    password: process.env.APP_DB_PASSWORD,
-    connectString: buildTNSConnectString(
-        process.env.DB_HOST,
-        process.env.DB_PORT,
-        process.env.DB_APP_SERVICE_NAME,
-    ),
-};
+const appDbCredentials = usingTestDb
+    ? {
+          user: process.env.APP_TEST_DB_USERNAME,
+          password: process.env.APP_TEST_DB_PASSWORD,
+          connectString: buildTNSConnectString(
+              process.env.DB_TEST_HOST || process.env.DB_HOST,
+              process.env.DB_TEST_PORT || process.env.DB_PORT,
+              process.env.DB_TEST_SID || process.env.DB_APP_SERVICE_NAME,
+          ),
+      }
+    : {
+          user: process.env.APP_DB_USERNAME,
+          password: process.env.APP_DB_PASSWORD,
+          connectString: buildTNSConnectString(
+              process.env.DB_HOST,
+              process.env.DB_PORT,
+              process.env.DB_APP_SERVICE_NAME,
+          ),
+      };
 
 const connections = {
-    // ── appDb — the standalone template connection (T_USERS_DEV / T_ADMINS_DEV /
-    //    T_AUDIT_LOGS_DEV). This is the only connection a fresh project needs.
-    //    Skipped entirely when DEMO_MODE=true (no Oracle pool is opened).
+    // ── appDb — interactive work. The only connection a fresh project needs.
     appDb: {
         ...appDbCredentials,
         poolMin: parseInt(process.env.APP_POOL_MIN ?? "", 10) || 5,
@@ -77,8 +93,8 @@ const connections = {
         poolTimeout: nonNegativeInt(process.env.APP_POOL_TIMEOUT, 30),
     },
 
-    // ── appDbBulk — same credentials, separate pool for long-hold work (export,
-    //    backup, purge, restore) so it cannot starve interactive traffic.
+    // ── appDbBulk — same credentials, separate pool for long-hold work (exports,
+    //    backups, bulk loads) so it cannot starve interactive traffic.
     appDbBulk: {
         ...appDbCredentials,
         poolMin: parseInt(process.env.APP_BULK_POOL_MIN ?? "", 10) || 1,
@@ -117,20 +133,14 @@ function getConnectionNames() {
     return Object.keys(connections);
 }
 
-/**
- * Named pool keys — single source of truth for pool name strings.
- * Import this into health.route.js and any other file that references pool names
- * to avoid magic strings.
- */
+/** Named pool keys — single source of truth for pool name strings. */
 const POOL_NAMES = Object.freeze(Object.keys(connections));
 
 /**
- * Pools whose SATURATION (NJS-076) makes /health/ready answer 503.
- *
- * Every pool must answer with a closed breaker for /ready to be 200; this list
- * only decides which pools may not be saturated. `appDbBulk` is excluded: it is
- * the load-shedding bulkhead, so a saturated bulk pool is the design working,
- * not the service being unready.
+ * Pools whose saturation (NJS-076) an app's readiness check should treat as
+ * "not ready". Exported for apps built on Mira; Mira itself does not read it.
+ * `appDbBulk` is excluded: it is the load-shedding bulkhead, so a saturated
+ * bulk pool is the design working, not the service being unready.
  */
 const READINESS_GATING_POOLS = Object.freeze(["appDb"]);
 
@@ -144,8 +154,8 @@ for (const p of READINESS_GATING_POOLS) {
 }
 
 // Default object as well as named exports: the Oracle adapter destructures
-// getConnectionConfig from it at load, so test/server/helpers/freshOracleAdapter.js
-// can swap the function on this plain object for a fresh adapter copy.
-// A named-export binding cannot be reassigned from outside the module.
-export default { connections, getConnectionConfig, getConnectionNames, POOL_NAMES, READINESS_GATING_POOLS, buildSimpleConnectString, buildTNSConnectString };
-export { connections, getConnectionConfig, getConnectionNames, POOL_NAMES, READINESS_GATING_POOLS, buildSimpleConnectString, buildTNSConnectString };
+// getConnectionConfig from it at load, so a test can swap the function on this
+// plain object for a fresh adapter copy. A named-export binding cannot be
+// reassigned from outside the module.
+export default { connections, getConnectionConfig, getConnectionNames, isDevelopment, usingTestDb, POOL_NAMES, READINESS_GATING_POOLS, buildSimpleConnectString, buildTNSConnectString };
+export { connections, getConnectionConfig, getConnectionNames, isDevelopment, usingTestDb, POOL_NAMES, READINESS_GATING_POOLS, buildSimpleConnectString, buildTNSConnectString };

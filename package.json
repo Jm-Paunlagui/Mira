@@ -23,7 +23,7 @@
   "main": "src/utils/oracle-mongo-wrapper/index.ts",
   "scripts": {
     "typecheck": "tsc -p .",
-    "test": "bun --bun mocha test/oracle-mongo-wrapper/test.js --timeout 60000 --exit"
+    "test": "bun --bun mocha \"test/**/*.test.{js,ts}\" --timeout 60000 --exit"
   },
   "dependencies": {
     "dotenv": "^17.4.0",

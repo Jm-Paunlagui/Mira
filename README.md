@@ -80,6 +80,8 @@ ORACLE_INSTANT_CLIENT=
 
 Pool sizing (`APP_POOL_*`, `APP_BULK_*`) and logging (`LOG_*`) are documented in `.env.example`.
 
+**Test database (optional):** with `NODE_ENV=development` and `APP_TEST_DB_USERNAME` set, both pools connect with `APP_TEST_DB_USERNAME` / `APP_TEST_DB_PASSWORD` instead. `DB_TEST_HOST` / `DB_TEST_PORT` / `DB_TEST_SID` fall back to the main values, so a test schema on the same server needs only its credentials.
+
 #### Step 2 — Register Connections in `database.ts`
 
 Each connection gets a name and its credentials from `.env`. You never hardcode passwords here — only `process.env` references. Two pools ship, on the same credentials:
