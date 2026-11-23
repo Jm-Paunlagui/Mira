@@ -60,7 +60,7 @@
  * ============================================================================
  */
 
-import { quoteIdentifier } from "../utils";
+import { quoteIdentifier, bindSafe } from "../utils";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
@@ -70,6 +70,30 @@ import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
  * @constant {number}
  */
 const ORACLE_IN_LIST_MAX = 1000;
+
+/**
+ * Aggregate functions a correlated $subquery may apply. The name is spliced
+ * into SQL, so anything else is refused (an arbitrary "aggregate" string could
+ * otherwise rewrite the comparison — CWE-89).
+ * @constant {Set<string>}
+ */
+const SUBQUERY_AGGREGATES = new Set(["SUM", "AVG", "MIN", "MAX", "COUNT"]);
+
+/**
+ * Large $in / $nin lists are bound as ONE collection instead of N scalar binds:
+ * `col IN (SELECT COLUMN_VALUE FROM TABLE(:b))`. Thousands of OR-ed IN groups
+ * make Oracle's parse cost grow super-linearly (20,000 values measured ~50x
+ * slower than 2,000) — an easy denial of service. One collection bind keeps the
+ * statement text constant, so cost is linear and the cursor is shared.
+ * SYS.ODCI*LIST types are granted to PUBLIC. Lists whose element type cannot be
+ * mapped (mixed types, strings > 4000 bytes) fall back to grouped IN lists.
+ */
+function _collectionBind(values: unknown[]): { type: string; val: unknown[] } | null {
+  if (values.every((v) => typeof v === "number" && Number.isFinite(v))) return { type: "SYS.ODCINUMBERLIST", val: values };
+  if (values.every((v) => v instanceof Date)) return { type: "SYS.ODCIDATELIST", val: values };
+  if (values.every((v) => typeof v === "string" && Buffer.byteLength(v, "utf8") <= 4000)) return { type: "SYS.ODCIVARCHAR2LIST", val: values };
+  return null;
+}
 
 // ─── _createCounter ─────────────────────────────────────────────
 /**
@@ -96,7 +120,7 @@ function _createCounter(): { next: (prefix: string) => string; } {
   let _count = 0;
   return {
     next(prefix) {
-      return `${prefix}_${_count++}`;
+      return `${bindSafe(prefix)}_${_count++}`;
     },
   };
 }
@@ -212,11 +236,8 @@ function _parseFieldExpr(field: string, expr: any, binds: Record<string, unknown
     if (expr === null || expr === undefined) {
       return `${qField} IS NULL`;
     }
-    // Handle $outer. correlated reference (for LATERAL JOIN)
-    if (typeof expr === "string" && expr.startsWith("$outer.")) {
-      const outerCol = expr.slice(7);
-      return `${qField} = ${quoteIdentifier(outerCol)}`;
-    }
+    // "$outer.COL" (LATERAL correlation) is bound like any value; $lateralJoin
+    // rewrites such binds into a reference to the OUTER source's column.
     const bname = counter.next(`where_${field}`);
     binds[bname] = expr;
     return `${qField} = :${bname}`;
@@ -253,8 +274,13 @@ function _parseFieldExpr(field: string, expr: any, binds: Record<string, unknown
         conditions.push(`${qField} ${COMPARISON_OPS[op]} :${bname}`);
       }
     } else if (op === "$in") {
+      const coll = Array.isArray(val) && val.length > ORACLE_IN_LIST_MAX ? _collectionBind(val) : null;
       if (!Array.isArray(val) || val.length === 0) {
         conditions.push("1=0"); // empty IN → always false
+      } else if (coll) {
+        const bname = counter.next(`where_${field}`);
+        binds[bname] = coll;
+        conditions.push(`${qField} IN (SELECT COLUMN_VALUE FROM TABLE(:${bname}))`);
       } else {
         // Oracle caps an IN list at 1,000 expressions (ORA-01795). Split
         // oversized value lists into OR-joined IN groups of ≤1,000 binds so
@@ -274,8 +300,13 @@ function _parseFieldExpr(field: string, expr: any, binds: Record<string, unknown
         );
       }
     } else if (op === "$nin") {
+      const coll = Array.isArray(val) && val.length > ORACLE_IN_LIST_MAX ? _collectionBind(val) : null;
       if (!Array.isArray(val) || val.length === 0) {
         conditions.push("1=1");
+      } else if (coll) {
+        const bname = counter.next(`where_${field}`);
+        binds[bname] = coll;
+        conditions.push(`${qField} NOT IN (SELECT COLUMN_VALUE FROM TABLE(:${bname}))`);
       } else {
         // Same ORA-01795 cap as $in. De Morgan: NOT(x IN a OR x IN b)
         // ≡ x NOT IN a AND x NOT IN b — so groups join with AND.
@@ -388,17 +419,9 @@ function _parseFieldExpr(field: string, expr: any, binds: Record<string, unknown
     } else if (op === "$inSelect") {
       // val can be a QueryBuilder, a resolved Array, or raw SQL string
       if (Array.isArray(val)) {
-        // Already resolved (e.g. from await distinct()) — treat like $in
-        if (val.length === 0) {
-          conditions.push("1=0");
-        } else {
-          const placeholders = val.map((v) => {
-            const bname = counter.next(`where_${field}`);
-            binds[bname] = v;
-            return `:${bname}`;
-          });
-          conditions.push(`${qField} IN (${placeholders.join(", ")})`);
-        }
+        // Already resolved (e.g. from await distinct()) — exactly $in, including its
+        // empty-list and >1,000-value (ORA-01795) handling.
+        conditions.push(_parseFieldExpr(field, { $in: val }, binds, outerAlias, counter));
       } else if (val && val._buildSQL) {
         // QueryBuilder — get its SQL
         const subSql = val._buildSQL();
@@ -485,8 +508,11 @@ function _parseFieldExpr(field: string, expr: any, binds: Record<string, unknown
 function _buildCorrelatedSubquery(field: string, spec: Record<string, any>, binds: Record<string, unknown>, outerAlias: string | null | undefined, counter: Record<string, any>): string {
   const collection = quoteIdentifier(spec.collection);
   const aggFn = spec.aggregate
-    ? spec.aggregate.replace("$", "").toUpperCase()
+    ? String(spec.aggregate).replace("$", "").toUpperCase()
     : null;
+  if (aggFn !== null && !SUBQUERY_AGGREGATES.has(aggFn)) {
+    throw new Error(MSG.AGGREGATE_UNKNOWN_FUNCTION("filterParser.$subquery", spec.aggregate));
+  }
   const subField = spec.field ? quoteIdentifier(spec.field) : "*";
 
   let selectExpr = subField;

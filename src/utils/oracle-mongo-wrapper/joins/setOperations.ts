@@ -48,6 +48,12 @@ import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
  *   The second query's bind variables are re-keyed with a "set2_" prefix
  *   to prevent collisions with the first query's binds.
  */
+/** limit/skip are spliced into SQL, so only a non-negative integer is accepted (CWE-89). */
+function _rowCount(what: string, n: unknown): number {
+  if (!Number.isInteger(n) || (n as number) < 0) throw new TypeError(MSG.INVALID_ROW_COUNT(`SetResultBuilder.${what}`, what, n));
+  return n as number;
+}
+
 class SetResultBuilder {
   declare _skipVal: unknown;
   declare _limitVal: unknown;
@@ -93,7 +99,7 @@ class SetResultBuilder {
    * @returns {SetResultBuilder}
    */
   limit(n: number): SetResultBuilder {
-    this._limitVal = n;
+    this._limitVal = _rowCount("limit", n);
     return this;
   }
 
@@ -102,7 +108,7 @@ class SetResultBuilder {
    * @returns {SetResultBuilder}
    */
   skip(n: number): SetResultBuilder {
-    this._skipVal = n;
+    this._skipVal = _rowCount("skip", n);
     return this;
   }
 

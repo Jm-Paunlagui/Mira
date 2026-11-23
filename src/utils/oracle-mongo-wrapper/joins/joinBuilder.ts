@@ -34,6 +34,7 @@
  */
 
 import { quoteIdentifier } from "../utils";
+import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
  * Build a JOIN SQL fragment from a $lookup specification.
@@ -112,7 +113,8 @@ function _resolveJoinType(type: any) {
     case "natural":
       return "NATURAL JOIN";
     default:
-      return "LEFT OUTER JOIN";
+      // A typo ("inenr") must not silently become a LEFT join (different rows).
+      throw new Error(MSG.JOIN_UNKNOWN_TYPE("buildJoinSQL", type));
   }
 }
 

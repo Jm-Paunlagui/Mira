@@ -23,7 +23,14 @@
   "main": "src/utils/oracle-mongo-wrapper/index.ts",
   "scripts": {
     "typecheck": "tsc -p .",
-    "test": "bun --bun mocha \"test/**/*.test.{js,ts}\" --timeout 60000 --exit"
+    "test": "bun test/run.ts",
+    "test:coverage": "bun test/run.ts --coverage",
+    "test:unit": "bun test/run.ts test/unit",
+    "test:integration": "bun test/run.ts test/integration",
+    "test:performance": "bun test/run.ts test/performance",
+    "test:chaos": "bun test/run.ts test/chaos",
+    "test:security": "bun test/run.ts test/security",
+    "test:reliability": "bun test/run.ts test/reliability"
   },
   "dependencies": {
     "dotenv": "^17.4.0",
@@ -37,8 +44,6 @@
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.6",
     "@types/oracledb": "^26.0.1",
-    "chai": "^6.2.2",
-    "mocha": "^11.7.5",
     "typescript": "~6.0"
   },
   "packageManager": "bun@1.4.5"

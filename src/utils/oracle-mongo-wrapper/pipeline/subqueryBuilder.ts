@@ -33,6 +33,10 @@
 
 import type { QueryBuilder } from "../core/QueryBuilder";
 import { quoteIdentifier } from "../utils";
+import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
+
+/** Aggregates a correlated subquery may apply (the name is spliced into SQL). */
+const CORRELATED_AGGREGATES = new Set(["SUM", "AVG", "MIN", "MAX", "COUNT"]);
 
 /**
  * Build a scalar subquery for use in SELECT projections.
@@ -144,7 +148,8 @@ function buildNotExistsSubquery(spec: Parameters<typeof buildExistsSubquery>[0],
  */
 function buildCorrelatedSubquery(spec: { collection: string; field: string; aggregate?: string; where?: Record<string, unknown>; }, outerAlias: string = "t0"): string {
   const { collection, field, aggregate, where = {} } = spec;
-  const aggFn = (aggregate || "$avg").replace("$", "").toUpperCase();
+  const aggFn = String(aggregate || "$avg").replace("$", "").toUpperCase();
+  if (!CORRELATED_AGGREGATES.has(aggFn)) throw new Error(MSG.AGGREGATE_UNKNOWN_FUNCTION("buildCorrelatedSubquery", aggregate));
   const aggExpr = `${aggFn}(${quoteIdentifier(field as string)})`;
 
   const whereParts: string[] = [];

@@ -250,6 +250,12 @@ function moneySafeFetchTypeHandler(metaData: import("oracledb").Metadata<unknown
     return undefined; // default handling for everything else
 }
 
+// Applied driver-wide so EVERY query (wrapper methods and raw conn.execute alike)
+// gets exact decimal strings for scaled NUMBER columns. It used to live only in
+// EXECUTE_OPTIONS, which no wrapper query passes — money silently arrived as
+// IEEE doubles (123456789012345.6789 → 123456789012345.67).
+oracledb.fetchTypeHandler = moneySafeFetchTypeHandler;
+
 const EXECUTE_OPTIONS = Object.freeze({
     outFormat: OUT_FORMAT_OBJECT,
     autoCommit: true,
@@ -779,7 +785,6 @@ const ACQUIRE_BASE_DELAY_MS = 150;
  * @returns {Promise<object>} An open connection the caller must close.
  */
 async function _acquireConnection(connectionName: string, pool: import("oracledb").Pool): Promise<import("oracledb").Connection> {
-    let lastErr;
 
     // B9 — honour the PER-POOL connectTimeout on the acquire-race timer.
     // `pool.connectTimeout` is not a property node-oracledb exposes on the live
@@ -790,7 +795,9 @@ async function _acquireConnection(connectionName: string, pool: import("oracledb
     const configuredTimeout: unknown = Reflect.get(cfg, "connectTimeout");
     const connectTimeoutMs = typeof configuredTimeout === "number" ? configuredTimeout : POOL_DEFAULTS.connectTimeout;
 
-    for (let attempt = 1; attempt <= ACQUIRE_MAX_ATTEMPTS; attempt++) {
+    // Every pass either returns a connection or throws on the last / a
+    // non-transient attempt, so the loop needs no exit condition.
+    for (let attempt = 1; ; attempt++) {
         const pending = pool.getConnection();
         let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -828,8 +835,6 @@ async function _acquireConnection(connectionName: string, pool: import("oracledb
                 () => {},
             );
 
-            lastErr = err;
-
             const isLastAttempt = attempt >= ACQUIRE_MAX_ATTEMPTS;
             if (isLastAttempt || !_isTransientDbError(err)) throw err;
 
@@ -846,8 +851,6 @@ async function _acquireConnection(connectionName: string, pool: import("oracledb
             if (timer) clearTimeout(timer);
         }
     }
-
-    throw lastErr;
 }
 
 /**
@@ -917,6 +920,10 @@ async function withConnection<T>(connectionName: string, callback: (conn: import
         );
     } finally {
         if (conn) {
+            // Session settings a callback changed must not follow the pooled
+            // connection to its next borrower (a leftover callTimeout aborts
+            // someone else's long query).
+            if (conn.callTimeout) conn.callTimeout = 0;
             try {
                 await conn.close();
             } catch (e) {
@@ -1089,7 +1096,9 @@ const NON_TRANSIENT_DB_ORA_CODES = new Set([1, 28, 31]);
 const TRANSIENT_DB_SYSTEM_CODES = new Set(["ECONNRESET", "ETIMEDOUT"]);
 const TRANSIENT_DB_STRING_PATTERNS = [
     /timed out getting connection/i,
-    /NJS-(040|500|501|503|510)/,
+    // NJS-040 (queue timeout) is deliberately absent: it means the pool is
+    // saturated, and retrying it stretches queueTimeout ~3x and adds load.
+    /NJS-(500|501|503|510)/,
 ];
 
 /** ORA number from the driver's errorNum, else parsed out of "ORA-XXXXX" in the message. */

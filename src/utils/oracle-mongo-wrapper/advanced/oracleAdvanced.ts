@@ -32,6 +32,10 @@
 
 import { quoteIdentifier } from "../utils";
 import { parseFilter } from "../parsers/filterParser";
+import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
+
+/** Aggregates PIVOT may apply (the name is spliced into SQL). */
+const PIVOT_AGGREGATES = new Set(["SUM", "AVG", "MIN", "MAX", "COUNT"]);
 
 /**
  * Build a CONNECT BY hierarchical query.
@@ -156,6 +160,7 @@ function buildPivot(tableName: string, spec: { value: Record<string, any>; pivot
   // Determine aggregate function and field
   const [aggOp, aggField] = Object.entries(value)[0];
   const aggFn = aggOp.replace("$", "").toUpperCase();
+  if (!PIVOT_AGGREGATES.has(aggFn)) throw new Error(MSG.AGGREGATE_UNKNOWN_FUNCTION("buildPivot", aggOp));
   const field = aggField.startsWith("$") ? aggField.substring(1) : aggField;
 
   // Build inner SELECT — only the columns needed for pivot

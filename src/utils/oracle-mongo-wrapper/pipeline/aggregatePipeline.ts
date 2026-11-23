@@ -64,7 +64,7 @@
  *   _buildProjectCols()  → Build SELECT columns for $project
  *   _buildAddFieldsCols() → Build extra columns for $addFields
  *   _buildLateralSub()   → Build LATERAL subquery
- *   _buildMergeStage()   → Build MERGE INTO for $merge stage
+ *   _buildMergeStatement() → Wrap the pipeline in MERGE INTO for $merge
  *   _buildBucket()       → Build CASE-based grouping for $bucket
  *   _buildSortString()   → Build ORDER BY string
  * ============================================================================
@@ -72,6 +72,7 @@
 
 import { quoteIdentifier } from "../utils";
 import { parseFilter } from "../parsers/filterParser";
+import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
  * Create a per-call counter for unique bind variable names.
@@ -114,11 +115,13 @@ function _createCounter(): Counter {
  */
 function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<string, unknown>): { sql: string; binds: Record<string, unknown>; } {
   const counter = _createCounter();
-  const ctes: Array<{ alias: string; sql: string; isMerge?: boolean }> = [];
+  const ctes: Array<{ alias: string; sql: string }> = [];
   const allBinds: Record<string, unknown> = {};
   let prevSource = quoteIdentifier(tableName);
   let stageIdx = 0;
   let outTable: string | null = null;
+  let mergeSpec: DslSpec = null;
+  let hasMerge = false;
 
   // Pre-scan for $having — attach to preceding $group
   for (let i = 0; i < pipeline.length; i++) {
@@ -257,9 +260,12 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
       }
 
       case "$merge": {
-        const mergeSql = _buildMergeStage(stage.$merge, prevSource);
-        ctes.push({ alias: stageAlias, sql: mergeSql, isMerge: true });
-        break;
+        // MERGE is a statement, not a row source: it must end the pipeline and
+        // wraps everything before it (see _buildMergeStatement).
+        if (pipeline[pipeline.length - 1] !== stage) throw new Error(MSG.PIPELINE_MERGE_INVALID("$merge must be the last stage"));
+        mergeSpec = stage.$merge;
+        hasMerge = true;
+        continue;
       }
 
       case "$bucket": {
@@ -272,12 +278,24 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
       case "$facet": {
         // Each facet pipeline is a separate CTE, union all at end
         const facetCtes: string[] = [];
+        let facetIdx = 0;
         for (const [facetName, facetPipeline] of Object.entries(stage.$facet as Record<string, unknown[]>)) {
-          const { sql } = buildAggregateSQL(
+          const built = buildAggregateSQL(
             prevSource.replace(/"/g, ""),
             facetPipeline,
             db,
           );
+          // Every facet numbers its binds from 0, so rename them per facet
+          // (f0_where_S_0, f1_where_S_0) before merging — otherwise facets
+          // would overwrite each other's values, and dropping them entirely
+          // fails with ORA-01008.
+          let sql = built.sql;
+          for (const [k, v] of Object.entries(built.binds)) {
+            const nk = `f${facetIdx}_${k}`;
+            sql = sql.replace(new RegExp(`:${k}\\b`, "g"), `:${nk}`);
+            allBinds[nk] = v;
+          }
+          facetIdx++;
           facetCtes.push(
             `SELECT '${facetName.replace(/'/g, "''")}' AS "facet_name", sub.* FROM (${sql}) sub`,
           );
@@ -319,42 +337,35 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
         break;
       }
 
+      case "$having":
+        // Reached only when the pre-scan could not attach it to a preceding $group.
+        throw new Error(MSG.PIPELINE_HAVING_WITHOUT_GROUP);
+
       default:
-        // Unknown stage — skip
-        stageIdx++;
-        continue;
+        // A typo ($mtach) silently skipped would turn a filtered query into a full read.
+        throw new Error(MSG.PIPELINE_UNKNOWN_STAGE(key));
     }
 
     prevSource = quoteIdentifier(stageAlias);
     stageIdx++;
   }
 
-  // Build final SQL
+  // Build final SQL: the SELECT the pipeline produces …
+  let sql: string;
   if (ctes.length === 0) {
-    return {
-      sql: `SELECT * FROM ${quoteIdentifier(tableName)}`,
-      binds: allBinds,
-    };
+    sql = `SELECT * FROM ${quoteIdentifier(tableName)}`;
+  } else if (ctes.length === 1) {
+    sql = ctes[0].sql;
+  } else {
+    const withParts = ctes
+      .slice(0, -1)
+      .map((c) => `${quoteIdentifier(c.alias)} AS (${c.sql})`);
+    sql = `WITH ${withParts.join(",\n     ")}\n${ctes[ctes.length - 1].sql}`;
   }
 
-  if (ctes.length === 1) {
-    let sql = ctes[0].sql;
-    if (outTable) {
-      sql = `INSERT INTO ${quoteIdentifier(outTable)} ${sql}`;
-    }
-    return { sql, binds: allBinds };
-  }
-
-  // Build WITH ... AS chain
-  const withParts = ctes
-    .slice(0, -1)
-    .map((c) => `${quoteIdentifier(c.alias)} AS (${c.sql})`);
-  const lastCte = ctes[ctes.length - 1];
-
-  let sql = `WITH ${withParts.join(",\n     ")}\n${lastCte.sql}`;
-  if (outTable) {
-    sql = `INSERT INTO ${quoteIdentifier(outTable)} ${sql}`;
-  }
+  // … optionally written somewhere by $merge / $out.
+  if (hasMerge) return { sql: _buildMergeStatement(mergeSpec, sql), binds: allBinds };
+  if (outTable) sql = `INSERT INTO ${quoteIdentifier(outTable)} ${sql}`;
   return { sql, binds: allBinds };
 }
 
@@ -534,7 +545,8 @@ function _buildAggExpr(expr: Record<string, DslSpec>, binds: Record<string, unkn
         }
         case "$concat": {
           if (Array.isArray(val)) {
-            return val.map(_fieldRef).join(" || ");
+            // "$col" is a column; any other string/number is a literal and is bound.
+            return val.map((v) => _fieldRefOrBind(v, binds, counter)).join(" || ");
           }
           return _fieldRef(val);
         }
@@ -742,15 +754,41 @@ function _buildLateralSub(lj: DslSpec, prevSource: unknown) {
 }
 
 /**
- * Build a MERGE INTO statement for the $merge pipeline stage.
- * Merges results from the pipeline into a target table.
+ * Wrap the pipeline's SELECT in a MERGE INTO for the $merge stage.
+ *
+ *   { $merge: {
+ *       into: "TARGET",                 // target table
+ *       on: { ID: "ID" },               // target column -> pipeline column
+ *       fields: ["ID", "TOTAL"],        // pipeline columns to write (same names in the target)
+ *       whenMatched: "merge",           // "merge" (update non-key fields, default) | "keepExisting"
+ *       whenNotMatched: "insert",       // "insert" (default) | "discard"
+ *   } }
+ *
+ * `fields` is required: the builder never sees the result columns, and Oracle
+ * accepts neither `INSERT VALUES (src.*)` nor updating an ON column (ORA-38104).
  */
-function _buildMergeStage(merge: DslSpec, source: unknown) {
-  const into = quoteIdentifier(merge.into);
-  const onCols = Object.entries(merge.on as Record<string, string>)
-    .map(([l, r]) => `tgt.${quoteIdentifier(l)} = src.${quoteIdentifier(r)}`)
+function _buildMergeStatement(merge: DslSpec, sourceSql: string): string {
+  const { into, on, fields, whenMatched = "merge", whenNotMatched = "insert" } = merge ?? {};
+  if (!into) throw new Error(MSG.PIPELINE_MERGE_INVALID("into is required"));
+  if (!on || typeof on !== "object" || Object.keys(on).length === 0) throw new Error(MSG.PIPELINE_MERGE_INVALID("on must map at least one target column"));
+  if (!Array.isArray(fields) || fields.length === 0) throw new Error(MSG.PIPELINE_MERGE_INVALID("fields must list the columns to write"));
+  if (whenMatched !== "merge" && whenMatched !== "keepExisting") throw new Error(MSG.PIPELINE_MERGE_INVALID('whenMatched must be "merge" or "keepExisting"'));
+  if (whenNotMatched !== "insert" && whenNotMatched !== "discard") throw new Error(MSG.PIPELINE_MERGE_INVALID('whenNotMatched must be "insert" or "discard"'));
+
+  const onSql = Object.entries(on as Record<string, string>)
+    .map(([t, s]) => `tgt.${quoteIdentifier(t)} = src.${quoteIdentifier(s)}`)
     .join(" AND ");
-  return `MERGE INTO ${into} tgt USING (SELECT * FROM ${source}) src ON (${onCols}) WHEN MATCHED THEN UPDATE SET tgt.updated = SYSDATE WHEN NOT MATCHED THEN INSERT VALUES (src.*)`;
+  const updatable = (fields as string[]).filter((f) => !(f in on));
+  const matched =
+    whenMatched === "merge" && updatable.length > 0
+      ? ` WHEN MATCHED THEN UPDATE SET ${updatable.map((c) => `tgt.${quoteIdentifier(c)} = src.${quoteIdentifier(c)}`).join(", ")}`
+      : "";
+  const notMatched =
+    whenNotMatched === "insert"
+      ? ` WHEN NOT MATCHED THEN INSERT (${(fields as string[]).map(quoteIdentifier).join(", ")}) VALUES (${(fields as string[]).map((c) => `src.${quoteIdentifier(c)}`).join(", ")})`
+      : "";
+  if (!matched && !notMatched) throw new Error(MSG.PIPELINE_MERGE_INVALID("nothing to do: no updatable fields and whenNotMatched is discard"));
+  return `MERGE INTO ${quoteIdentifier(into)} tgt USING (${sourceSql}) src ON (${onSql})${matched}${notMatched}`;
 }
 
 /**

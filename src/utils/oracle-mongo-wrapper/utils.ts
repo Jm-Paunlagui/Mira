@@ -44,6 +44,17 @@ function quoteIdentifier(name: string): string {
   return `"${sanitized}"`;
 }
 
+/**
+ * Makes a caller-derived string (usually a column name) safe to use INSIDE a
+ * bind-variable name. Bind names are not quoted in SQL (`:where_NAME_0`), so a
+ * field name such as `NAME" OR "X` would otherwise break out of the
+ * placeholder. Anything outside [A-Za-z0-9_] becomes "_"; callers keep names
+ * unique with a counter or index suffix.
+ */
+function bindSafe(name: unknown): string {
+  return String(name).replace(/[^A-Za-z0-9_]/g, "_");
+}
+
 // ─── convertTypes ───────────────────────────────────────────────
 /**
  * ⚠ FENCED — DO NOT APPLY TO MONEY OR RATE VALUES.
@@ -247,4 +258,4 @@ function buildProjection(projection: Record<string, unknown> | null | undefined)
   };
 }
 
-export { quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection };
+export { quoteIdentifier, bindSafe, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection };

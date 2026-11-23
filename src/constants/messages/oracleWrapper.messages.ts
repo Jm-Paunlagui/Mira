@@ -125,8 +125,6 @@ const oracleMongoWrapperMessages = {
     "[updateParser] $rename is not supported. Use ALTER TABLE to rename columns.",
   UPDATE_UNSUPPORTED_OPERATOR: (op: unknown) =>
     `[updateParser] Unsupported update operator: ${op}`,
-  UPDATE_NO_OPERATOR:
-    "[updateParser] Update object must contain at least one operator ($set, $inc, etc.).",
   UPDATE_CURRENT_DATE_INVALID: (field: unknown) =>
     `[updateParser] $currentDate.${field} must be true, { $type: "date" } or { $type: "timestamp" }.`,
   FOR_UPDATE_INVALID_MODE: (mode: unknown) =>
@@ -156,6 +154,28 @@ const oracleMongoWrapperMessages = {
     "[performance.createMaterializedView] Expected a QueryBuilder or SQL string.",
   SET_OP_COLUMN_COUNT_MISMATCH:
     "[SetResultBuilder] Column counts differ between queries",
+  COLLECTION_INVALID_TABLE_NAME: (name: unknown) =>
+    `[OracleCollection] tableName must be a non-empty string, got ${typeof name === "string" ? '""' : typeof name}.`,
+  INVALID_ROW_COUNT: (scope: unknown, what: unknown, value: unknown) =>
+    `[${scope}] ${what} must be a non-negative integer, got ${typeof value === "number" ? value : typeof value}.`,
+  PIPELINE_UNKNOWN_STAGE: (stage: unknown) =>
+    `[aggregatePipeline] Unsupported stage: ${String(stage)}.`,
+  PIPELINE_MERGE_INVALID: (reason: unknown) =>
+    `[aggregatePipeline] Invalid $merge: ${reason}.`,
+  PIPELINE_HAVING_WITHOUT_GROUP:
+    "[aggregatePipeline] $having must directly follow a $group stage.",
+  JOIN_UNKNOWN_TYPE: (scope: unknown, type: unknown) =>
+    `[${scope}] Unknown joinType "${String(type)}". Use left, right, full, inner, cross, self or natural.`,
+  WINDOW_UNKNOWN_FUNCTION: (fn: unknown) =>
+    `[windowFunctions] Unsupported window function: ${String(fn)}.`,
+  WINDOW_INVALID_ARGUMENT: (name: unknown, value: unknown) =>
+    `[windowFunctions] ${name} must be a positive integer, got ${typeof value === "number" ? value : typeof value}.`,
+  WINDOW_INVALID_FRAME: (frame: unknown) =>
+    `[windowFunctions] Invalid frame "${String(frame).slice(0, 80)}". Use ROWS|RANGE with UNBOUNDED PRECEDING / n PRECEDING / CURRENT ROW / n FOLLOWING / UNBOUNDED FOLLOWING.`,
+  AGGREGATE_UNKNOWN_FUNCTION: (scope: unknown, fn: unknown) =>
+    `[${scope}] Unsupported aggregate function: ${String(fn).slice(0, 40)}. Use SUM, AVG, MIN, MAX or COUNT.`,
+  SUBQUERY_FIELD_REQUIRED: (fn: unknown) =>
+    `[QueryBuilder.project] $subquery fn "${String(fn)}" needs a field.`,
 };
 
 export { oracleMongoWrapperMessages };

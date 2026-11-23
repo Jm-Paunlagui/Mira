@@ -26,6 +26,7 @@ Oracle Database
 - [Hard — Aggregation, Transactions & Joins](#-hard--aggregation-transactions--joins)
 - [Advanced — Window Functions, CTEs, Hierarchies & More](#-advanced--window-functions-ctes-hierarchies--more)
 - [Operator Reference](#operator-reference)
+- [Testing](#testing)
 
 ---
 
@@ -1171,5 +1172,28 @@ await employees.merge(
     { whenMatched: { $set: { salary: 60000 } }, whenNotMatched: "insert" },
 );
 ```
+
+## Testing
+
+The suite runs on `bun test` against a real Oracle schema (the `appDb` connection in `.env`). It is split into six categories, one folder each under `test/`:
+
+| Category | What it proves |
+| --- | --- |
+| `unit` | SQL builders, error paths (stub connections), config, and the adapter (stub driver: pool lifecycle, retries, health monitor, shutdown) |
+| `integration` | Every collection, query, transaction, DDL, DCL and performance-utility method against the live schema |
+| `performance` | Throughput / latency floors; numbers recorded per run |
+| `chaos` | Dead host, bad credentials, pool exhaustion, cancelled calls, dropped connections, deadlocks, injected mid-transaction crashes, fuzzed filters |
+| `security` | Injection payloads (values, identifiers, raw-SQL splice points), secret redaction in errors, least privilege, resource abuse |
+| `reliability` | No lost updates or leaked connections, idempotent upserts, exact data round-trips, soak stability |
+
+```bash
+bun run test            # all six categories
+bun run test:coverage   # + coverage (threshold 100% lines/functions for src/config and the wrapper)
+bun run test:unit       # or :integration / :performance / :chaos / :security / :reliability
+```
+
+**Database prerequisites.** The schema user needs `CREATE TABLE`, `CREATE VIEW`, `CREATE SEQUENCE`, `CREATE SYNONYM`, `CREATE MATERIALIZED VIEW` and a tablespace quota (`ALTER USER <user> QUOTA UNLIMITED ON USERS;`). Every suite creates its own `MIRA_<suite>_*` tables and drops them afterwards.
+
+**Results.** The runner prints a scorecard per category. Tests named `DEFECT:` / `SECURITY:` assert the *fixed* behaviour of a known open issue and are reported separately from unexpected failures. Each run is stored under one `RUN_ID` in two tables that are kept between runs: `MIRA_TEST_RESULTS` (one row per test) and `MIRA_TEST_METRICS` (latencies, throughput, counts). Set `MIRA_SKIP_PERSIST=1` to skip writing them; performance budgets can be tightened with `MIRA_PERF_*` env vars (see `test/performance/perf.test.ts`).
 
 ## Apache License 2.0 © 2026 John Moises Paunlagui. All rights reserved. See LICENSE.txt for details.

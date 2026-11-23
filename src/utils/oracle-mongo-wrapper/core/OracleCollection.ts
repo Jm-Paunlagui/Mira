@@ -78,7 +78,7 @@
  */
 
 import type { DbConnection } from "../db";
-import { quoteIdentifier, mergeBinds } from "../utils";
+import { quoteIdentifier, bindSafe, mergeBinds } from "../utils";
 import { parseFilter } from "../parsers/filterParser";
 import { parseUpdate } from "../parsers/updateParser";
 import { QueryBuilder } from "./QueryBuilder";
@@ -98,6 +98,11 @@ function _deepClone(value: unknown): unknown {
     if (value === null || typeof value !== "object") return value;
     if (value instanceof Date) return new Date(value.getTime());
     if (Array.isArray(value)) return value.map((v) => _deepClone(v));
+    // Class instances (a QueryBuilder in $lateralJoin / $inSelect) are kept by
+    // reference: copying their fields into a plain object drops their methods,
+    // and $lateralJoin then silently became LATERAL (SELECT 1 FROM DUAL) — a cross join.
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return value;
     const src = value as Record<string, unknown>; // a plain object: null, Date and arrays were handled above
     const out: Record<string, unknown> = {};
     for (const k of Object.keys(src)) out[k] = _deepClone(src[k]);
@@ -117,9 +122,9 @@ function _deepClone(value: unknown): unknown {
 function _multiRowReturning(cols: string[] | undefined, oracledb: { BIND_OUT: number }): { sql: string; outBinds: Record<string, unknown> } {
     if (!cols || cols.length === 0) return { sql: "", outBinds: {} };
     const outBinds: Record<string, unknown> = {};
-    for (const c of cols) outBinds[`out_${c}`] = { dir: oracledb.BIND_OUT };
+    for (const c of cols) outBinds[`out_${bindSafe(c)}`] = { dir: oracledb.BIND_OUT };
     return {
-        sql: ` RETURNING ${cols.map(quoteIdentifier).join(", ")} INTO ${cols.map((c) => `:out_${c}`).join(", ")}`,
+        sql: ` RETURNING ${cols.map(quoteIdentifier).join(", ")} INTO ${cols.map((c) => `:out_${bindSafe(c)}`).join(", ")}`,
         outBinds,
     };
 }
@@ -128,7 +133,7 @@ function _multiRowReturning(cols: string[] | undefined, oracledb: { BIND_OUT: nu
 function _returnedRows(cols: string[], outBinds: unknown): Array<Record<string, unknown>> {
     const ob = (outBinds ?? {}) as Record<string, unknown>;
     const columns = cols.map((c) => {
-        const v = ob[`out_${c}`];
+        const v = ob[`out_${bindSafe(c)}`];
         return Array.isArray(v) ? v : v === undefined ? [] : [v];
     });
     const n = Math.max(0, ...columns.map((v) => v.length));
@@ -185,6 +190,9 @@ class OracleCollection {
      *   You normally don't pass this yourself — it's set by Session.collection().
      */
     constructor(tableName: string, db: WrapperDb, _conn: import("../db").DbConnection | null = null) {
+        if (typeof tableName !== "string" || tableName === "") {
+            throw new TypeError(MSG.COLLECTION_INVALID_TABLE_NAME(tableName));
+        }
         this.tableName = tableName;
         this.db = db;
         this._conn = _conn;
@@ -356,7 +364,7 @@ class OracleCollection {
                         if (filterColSet.has(col)) {
                             insertVals.push(`src.${quoteIdentifier(col)}`);
                         } else {
-                            const bname = `ins_${col}`;
+                            const bname = `ins_${insertCols.length}`;
                             mergeBinds[bname] = val;
                             insertVals.push(`:${bname}`);
                         }
@@ -748,11 +756,11 @@ class OracleCollection {
             if (returningCols.length > 0) {
                 const retCols = returningCols.map(quoteIdentifier).join(", ");
                 const retOuts = returningCols
-                    .map((c: unknown) => `:out_${c}`)
+                    .map((c: unknown) => `:out_${bindSafe(c)}`)
                     .join(", ");
                 returningSql = ` RETURNING ${retCols} INTO ${retOuts}`;
                 for (const c of returningCols) {
-                    outBinds[`out_${c}`] = { dir: this.db.oracledb.BIND_OUT };
+                    outBinds[`out_${bindSafe(c)}`] = { dir: this.db.oracledb.BIND_OUT };
                 }
             }
 
@@ -791,7 +799,7 @@ class OracleCollection {
                     if (returningCols.length > 0) {
                         response.returning = {};
                         for (const c of returningCols) {
-                            const val = result.outBinds[`out_${c}`];
+                            const val = result.outBinds[`out_${bindSafe(c)}`];
                             response.returning[c] = Array.isArray(val)
                                 ? val[0]
                                 : val;
@@ -900,7 +908,7 @@ class OracleCollection {
             if (returningCols.length > 0) {
                 const retCols = returningCols.map(quoteIdentifier).join(", ");
                 const retOuts = returningCols
-                    .map((c: unknown) => `:out_${c}`)
+                    .map((c: unknown) => `:out_${bindSafe(c)}`)
                     .join(", ");
                 returningSql = ` RETURNING ${retCols} INTO ${retOuts}`;
             }
@@ -942,7 +950,7 @@ class OracleCollection {
                 }
             });
             for (const c of returningCols) {
-                bindDefs[`out_${c}`] = {
+                bindDefs[`out_${bindSafe(c)}`] = {
                     type: this.db.oracledb.NUMBER,
                     dir: this.db.oracledb.BIND_OUT,
                 };
@@ -973,7 +981,7 @@ class OracleCollection {
                     const returning: Record<string, number | null>[] = result.outBinds.map((ob: Record<string, unknown>) => {
                         const rowOut: Record<string, number | null> = {};
                         for (const c of returningCols) {
-                            const val = ob[`out_${c}`];
+                            const val = ob[`out_${bindSafe(c)}`];
                             const v = Array.isArray(val) ? val[0] : val;
                             rowOut[c] = typeof v === "number" ? v : null; // NUMBER out-bind: a number, or null for a NULL column
                         }
@@ -1179,11 +1187,11 @@ class OracleCollection {
             if (returningCols.length > 0) {
                 const retCols = returningCols.map(quoteIdentifier).join(", ");
                 const retOuts = returningCols
-                    .map((c: unknown) => `:out_${c}`)
+                    .map((c: unknown) => `:out_${bindSafe(c)}`)
                     .join(", ");
                 returningSql = ` RETURNING ${retCols} INTO ${retOuts}`;
                 for (const c of returningCols) {
-                    outBinds[`out_${c}`] = { dir: this.db.oracledb.BIND_OUT };
+                    outBinds[`out_${bindSafe(c)}`] = { dir: this.db.oracledb.BIND_OUT };
                 }
             }
 
@@ -1228,7 +1236,7 @@ class OracleCollection {
                 if (returningCols.length > 0 && result.outBinds) {
                     response.returning = {};
                     for (const c of returningCols) {
-                        const val = result.outBinds[`out_${c}`];
+                        const val = result.outBinds[`out_${bindSafe(c)}`];
                         response.returning[c] = Array.isArray(val)
                             ? val[0]
                             : val;
@@ -1466,11 +1474,11 @@ class OracleCollection {
             if (returningCols.length > 0) {
                 const retCols = returningCols.map(quoteIdentifier).join(", ");
                 const retOuts = returningCols
-                    .map((c: unknown) => `:out_${c}`)
+                    .map((c: unknown) => `:out_${bindSafe(c)}`)
                     .join(", ");
                 returningSql = ` RETURNING ${retCols} INTO ${retOuts}`;
                 for (const c of returningCols) {
-                    outBinds[`out_${c}`] = { dir: this.db.oracledb.BIND_OUT };
+                    outBinds[`out_${bindSafe(c)}`] = { dir: this.db.oracledb.BIND_OUT };
                 }
             }
 
@@ -1488,7 +1496,7 @@ class OracleCollection {
                 if (returningCols.length > 0 && result.outBinds) {
                     response.returning = {};
                     for (const c of returningCols) {
-                        const val = result.outBinds[`out_${c}`];
+                        const val = result.outBinds[`out_${bindSafe(c)}`];
                         response.returning[c] = Array.isArray(val)
                             ? val[0]
                             : val;
@@ -1840,13 +1848,12 @@ class OracleCollection {
     async merge(sourceData: Record<string, unknown>, matchCondition: { localField: string; foreignField: string }, options: MergeOptions = {}): Promise<{ acknowledged: boolean;  }> {
         return this._execute(async (conn) => {
             const cols = Object.keys(sourceData);
-            const srcParts = cols.map((c) => {
-                const bname = `merge_${c}`;
-                return `:${bname} AS ${quoteIdentifier(c)}`;
-            });
+            // Positional bind names: column names are caller data and may hold
+            // characters that are not valid inside a bind placeholder.
+            const srcParts = cols.map((c, i) => `:merge_${i} AS ${quoteIdentifier(c)}`);
             const srcBinds: Record<string, unknown> = {};
-            cols.forEach((c) => {
-                srcBinds[`merge_${c}`] = sourceData[c];
+            cols.forEach((c, i) => {
+                srcBinds[`merge_${i}`] = sourceData[c];
             });
 
             const onClause = `tgt.${quoteIdentifier(matchCondition.localField)} = src.${quoteIdentifier(matchCondition.foreignField)}`;
@@ -1924,14 +1931,14 @@ class OracleCollection {
             if (options.whenMatched) {
                 const { $set } = options.whenMatched;
                 if ($set) {
-                    const parts = Object.entries($set).map(([col, val]) => {
+                    const parts = Object.entries($set).map(([col, val], i) => {
                         if (
                             typeof val === "string" &&
                             val.startsWith("$src.")
                         ) {
                             return `tgt.${quoteIdentifier(col)} = src.${quoteIdentifier(val.replace("$src.", ""))}`;
                         }
-                        const bname = `mergeFrom_${col}`;
+                        const bname = `mergeFrom_${i}`;
                         binds[bname] = val;
                         return `tgt.${quoteIdentifier(col)} = :${bname}`;
                     });

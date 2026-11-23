@@ -66,7 +66,7 @@
  */
 
 import type { DbConnection } from "../db";
-import { quoteIdentifier, buildOrderBy, buildProjection } from "../utils";
+import { quoteIdentifier, bindSafe, buildOrderBy, buildProjection } from "../utils";
 import { parseFilter } from "../parsers/filterParser";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
@@ -74,6 +74,8 @@ import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 interface ProjectionSubquery {
     collection: string;
     fn?: string;
+    /** Column SUM/AVG/MIN/MAX apply to (required for those fns). */
+    field?: string;
     filter?: Record<string, unknown>;
 }
 
@@ -116,6 +118,12 @@ function _forUpdateClause(mode: unknown): string {
     return clause;
 }
 
+/** Rows for limit/skip: spliced into SQL, so only a non-negative integer is accepted. */
+function _rowCount(scope: string, what: string, n: unknown): number {
+    if (!Number.isInteger(n) || (n as number) < 0) throw new TypeError(MSG.INVALID_ROW_COUNT(scope, what, n));
+    return n as number;
+}
+
 class QueryBuilder {
     declare _terminated: boolean;
     declare _asOf: { scn?: number | string; timestamp?: string } | null;
@@ -144,8 +152,8 @@ class QueryBuilder {
         this.db = db;
         this._conn = conn;
         this._sort = options.sort || null;
-        this._limit = options.limit || null;
-        this._skip = options.skip || null;
+        this._limit = options.limit != null ? _rowCount("QueryBuilder", "limit", options.limit) : null;
+        this._skip = options.skip != null ? _rowCount("QueryBuilder", "skip", options.skip) : null;
         this._projection = options.projection || null;
         this._forUpdate = options.forUpdate || null;
         this._sample = options.sample || null;
@@ -185,7 +193,7 @@ class QueryBuilder {
      */
     limit(n: number): QueryBuilder {
         this._checkTerminated();
-        this._limit = n;
+        this._limit = _rowCount("QueryBuilder.limit", "limit", n);
         return this;
     }
 
@@ -203,7 +211,7 @@ class QueryBuilder {
      */
     skip(n: number): QueryBuilder {
         this._checkTerminated();
-        this._skip = n;
+        this._skip = _rowCount("QueryBuilder.skip", "skip", n);
         return this;
     }
 
@@ -285,13 +293,16 @@ class QueryBuilder {
                     const sub = val.$subquery as ProjectionSubquery;
                     const subColl = quoteIdentifier(sub.collection);
                     const fnMap = {
-                        count: "COUNT(*)",
                         sum: "SUM",
                         avg: "AVG",
                         min: "MIN",
                         max: "MAX",
                     };
-                    const fnExpr = fnMap[sub.fn as keyof typeof fnMap] || "COUNT(*)";
+                    const aggFn = fnMap[sub.fn as keyof typeof fnMap];
+                    // SUM/AVG/MIN/MAX need a column ("SELECT SUM FROM …" is invalid SQL);
+                    // count (and the historical fallback for unknown fns) is COUNT(*).
+                    if (aggFn && !sub.field) throw new Error(MSG.SUBQUERY_FIELD_REQUIRED(sub.fn));
+                    const fnExpr = aggFn ? `${aggFn}(${quoteIdentifier(sub.field as string)})` : "COUNT(*)";
 
                     // Build correlated WHERE
                     const subWhere: string[] = [];
@@ -303,7 +314,7 @@ class QueryBuilder {
                                     `${quoteIdentifier(fk)} = t0.${quoteIdentifier(outerCol)}`,
                                 );
                             } else {
-                                const bname = `sub_${key}_${fk}_${Object.keys(binds).length}`;
+                                const bname = `sub_${bindSafe(key)}_${bindSafe(fk)}_${Object.keys(binds).length}`;
                                 binds[bname] = fv;
                                 subWhere.push(
                                     `${quoteIdentifier(fk)} = :${bname}`,
@@ -514,30 +525,51 @@ class QueryBuilder {
         const { sql, binds } = this._buildSQL();
         const proj = buildProjection(this._projection);
 
+        // The callback may be async: the stream is paused until its promise
+        // settles (backpressure), and a rejection — like a synchronous throw —
+        // stops the stream and rejects forEach. Without this, an async
+        // consumer's failure became an unhandled rejection and forEach
+        // reported success.
         const run = (conn: DbConnection) =>
             new Promise<void>((resolve, reject) => {
                 const stream = conn.queryStream(sql, binds, {
                     outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
                 });
+                let done = false;
+                let pending: Promise<unknown> = Promise.resolve();
+                const fail = (err: unknown) => {
+                    if (done) return;
+                    done = true;
+                    stream.destroy();
+                    reject(new Error(MSG.wrapError("QueryBuilder.forEach", err, sql, binds)));
+                };
                 stream.on("data", (row: Record<string, unknown>) => {
+                    if (done) return;
                     if (proj.isExclusion && proj.excludedCols.length > 0) {
                         for (const col of proj.excludedCols) delete row[col];
                     }
-                    fn(row);
+                    let out: unknown;
+                    try {
+                        out = fn(row);
+                    } catch (err) {
+                        fail(err);
+                        return;
+                    }
+                    if (out && typeof (out as Promise<unknown>).then === "function") {
+                        stream.pause();
+                        pending = (out as Promise<unknown>).then(() => {
+                            if (!done) stream.resume();
+                        }, fail);
+                    }
                 });
-                stream.on("error", (err: unknown) => {
-                    reject(
-                        new Error(
-                            MSG.wrapError(
-                                "QueryBuilder.forEach",
-                                err,
-                                sql,
-                                binds,
-                            ),
-                        ),
-                    );
+                stream.on("error", fail);
+                stream.on("end", () => {
+                    void pending.then(() => {
+                        if (done) return;
+                        done = true;
+                        resolve();
+                    });
                 });
-                stream.on("end", resolve);
             });
 
         if (this._conn) {

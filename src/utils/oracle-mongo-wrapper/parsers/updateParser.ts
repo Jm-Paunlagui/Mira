@@ -44,7 +44,7 @@
  * ============================================================================
  */
 
-import { quoteIdentifier } from "../utils";
+import { quoteIdentifier, bindSafe } from "../utils";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 // ─── _createCounter ─────────────────────────────────────────────
@@ -67,7 +67,7 @@ function _createCounter(): { next: (prefix: string) => string; } {
   let c = 0;
   return {
     next(prefix) {
-      return `upd_${prefix}_${c++}`;
+      return `upd_${bindSafe(prefix)}_${c++}`;
     },
   };
 }
@@ -118,23 +118,19 @@ function parseUpdate(update: Record<string, any>): { setClause: string; binds: R
   const counter = _createCounter();
   const parts: string[] = [];
   const binds: Record<string, unknown> = {};
-  let hasOp = false;
 
   for (const [op, fields] of Object.entries(update)) {
     if (op === "$set") {
-      hasOp = true;
       for (const [field, val] of Object.entries(fields)) {
         const bname = counter.next(field);
         binds[bname] = val;
         parts.push(`${quoteIdentifier(field)} = :${bname}`);
       }
     } else if (op === "$unset") {
-      hasOp = true;
       for (const field of Object.keys(fields)) {
         parts.push(`${quoteIdentifier(field)} = NULL`);
       }
     } else if (op === "$inc") {
-      hasOp = true;
       for (const [field, val] of Object.entries(fields)) {
         const bname = counter.next(field);
         binds[bname] = val;
@@ -143,7 +139,6 @@ function parseUpdate(update: Record<string, any>): { setClause: string; binds: R
         );
       }
     } else if (op === "$mul") {
-      hasOp = true;
       for (const [field, val] of Object.entries(fields)) {
         const bname = counter.next(field);
         binds[bname] = val;
@@ -152,7 +147,6 @@ function parseUpdate(update: Record<string, any>): { setClause: string; binds: R
         );
       }
     } else if (op === "$min") {
-      hasOp = true;
       for (const [field, val] of Object.entries(fields)) {
         const bname = counter.next(field);
         binds[bname] = val;
@@ -161,7 +155,6 @@ function parseUpdate(update: Record<string, any>): { setClause: string; binds: R
         );
       }
     } else if (op === "$max") {
-      hasOp = true;
       for (const [field, val] of Object.entries(fields)) {
         const bname = counter.next(field);
         binds[bname] = val;
@@ -170,7 +163,6 @@ function parseUpdate(update: Record<string, any>): { setClause: string; binds: R
         );
       }
     } else if (op === "$currentDate") {
-      hasOp = true;
       // MongoDB semantics: `true` / { $type: "date" } stamp a DATE (SYSDATE,
       // whole seconds); { $type: "timestamp" } stamps SYSTIMESTAMP so a
       // TIMESTAMP(n) column keeps its fractional seconds. SYSDATE into a
@@ -191,10 +183,6 @@ function parseUpdate(update: Record<string, any>): { setClause: string; binds: R
     } else {
       throw new Error(MSG.UPDATE_UNSUPPORTED_OPERATOR(op));
     }
-  }
-
-  if (!hasOp) {
-    throw new Error(MSG.UPDATE_NO_OPERATOR);
   }
 
   return {

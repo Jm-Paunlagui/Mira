@@ -38,6 +38,26 @@
  */
 
 import { quoteIdentifier } from "../utils";
+import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
+
+/**
+ * Window functions beyond the dedicated cases below that may be emitted as
+ * `FN() OVER (...)`. The function name is spliced into SQL, so anything not
+ * listed here is refused (CWE-89).
+ */
+const EXTRA_WINDOW_FUNCTIONS = new Set(["CUME_DIST", "PERCENT_RANK"]);
+
+/** A frame bound: UNBOUNDED PRECEDING|FOLLOWING, CURRENT ROW, or n PRECEDING|FOLLOWING. */
+const FRAME_BOUND = String.raw`(?:UNBOUNDED\s+(?:PRECEDING|FOLLOWING)|CURRENT\s+ROW|\d+\s+(?:PRECEDING|FOLLOWING))`;
+/** ROWS|RANGE <bound> or ROWS|RANGE BETWEEN <bound> AND <bound> — the only frame text accepted. */
+const FRAME_RE = new RegExp(String.raw`^(?:ROWS|RANGE)\s+(?:${FRAME_BOUND}|BETWEEN\s+${FRAME_BOUND}\s+AND\s+${FRAME_BOUND})$`, "i");
+
+/** A count argument (n, offset) that is spliced into SQL: must be a positive integer. */
+function _positiveInt(name: string, value: unknown): void {
+  if (value !== undefined && !(Number.isInteger(value) && (value as number) > 0)) {
+    throw new TypeError(MSG.WINDOW_INVALID_ARGUMENT(name, value));
+  }
+}
 
 /**
  * Build a window/analytic function expression.
@@ -54,6 +74,11 @@ import { quoteIdentifier } from "../utils";
  */
 function buildWindowExpr(spec: { fn: string; field?: string; partitionBy?: string | string[]; orderBy?: Record<string, unknown>; offset?: number; n?: number; frame?: string; }): string {
   const { fn, field, partitionBy, orderBy, offset, n, frame } = spec;
+  _positiveInt("n", n);
+  _positiveInt("offset", offset);
+  if (frame !== undefined && !(typeof frame === "string" && FRAME_RE.test(frame.trim()))) {
+    throw new TypeError(MSG.WINDOW_INVALID_FRAME(frame));
+  }
 
   // Build OVER clause
   const overParts: string[] = [];
@@ -73,14 +98,14 @@ function buildWindowExpr(spec: { fn: string; field?: string; partitionBy?: strin
     overParts.push(`ORDER BY ${orderCols}`);
   }
   if (frame) {
-    overParts.push(frame);
+    overParts.push(frame.trim().replace(/\s+/g, " ").toUpperCase());
   }
 
   const overClause =
     overParts.length > 0 ? `OVER (${overParts.join(" ")})` : "OVER ()";
 
   // Build function call
-  const fnUpper = fn.toUpperCase();
+  const fnUpper = String(fn).toUpperCase();
   switch (fnUpper) {
     case "ROW_NUMBER":
       return `ROW_NUMBER() ${overClause}`;
@@ -111,6 +136,7 @@ function buildWindowExpr(spec: { fn: string; field?: string; partitionBy?: strin
     case "MAX":
       return `MAX(${quoteIdentifier(field as string)}) ${overClause}`;
     default:
+      if (!EXTRA_WINDOW_FUNCTIONS.has(fnUpper)) throw new Error(MSG.WINDOW_UNKNOWN_FUNCTION(fn));
       return `${fnUpper}(${field ? quoteIdentifier(field as string) : ""}) ${overClause}`;
   }
 }

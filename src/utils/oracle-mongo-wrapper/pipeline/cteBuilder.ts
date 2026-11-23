@@ -389,7 +389,7 @@ function _resolveJoinType(type: string | undefined) {
     case "cross":
       return "CROSS JOIN";
     default:
-      return "INNER JOIN";
+      throw new Error(MSG.JOIN_UNKNOWN_TYPE("CTEResult.join", type));
   }
 }
 
