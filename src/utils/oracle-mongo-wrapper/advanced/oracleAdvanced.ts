@@ -62,7 +62,7 @@ const PIVOT_AGGREGATES = new Set(["SUM", "AVG", "MIN", "MAX", "COUNT"]);
  *     maxLevel: 5
  *   })
  */
-function buildConnectBy(tableName: string, spec: { startWith?: Record<string, unknown>; connectBy: Record<string, any>; orderSiblings?: Record<string, unknown>; maxLevel?: number; includeLevel?: boolean; includePath?: boolean; }): { sql: string; binds: Record<string, unknown>; } {
+function buildConnectBy(tableName: string, spec: { startWith?: Record<string, unknown>; connectBy: Record<string, any>; orderSiblings?: Record<string, unknown>; maxLevel?: number; includeLevel?: boolean; includePath?: boolean; pathColumn?: string; root?: string | string[]; includeIsLeaf?: boolean; includeIsCycle?: boolean; }): { sql: string; binds: Record<string, unknown>; } {
   const {
     startWith,
     connectBy,
@@ -70,6 +70,10 @@ function buildConnectBy(tableName: string, spec: { startWith?: Record<string, un
     maxLevel,
     includeLevel,
     includePath,
+    pathColumn,
+    root,
+    includeIsLeaf,
+    includeIsCycle,
   } = spec;
   const binds: Record<string, unknown> = {};
 
@@ -78,9 +82,14 @@ function buildConnectBy(tableName: string, spec: { startWith?: Record<string, un
   if (includeLevel) selectParts.push("LEVEL");
   if (includePath) {
     selectParts.push(
-      `SYS_CONNECT_BY_PATH(${quoteIdentifier(_getNameColumn(spec))}, '/') AS "PATH"`,
+      `SYS_CONNECT_BY_PATH(${quoteIdentifier(pathColumn ?? _getNameColumn(spec))}, '/') AS "PATH"`,
     );
   }
+  // CONNECT_BY_ROOT <col> AS "ROOT_<COL>": the top row's value on every row (roll-ups per subtree).
+  for (const c of root == null ? [] : Array.isArray(root) ? root : [root]) selectParts.push(`CONNECT_BY_ROOT ${quoteIdentifier(c)} AS ${quoteIdentifier(`ROOT_${c.toUpperCase()}`)}`);
+  if (includeIsLeaf) selectParts.push('CONNECT_BY_ISLEAF AS "IS_LEAF"');
+  // NOCYCLE is always on, so a loop is cut; IS_CYCLE = 1 marks the row whose child would close it.
+  if (includeIsCycle) selectParts.push('CONNECT_BY_ISCYCLE AS "IS_CYCLE"');
   selectParts.push(`${quoteIdentifier(tableName)}.*`);
 
   // START WITH

@@ -62,6 +62,16 @@ Fix order: the five silent wrong-data defects (6, 7, 10, 11, 16) come first. Fol
 | 18 | `find().limit(n).forUpdate("skip locked")` | The page was chosen in a `FETCH FIRST` subquery before the lock skipped busy rows, so a second worker on a queue got nothing while free rows waited. Now the cursor locks rows as it fetches them and stops after `n` (`maxRows`, prefetch sized to match so no extra row is locked) | `[]` instead of the next free row | **Silent wrong data** |
 | 19 | Standalone `forUpdate` read | Ran with `autoCommit`, and the commit ended the FOR UPDATE cursor before every row was fetched | ORA-01002 whenever rows were skipped | Fails loudly |
 
+### Found while closing coverage gaps (20) — fixed
+
+| # | Area | Defect | Live result | Severity |
+|---|---|---|---|---|
+| 20 | `$facet` | A facet with several stages, after another stage, nested a `WITH` inside the pipeline's `WITH` | ORA-32034 | Fails loudly |
+
+### Coverage gaps closed (phases 1–3, branch `feat/coverage-gaps`)
+
+17 gaps → 6. Through Mira now: ROLLUP subtotals (GROUPING flags), inventory FIFO cost, ABC classes, penny allocation (expression engine), stock-out runs and split payments (`$matchRecognize`), recipe cycle detection (`includeIsCycle`), receivables FIFO and aging (`$lookup` pipeline, `$dateDiff`, `$switch`), the account-tree roll-up (`$connectBy` stage), FX at the rate in force (outer `$lateralJoin`). Remaining: recursion that carries a calculation (quantity explosion, MRP, cost roll-up, loan schedule) and row generators (depreciation dates, calendar densification).
+
 ## 1.2 Sim expansion plan (built: stages 9–14)
 
 Status: built on 2026-11-24. `bun run sim` runs 15 stages, 286 checks; 33 business queries go through Mira's API and 17 are coverage gaps (run as hand-written SQL, still checked), listed at the end of every run.

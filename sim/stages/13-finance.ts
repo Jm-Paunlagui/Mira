@@ -22,13 +22,13 @@ export async function financeStage(sim: Sim, ctx: Ctx, state: State) {
   await schema.createTable(E.IMPORTS, { INV_NO: { type: "VARCHAR2(10)", primaryKey: true }, CCY: { type: "CHAR(3)" }, IDATE: { type: "DATE" }, AMOUNT: { type: "NUMBER(14,2)" } });
   await coll(E.FX).insertMany(FX, { returning: [] });
   await coll(E.IMPORTS).insertMany(IMPORTS.map((x) => ({ ...x, AMOUNT: x.AMOUNT / 100 })), { returning: [] });
-  const fx = await sim.viaSql("conversion at the rate in force on the invoice date", "the latest rate on or before a date needs a correlated subquery with a <= condition (or KEEP (DENSE_RANK LAST)); Mira's correlated subqueries only take equality", () =>
-    raw<{ INV_NO: string; PHP: string | null }>(
-      `SELECT i.INV_NO,
-              ROUND(i.AMOUNT * (SELECT MAX(r.RATE) KEEP (DENSE_RANK LAST ORDER BY r.RDATE)
-                                  FROM "${E.FX}" r WHERE r.CCY = i.CCY AND r.RDATE <= i.IDATE), 2) AS PHP
-         FROM "${E.IMPORTS}" i ORDER BY i.INV_NO`,
-    ),
+  // Latest rate on or before the invoice date: an outer lateral subquery, so a currency with no rate keeps its row.
+  const fx = await sim.mira(() =>
+    coll(E.IMPORTS).aggregate([
+      { $lateralJoin: { subquery: coll(E.FX).find({ CCY: "$outer.CCY", RDATE: { $lte: "$outer.IDATE" } }).sort({ RDATE: -1 }).limit(1).project({ RATE: 1 }), as: "R", outer: true } },
+      { $project: { INV_NO: 1, PHP: { $round: [{ $mul: ["$AMOUNT", "$RATE"] }, 2] } } },
+      { $sort: { INV_NO: 1 } },
+    ]),
   );
   sim.eq("FX: each import in pesos at the rate in force that day; no JPY rate → no amount", fx.map((r) => [r.INV_NO, r.PHP == null ? null : cents(r.PHP)]), IMPORTS.map((x) => [x.INV_NO, convert(x)]));
 
@@ -82,15 +82,17 @@ export async function financeStage(sim: Sim, ctx: Ctx, state: State) {
 
   // ── Bonus pool split across branches to the cent ───────────────────────────
   const POOL = 100_000_00;
-  const split = await sim.viaSql("bonus pool split by revenue share, exact to the cent", "largest-remainder allocation needs FLOOR, ROW_NUMBER over an expression and a final CASE; Mira has no FLOOR and no multi-step expressions", () =>
-    raw<{ STORE_ID: number; PART: number }>(
-      `WITH w AS (SELECT STORE_ID, SUM(TOTAL) AS W FROM "${T.ORDERS}" GROUP BY STORE_ID),
-            b AS (SELECT STORE_ID, :pool * W / SUM(W) OVER () AS EXACT FROM w),
-            f AS (SELECT STORE_ID, FLOOR(EXACT) AS BASE, EXACT - FLOOR(EXACT) AS REM FROM b),
-            r AS (SELECT STORE_ID, BASE, ROW_NUMBER() OVER (ORDER BY REM DESC, STORE_ID) AS RN, :pool - SUM(BASE) OVER () AS LEFTOVER FROM f)
-       SELECT STORE_ID, BASE + CASE WHEN RN <= LEFTOVER THEN 1 ELSE 0 END AS PART FROM r ORDER BY STORE_ID`,
-      { pool: POOL },
-    ),
+  // Largest remainder: floor every exact share, then hand the leftover cents to the
+  // largest remainders (ties to the lower branch id).
+  const split = await sim.mira(() =>
+    coll(T.ORDERS).aggregate([
+      { $group: { _id: "$STORE_ID", W: { $sum: "$TOTAL" } } },
+      { $addFields: { EXACT: { $divide: [{ $mul: [POOL, "$W"] }, { $window: { fn: "SUM", field: "W" } }] } } },
+      { $addFields: { BASE: { $floor: "$EXACT" }, REM: { $subtract: ["$EXACT", { $floor: "$EXACT" }] } } },
+      { $addFields: { RN: { $window: { fn: "ROW_NUMBER", orderBy: { REM: -1, STORE_ID: 1 } } }, SUMBASE: { $window: { fn: "SUM", field: "BASE" } } } },
+      { $addFields: { PART: { $add: ["$BASE", { $cond: { if: { $lte: ["$RN", { $subtract: [POOL, "$SUMBASE"] }] }, then: 1, else: 0 } }] } } },
+      { $sort: { STORE_ID: 1 } },
+    ]),
   );
   const want = allocate(POOL, STORES.map((s) => [String(s.STORE_ID), sum((o) => o.storeId === s.STORE_ID)]));
   sim.eq("allocation: each branch's share (largest remainder)", split.map((r) => [String(r.STORE_ID), Number(r.PART)]), [...want]);

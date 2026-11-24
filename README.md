@@ -873,6 +873,88 @@ const orgTree = await employees.connectBy({
 });
 ```
 
+
+Extra hierarchy columns: `root: "NAME"` adds `ROOT_NAME` (CONNECT_BY_ROOT, the top row's value on every row), `includeIsLeaf: true` adds `IS_LEAF`, `includeIsCycle: true` adds `IS_CYCLE` (NOCYCLE is always on, so a loop is cut; `IS_CYCLE = 1` marks the row that would close it), and `pathColumn` chooses the column `includePath` builds the path from.
+
+### Joins and Trees Inside the Pipeline
+
+```js
+// Join a GROUPED result, not rows: each customer's total receipts next to every invoice
+await invoices.aggregate([
+    {
+        $lookup: {
+            from: "receipts",
+            pipeline: [{ $group: { _id: "$customer", paid: { $sum: "$amount" } } }],
+            localField: "customer",
+            foreignField: "customer",
+            as: "p",
+            joinType: "left",
+            select: ["PAID"],
+        },
+    },
+]);
+
+// The latest rate on or before each invoice date; outer: true keeps invoices with no rate (OUTER APPLY)
+await invoices.aggregate([
+    {
+        $lateralJoin: {
+            subquery: rates.find({ ccy: "$outer.ccy", rdate: { $lte: "$outer.idate" } }).sort({ rdate: -1 }).limit(1),
+            as: "r",
+            outer: true,
+        },
+    },
+]);
+
+// A tree as a stage: every manager with the salary of their whole team
+await employees.aggregate([
+    { $connectBy: { connectBy: { manager_id: "$PRIOR id" }, root: "id" } },
+    { $group: { _id: "$ROOT_ID", team: { $sum: "$salary" } } },
+]);
+```
+
+A `$lookup` or `$facet` pipeline can have several stages and come after other stages: its steps are written into the outer `WITH` (Oracle refuses a `WITH` nested inside another, ORA-32034). `$merge` / `$out` are not allowed inside them.
+
+### Row Pattern Matching (MATCH_RECOGNIZE)
+
+The `$matchRecognize` stage finds runs of rows that match a pattern: stock-outs, split payments, price streaks.
+
+```js
+// Every run of consecutive zero-stock days, per item
+await daily.aggregate([
+    {
+        $matchRecognize: {
+            partitionBy: ["SKU"],
+            orderBy: { D: 1 },
+            measures: { START_D: { $first: "$D" }, DAYS: { $count: "*" } },
+            pattern: "Z+",
+            define: { Z: { QTY: 0 } },
+        },
+    },
+]);
+
+// Payments to one supplier, each under the limit and ≤ 3 days apart, that together pass it
+await payments.aggregate([
+    {
+        $matchRecognize: {
+            partitionBy: ["SUPPLIER"],
+            orderBy: { PDATE: 1 },
+            measures: { FIRST_ID: { $first: "$ID" }, TOTAL: { $sum: "$AMOUNT" } },
+            pattern: "A B+",
+            define: {
+                A: { $lt: ["$AMOUNT", 10000] },
+                B: { $and: [{ $lt: ["$AMOUNT", 10000] }, { $lte: [{ $subtract: ["$PDATE", { $prev: "$PDATE" }] }, 3] }] },
+            },
+        },
+    },
+    { $match: { TOTAL: { $gt: 10000 } } },
+]);
+```
+
+- `pattern`: variable names with quantifiers (`* + ? {n,m}`), `( )`, `|`, `^`, `$`. Every variable must be defined; anything else is refused before SQL is built.
+- `define`: one condition per variable, written like a `$cond` condition (values bound). `$prev` / `$next` (optionally `["$COL", n]`) look at neighbouring rows; `true` matches any row.
+- `measures`: `$first` / `$last` / `$sum` / `$min` / `$max` / `$avg` / `$count` of `"$COL"` or `"$VAR.COL"`, plus `$classifier` and `$matchNumber`.
+- `rowsPerMatch`: `"one"` (default) or `"all"`; `afterMatch`: `"pastLastRow"` (default) or `"nextRow"`.
+
 ### PIVOT (Rows → Columns)
 
 Turn row values into column headers:
@@ -1111,6 +1193,22 @@ console.log(sql);
 | `$cond`         | `CASE WHEN ... THEN ... ELSE ... END` | `{ tier: { $cond: { if: ..., then: ..., else: ... } } }`    |
 | `$ifNull`       | `COALESCE(col, fallback)`             | `{ name: { $ifNull: ['$nickname', 'N/A'] } }`               |
 | `$dateToString` | `TO_CHAR(col, format)`                | `{ d: { $dateToString: { format: '...', date: '$col' } } }` |
+| `$max` / `$min` with a list | `GREATEST(...)` / `LEAST(...)` (values in the row) | `{ hi: { $max: ['$a', '$b', 0] } }` |
+| `$abs` `$ceil` `$floor` | `ABS` / `CEIL` / `FLOOR` | `{ whole: { $floor: '$qty' } }` |
+| `$round` / `$trunc` | `ROUND(x[, places])` / `TRUNC(x[, places])` | `{ r: { $round: ['$amount', 2] } }` |
+| `$mod` | `MOD(a, b)` | `{ m: { $mod: ['$n', 7] } }` |
+| `$switch` | `CASE WHEN … WHEN … ELSE … END` | `{ g: { $switch: { branches: [{ case: …, then: 'A' }], default: 'C' } } }` |
+| `$literal` | a bound value, never a column | `{ k: { $literal: '$not-a-column' } }` |
+| `$dateDiff` | calendar boundaries between two dates (`day` `week` `month` `quarter` `year`) | `{ late: { $dateDiff: { startDate: '$due', endDate: asOf, unit: 'day' } } }` |
+| `$dateAdd` | `+ n` days / weeks, `ADD_MONTHS`, `NUMTODSINTERVAL` (`second` … `year`) | `{ due: { $dateAdd: { startDate: '$inv', unit: 'day', amount: 30 } } }` |
+| `$dateTrunc` | `TRUNC(date, 'MM')` (`year` `quarter` `month` `week` `day` `hour` `minute`) | `{ m: { $dateTrunc: { date: '$at', unit: 'month' } } }` |
+| `$lastDayOfMonth` `$year` `$month` `$dayOfMonth` | `LAST_DAY`, `EXTRACT(...)` | `{ y: { $year: '$at' } }` |
+
+**Nesting.** Any argument can itself be an expression, a column (`'$col'`) or a literal (always bound), and aggregates accept expressions: `{ $sum: { $mul: ['$qty', '$price'] } }`, `{ $round: [{ $divide: ['$a', '$b'] }, 2] }`.
+
+**Conditions** in `$cond` and `$switch` can compare two operands, either side a column, expression or literal: `{ $gt: ['$score', '$age'] }`, combined with `$and` / `$or` / `$not`. `{ $eq: ['$x', null] }` is `IS NULL`. The older filter form `{ score: { $gte: 90 } }` still works.
+
+**Subtotal flags.** `_id: { $rollup: [...], grouping: true }` (also `$cube` / `$groupingSets`) adds `GROUPING_<col>`, which is 1 on subtotal rows, so a subtotal can be told from a group whose key is NULL.
 
 ### Quick Cheat Sheet
 
@@ -1219,7 +1317,7 @@ bun run test:unit       # or :integration / :performance / :chaos / :security / 
 14. **Audit:** Benford, journals without lines, split payments
 15. **Operations:** pool stats, health, shutdown
 
-Business queries Mira's API cannot express (for example `MATCH_RECOGNIZE`, date arithmetic, `CONNECT_BY_ROOT`) run as hand-written SQL, are still checked, and are listed at the end as **coverage gaps** with the reason: a measured list of what Mira could support next.
+Business queries Mira's API cannot express (for example `MATCH_RECOGNIZE`, `CONNECT_BY_ROOT`, recursion that carries a calculation) run as hand-written SQL, are still checked, and are listed at the end as **coverage gaps** with the reason: a measured list of what Mira could support next.
 
 Every result is checked against an in-memory model of the business or a hand-written SQL read. Then the run proves that **every public Mira function was called** (`sim/lib/tracker.ts`), and lists any that were not.
 

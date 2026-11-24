@@ -127,6 +127,7 @@ export async function ledgerStage(sim: Sim, ctx: Ctx, state: State) {
   const bal = (a: string) => posted.filter((l) => l.acct === a).reduce((s, l) => s + l.dr - l.cr, 0);
 
   // ── Chart of accounts tree ─────────────────────────────────────────────────
+  const postedOnlyEarly = { $lookup: { from: E.JOURNALS, localField: "JOURNAL_ID", foreignField: "JOURNAL_ID", as: "j", joinType: "inner", select: ["STATUS"] } };
   const tree = (await sim.mira(() => coll(E.ACCOUNTS).connectBy({ startWith: { PARENT_CODE: null }, connectBy: { PARENT_CODE: "$PRIOR CODE" }, includeLevel: true, orderSiblings: { CODE: 1 } }))) as { CODE: string; LEVEL: number }[];
   const preorder: [string, number][] = [];
   const walk = (parent: string | null, lvl: number) => {
@@ -137,16 +138,18 @@ export async function ledgerStage(sim: Sim, ctx: Ctx, state: State) {
   };
   walk(null, 1);
   sim.eq("connectBy: chart of accounts in tree order with levels", tree.map((r) => [r.CODE, Number(r.LEVEL)]), preorder);
-  const rollup = await sim.viaSql("balances rolled up the account tree", "CONNECT_BY_ROOT is not exposed (connectBy has no root column), so a node cannot be summed with its descendants", () =>
-    raw<{ ROOT: string; TOTAL: string }>(
-      `SELECT t.ROOT, NVL(SUM(b.BAL), 0) AS TOTAL
-         FROM (SELECT CONNECT_BY_ROOT CODE AS ROOT, CODE FROM "${E.ACCOUNTS}" CONNECT BY PRIOR CODE = PARENT_CODE) t
-         LEFT JOIN (SELECT l.ACCOUNT_CODE, SUM(l.NET) AS BAL FROM "${E.LINES}" l JOIN "${E.JOURNALS}" j ON j.JOURNAL_ID = l.JOURNAL_ID WHERE j.STATUS = 'posted' GROUP BY l.ACCOUNT_CODE) b ON b.ACCOUNT_CODE = t.CODE
-        GROUP BY t.ROOT ORDER BY t.ROOT`,
-    ),
+  // Every account with all accounts under it ($connectBy root), joined to posted balances
+  // per account (a grouped $lookup pipeline), summed per root.
+  const rollup = await sim.mira(() =>
+    coll(E.ACCOUNTS).aggregate([
+      { $connectBy: { connectBy: { PARENT_CODE: "$PRIOR CODE" }, root: "CODE" } },
+      { $lookup: { from: E.LINES, pipeline: [postedOnlyEarly, { $match: { STATUS: "posted" } }, { $group: { _id: "$ACCOUNT_CODE", BAL: { $sum: "$NET" } } }], localField: "CODE", foreignField: "ACCOUNT_CODE", as: "b", joinType: "left", select: ["BAL"] } },
+      { $group: { _id: "$ROOT_CODE", TOTAL: { $sum: { $ifNull: ["$BAL", 0] } } } },
+      { $sort: { ROOT_CODE: 1 } },
+    ]),
   );
   const below = (code: string): string[] => [code, ...ACCOUNTS.filter((a) => a.PARENT_CODE === code).flatMap((a) => below(a.CODE))];
-  sim.eq("roll-up: every account's balance includes its sub-accounts", rollup.map((r) => [r.ROOT, cents(r.TOTAL)]), ACCOUNTS.map((a) => a.CODE).sort().map((c) => [c, below(c).reduce((s, x) => s + bal(x), 0)]));
+  sim.eq("roll-up ($connectBy → $lookup pipeline → $group): every account's balance includes its sub-accounts", rollup.map((r) => [r.ROOT_CODE, cents(r.TOTAL)]), ACCOUNTS.map((a) => a.CODE).sort().map((c) => [c, below(c).reduce((s, x) => s + bal(x), 0)]));
 
   // ── Cash ledger card: running balance in date order ────────────────────────
   const card = await sim.mira(() =>
@@ -185,18 +188,18 @@ export async function ledgerStage(sim: Sim, ctx: Ctx, state: State) {
       postedOnly,
       { $match: { STATUS: "posted" } },
       { $lookup: { from: E.ACCOUNTS, localField: "ACCOUNT_CODE", foreignField: "CODE", as: "a", joinType: "inner", select: ["TYPE"] } },
-      { $group: { _id: { $rollup: ["TYPE", "ACCOUNT_CODE"] }, BAL: { $sum: "$NET" } } },
+      { $group: { _id: { $rollup: ["TYPE", "ACCOUNT_CODE"], grouping: true }, BAL: { $sum: "$NET" } } },
     ]),
   );
   const types = [...new Set(posted.map((l) => TYPE_OF.get(l.acct)!))];
   const sub = (t: string) => posted.filter((l) => TYPE_OF.get(l.acct) === t).reduce((s, l) => s + l.dr - l.cr, 0);
-  const ruKey = (r: Record<string, unknown>) => `${r.TYPE ?? "*"}|${r.ACCOUNT_CODE ?? "*"}`;
+  // GROUPING_* flags (not NULL keys) say which rows are subtotals.
+  const ruKey = (r: Record<string, unknown>) => `${Number(r.GROUPING_TYPE) ? "*" : r.TYPE}|${Number(r.GROUPING_ACCOUNT_CODE) ? "*" : r.ACCOUNT_CODE}`;
   const ruGot = Object.fromEntries(ru.map((r) => [ruKey(r), cents(r.BAL)]));
   const ruWant: Record<string, number> = { "*|*": 0 };
   for (const t of types) ruWant[`${t}|*`] = sub(t);
   for (const a of new Set(posted.map((l) => l.acct))) ruWant[`${TYPE_OF.get(a)}|${a}`] = bal(a);
-  sim.eq("ROLLUP: per-account balances, per-type subtotals and a grand total of zero", ruGot, ruWant);
-  sim.gap("ROLLUP subtotal rows", "GROUPING() / GROUPING_ID() are not exposed, so a subtotal row cannot be told from a group whose key is NULL");
+  sim.eq("ROLLUP with GROUPING flags: per-account balances, per-type subtotals and a grand total of zero", ruGot, ruWant);
 
   // ── Quarterly P&L (PIVOT) and month-on-month revenue (LAG) ─────────────────
   const pnl = (await sim.mira(() => lines.pivot({ value: { $sum: "$NET" }, pivotOn: "QUARTER", pivotValues: ["Q1", "Q2", "Q3", "Q4"], groupBy: "ACCOUNT_CODE" }))) as Record<string, unknown>[];

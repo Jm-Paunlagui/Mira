@@ -387,8 +387,87 @@ describe("unit: aggregate pipeline", () => {
     expect(sql).toContain('"R" = :where_R_3'); // not an alias: left as written
   });
 
+  it("expressions: every date unit, $literal, $round/$trunc forms, null and argument errors", () => {
+    const one = (e: unknown) => {
+      const { sql, binds } = agg([{ $project: { X: e } }]);
+      return { sql: sql.replace(/^SELECT /, "").replace(/ AS "X" FROM "T"$/, ""), binds };
+    };
+    expect(one({ $dateAdd: { startDate: "$D", unit: "hour", amount: 3 } }).sql).toBe(`("D" + NUMTODSINTERVAL(:agg_0, 'HOUR'))`);
+    expect(one({ $dateAdd: { startDate: "$D", unit: "minute", amount: 3 } }).sql).toContain("'MINUTE'");
+    expect(one({ $dateAdd: { startDate: "$D", unit: "second", amount: 3 } }).sql).toContain("'SECOND'");
+    expect(one({ $dateAdd: { startDate: "$D", unit: "week", amount: 2 } }).sql).toBe('(CAST("D" AS DATE) + 7 * :agg_0)');
+    expect(one({ $dateAdd: { startDate: "$D", unit: "quarter", amount: 1 } }).sql).toBe('ADD_MONTHS("D", 3 * :agg_0)');
+    expect(one({ $dateAdd: { startDate: "$D", unit: "year", amount: 1 } }).sql).toBe('ADD_MONTHS("D", 12 * :agg_0)');
+    expect(one({ $dateDiff: { startDate: "$S", endDate: "$E", unit: "week" } }).sql).toBe(`((TRUNC(CAST("E" AS DATE), 'IW') - TRUNC(CAST("S" AS DATE), 'IW')) / 7)`);
+    expect(one({ $dateDiff: { startDate: "$S", endDate: "$E", unit: "quarter" } }).sql).toContain("TRUNC(((EXTRACT(YEAR FROM \"E\") * 12");
+    expect(one({ $dateDiff: { startDate: "$S", endDate: "$E", unit: "year" } }).sql).toBe('(EXTRACT(YEAR FROM "E") - EXTRACT(YEAR FROM "S"))');
+    for (const unit of ["year", "quarter", "week", "day", "hour", "minute"]) expect(one({ $dateTrunc: { date: "$D", unit } }).sql).toMatch(/^TRUNC\("D", '/);
+    expect(() => one({ $dateTrunc: { date: "$D", unit: "fortnight" } })).toThrow(/\$dateTrunc expects unit/);
+    expect(() => one({ $dateAdd: { startDate: "$D", unit: "eon", amount: 1 } })).toThrow(/\$dateAdd expects unit/);
+    expect(() => one({ $dateDiff: { startDate: "$S", endDate: "$E", unit: "hour" } })).toThrow(/\$dateDiff expects unit/);
+    expect(one({ $literal: "$NOT_A_COLUMN" })).toEqual({ sql: ":agg_0", binds: { agg_0: "$NOT_A_COLUMN" } });
+    expect(one({ $round: "$A" }).sql).toBe('ROUND("A")');
+    expect(one({ $trunc: ["$A"] }).sql).toBe('TRUNC("A")');
+    expect(one({ $dateToString: { date: new Date(0), format: "YYYY" } }).sql).toBe("TO_CHAR(:agg_0, 'YYYY')");
+    expect(one({ $ifNull: ["$A", null] }).sql).toBe('COALESCE("A", NULL)');
+    expect(one({ $cond: { if: { $eq: ["$A", null] }, then: 1, else: 0 } }).sql).toContain('WHEN "A" IS NULL THEN');
+    expect(one({ $cond: { if: { $ne: ["$A", null] }, then: 1, else: 0 } }).sql).toContain('WHEN "A" IS NOT NULL THEN');
+    expect(one({ $switch: { branches: [{ case: { $gt: ["$A", 1] }, then: "x" }] } }).sql).toBe('CASE WHEN "A" > :agg_0 THEN :agg_1 END');
+    expect(() => one({ $switch: { branches: [] } })).toThrow(/\$switch expects branches/);
+    expect(() => one({ $mod: ["$A"] })).toThrow(/\$mod expects a list of at least 2/);
+    expect(() => one({ $max: ["$A"] })).toThrow(/\$max expects a list of at least 2/);
+    expect(() => one({ $cond: { if: { $gt: ["$A"] }, then: 1, else: 0 } })).toThrow(/\$gt expects two operands/);
+    expect(one({ $sum: 7 }).sql).toBe("SUM(7)"); // a bare number in an aggregate stays a literal, as before
+  });
+
+  it("$matchRecognize: SQL shape, options and every refusal", () => {
+    const mr = (spec: Record<string, unknown>) => agg([{ $matchRecognize: spec }]);
+    const base = { orderBy: { D: 1 }, pattern: "A B*", define: { A: true, B: { $gt: ["$X", { $prev: ["$X", 2] }] } } };
+    const { sql, binds } = mr({ ...base, partitionBy: "K", measures: { L: { $last: "$B.X" }, C: { $classifier: true } }, afterMatch: "nextRow" });
+    expect(sql).toBe(
+      'SELECT * FROM "T" MATCH_RECOGNIZE (PARTITION BY "K" ORDER BY "D" ASC MEASURES LAST(B."X") AS "L", CLASSIFIER() AS "C" ONE ROW PER MATCH AFTER MATCH SKIP TO NEXT ROW PATTERN (A B*) DEFINE A AS 1=1, B AS "X" > (PREV("X", 2)))',
+    );
+    expect(binds).toEqual({});
+    expect(mr({ ...base, define: { A: true, B: { $lt: ["$X", { $next: "$X" }] } } }).sql).toContain('B AS "X" < (NEXT("X"))');
+    expect(mr({ ...base, measures: { N: { $count: "*" } } }).sql).toContain('COUNT(*) AS "N"');
+    for (const [spec, re] of [
+      [null, /expects an object/],
+      [{ ...base, orderBy: {} }, /orderBy is required/],
+      [{ ...base, define: undefined }, /define is required/],
+      [{ ...base, define: { a: true } }, /variable a must be an upper-case name/],
+      [{ ...base, pattern: "" }, /pattern may contain only/],
+      [{ ...base, pattern: 42 }, /pattern may contain only/],
+      [{ ...base, measures: { L: { $last: "X" } } }, /a measure takes/],
+      [{ ...base, measures: { L: { $last: "$Q.X" } } }, /variable Q is not defined/],
+      [{ ...base, measures: { L: {} } }, /measure L: use/],
+      [{ ...base, rowsPerMatch: "some" }, /rowsPerMatch/],
+      [{ ...base, afterMatch: "later" }, /afterMatch/],
+      [{ ...base, define: { A: true, B: { $gt: ["$X", { $prev: ["$X", -1] }] } } }, /\$prev expects/],
+    ] as [unknown, RegExp][])
+      expect(() => mr(spec as never)).toThrow(re);
+  });
+
+  it("$lookup pipeline / $connectBy stage / outer $lateralJoin: SQL shape and refusals", () => {
+    expect(() => agg([{ $lookup: { from: "O", pipeline: { $match: {} }, localField: "A", foreignField: "B" } }])).toThrow(/pipeline must be an array/);
+    const lk = agg([{ $lookup: { from: "O", pipeline: [{ $match: { S: 1 } }], localField: "ID", foreignField: "UID" } }]).sql;
+    expect(lk).toBe('SELECT "T".*, "SUB".* FROM "T" LEFT OUTER JOIN (SELECT * FROM "O" WHERE "S" = :where_S_0) "SUB" ON "T"."ID" = "SUB"."UID"');
+    expect(() => agg([{ $lookup: { from: "O", pipeline: [], localField: "A", foreignField: "B", as: "x", joinType: "weird" } }])).toThrow(/Unknown joinType/);
+    expect(agg([{ $connectBy: { connectBy: { M: "$PRIOR ID" } } }]).sql).toBe('SELECT "T".* FROM "T" CONNECT BY NOCYCLE PRIOR "ID" = "M"');
+    const cb = agg([{ $match: { A: 1 } }, { $sort: { A: 1 } }, { $connectBy: { startWith: { A: 2 }, connectBy: { M: "$PRIOR ID" }, root: ["ID", "A"] } }, { $match: { root_id: 1 } }]);
+    expect(cb.sql).toContain('START WITH "A" = :cb2_where_A_0');
+    expect(cb.sql).toContain('"ROOT_ID" = :');
+    expect(cb.binds).toMatchObject({ where_A_0: 1, cb2_where_A_0: 2 });
+  });
+
+  it("connectBy: root (one or several), leaf and cycle flags, chosen path column", () => {
+    const { sql } = buildConnectBy("E", { connectBy: { MGR: "$PRIOR ID" }, root: ["ID", "NAME"], includeIsLeaf: true, includeIsCycle: true, includePath: true, pathColumn: "CODE" } as never);
+    expect(sql).toBe(
+      `SELECT SYS_CONNECT_BY_PATH("CODE", '/') AS "PATH", CONNECT_BY_ROOT "ID" AS "ROOT_ID", CONNECT_BY_ROOT "NAME" AS "ROOT_NAME", CONNECT_BY_ISLEAF AS "IS_LEAF", CONNECT_BY_ISCYCLE AS "IS_CYCLE", "E".* FROM "E" CONNECT BY NOCYCLE PRIOR "ID" = "MGR"`,
+    );
+  });
+
   it("DEFECT: an unknown expression operator is refused, not turned into a column name", () => {
-    expect(() => agg([{ $project: { R: { $round: ["$A", 0] } } }])).toThrow(/Unsupported expression operator "\$round"/);
+    expect(() => agg([{ $project: { R: { $cosine: ["$A", 0] } } }])).toThrow(/Unsupported expression operator "\$cosine"/);
     expect(() => agg([{ $group: { _id: "$R", s: { $stdDevPop: "$A" } } }])).toThrow(/Unsupported expression operator "\$stdDevPop"/);
   });
 
@@ -478,10 +557,15 @@ describe("unit: aggregate pipeline", () => {
 
   it("DEFECT: $facet keeps the binds of its sub-pipelines", () => {
     const { sql, binds } = agg([{ $facet: { a: [{ $match: { S: "x" } }], b: [{ $match: { S: "y" } }] } }]);
-    expect(sql).toContain(":f0_where_S_0");
+    // The first facet keeps its names; the second, which would clash, is renamed.
+    expect(sql).toContain(":where_S_0");
     expect(sql).toContain(":f1_where_S_0");
-    expect(sql).not.toMatch(/:where_S_0/);
-    expect(binds).toEqual({ f0_where_S_0: "x", f1_where_S_0: "y" });
+    expect(binds).toEqual({ where_S_0: "x", f1_where_S_0: "y" });
+    // A multi-stage facet after another stage hoists its steps into the outer WITH (no nested WITH).
+    const deep = agg([{ $match: { A: 1 } }, { $facet: { a: [{ $match: { S: "x" } }, { $count: "n" }] } }]).sql;
+    expect(deep.match(/\bWITH\b/g)).toHaveLength(1);
+    expect(deep).toContain('"stage_1_f0_stage_0" AS (SELECT * FROM "stage_0" WHERE "S" = :where_S_0)');
+    expect(() => agg([{ $facet: { a: [{ $out: "X" }] } }])).toThrow(/cannot be used inside a \$facet or \$lookup/);
   });
 
   it("DEFECT: an unknown stage is rejected (not silently dropped)", () => {

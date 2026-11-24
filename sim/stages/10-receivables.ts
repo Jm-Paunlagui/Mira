@@ -44,43 +44,40 @@ export async function receivablesStage(sim: Sim, ctx: Ctx, _state: State) {
     custs.map((c) => [c, owed(c)]),
   );
 
-  // Receipts applied to the oldest invoice first.
-  const fifo = await sim.viaSql("receipts applied oldest invoice first (FIFO)", "needs a running total of invoices compared with total receipts and GREATEST/LEAST arithmetic; Mira's $window gives the running total but there is no GREATEST/LEAST or column-to-column expression", () =>
-    raw<{ INV_NO: number; OPEN_AMT: string }>(
-      `WITH i AS (SELECT INV_NO, CUSTOMER, AMOUNT,
-                         SUM(AMOUNT) OVER (PARTITION BY CUSTOMER ORDER BY INV_NO ROWS UNBOUNDED PRECEDING) AS CUM_END
-                    FROM "${E.AR_INV}"),
-            p AS (SELECT CUSTOMER, SUM(AMOUNT) AS PAID FROM "${E.AR_RCPT}" GROUP BY CUSTOMER)
-       SELECT i.INV_NO,
-              i.AMOUNT - LEAST(i.AMOUNT, GREATEST(0, NVL(p.PAID, 0) - (i.CUM_END - i.AMOUNT))) AS OPEN_AMT
-         FROM i LEFT JOIN p ON p.CUSTOMER = i.CUSTOMER
-        ORDER BY i.INV_NO`,
-    ),
-  );
+  // Receipts applied to the oldest invoice first: running total of each customer's invoices,
+  // their total receipts joined from a grouped pipeline, then LEAST / GREATEST per invoice.
+  const openStages = [
+    { $addFields: { CUM_END: { $window: { fn: "SUM", field: "AMOUNT", partitionBy: "CUSTOMER", orderBy: { INV_NO: 1 }, frame: "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" } } } },
+    { $lookup: { from: E.AR_RCPT, pipeline: [{ $group: { _id: "$CUSTOMER", PAID: { $sum: "$AMOUNT" } } }], localField: "CUSTOMER", foreignField: "CUSTOMER", as: "p", joinType: "left", select: ["PAID"] } },
+    { $addFields: { OPEN_AMT: { $subtract: ["$AMOUNT", { $min: ["$AMOUNT", { $max: [0, { $subtract: [{ $ifNull: ["$PAID", 0] }, { $subtract: ["$CUM_END", "$AMOUNT"] }] }] }] }] } } },
+  ];
+  const fifo = await sim.mira(() => inv.aggregate([...openStages, { $sort: { INV_NO: 1 } }]));
   sim.eq("FIFO application: open amount of every invoice", fifo.map((r) => [Number(r.INV_NO), cents(r.OPEN_AMT)]), AR_INVOICES.map((x) => [x.INV_NO, open.get(x.INV_NO)]));
 
-  // Aging buckets as of year end.
-  const aging = await sim.viaSql("aging buckets as of a date", "days past due needs date arithmetic (DATE - DATE) in a projection; Mira's pipeline has only $dateToString", () =>
-    raw<{ BUCKET: string; N: number; OPEN_AMT: string }>(
-      `WITH i AS (SELECT INV_NO, CUSTOMER, AMOUNT, DUE_DATE,
-                         SUM(AMOUNT) OVER (PARTITION BY CUSTOMER ORDER BY INV_NO ROWS UNBOUNDED PRECEDING) AS CUM_END
-                    FROM "${E.AR_INV}"),
-            p AS (SELECT CUSTOMER, SUM(AMOUNT) AS PAID FROM "${E.AR_RCPT}" GROUP BY CUSTOMER),
-            o AS (SELECT i.DUE_DATE, i.AMOUNT - LEAST(i.AMOUNT, GREATEST(0, NVL(p.PAID, 0) - (i.CUM_END - i.AMOUNT))) AS OPEN_AMT
-                    FROM i LEFT JOIN p ON p.CUSTOMER = i.CUSTOMER)
-       SELECT CASE WHEN TO_DATE(:asof, 'YYYY-MM-DD') - DUE_DATE <= 0 THEN 'current'
-                   WHEN TO_DATE(:asof, 'YYYY-MM-DD') - DUE_DATE <= 30 THEN '1-30'
-                   WHEN TO_DATE(:asof, 'YYYY-MM-DD') - DUE_DATE <= 60 THEN '31-60'
-                   WHEN TO_DATE(:asof, 'YYYY-MM-DD') - DUE_DATE <= 90 THEN '61-90' ELSE '90+' END AS BUCKET,
-              COUNT(*) AS N, SUM(OPEN_AMT) AS OPEN_AMT
-         FROM o WHERE OPEN_AMT > 0
-        GROUP BY CASE WHEN TO_DATE(:asof, 'YYYY-MM-DD') - DUE_DATE <= 0 THEN 'current'
-                      WHEN TO_DATE(:asof, 'YYYY-MM-DD') - DUE_DATE <= 30 THEN '1-30'
-                      WHEN TO_DATE(:asof, 'YYYY-MM-DD') - DUE_DATE <= 60 THEN '31-60'
-                      WHEN TO_DATE(:asof, 'YYYY-MM-DD') - DUE_DATE <= 90 THEN '61-90' ELSE '90+' END
-        ORDER BY 1`,
-      { asof: iso(AS_OF) },
-    ),
+  // Aging buckets as of year end: days past due ($dateDiff) into buckets ($switch).
+  const aging = await sim.mira(() =>
+    inv.aggregate([
+      ...openStages,
+      { $match: { OPEN_AMT: { $gt: 0 } } },
+      { $addFields: { LATE: { $dateDiff: { startDate: "$DUE_DATE", endDate: AS_OF, unit: "day" } } } },
+      {
+        $addFields: {
+          BUCKET: {
+            $switch: {
+              branches: [
+                { case: { $lte: ["$LATE", 0] }, then: "current" },
+                { case: { $lte: ["$LATE", 30] }, then: "1-30" },
+                { case: { $lte: ["$LATE", 60] }, then: "31-60" },
+                { case: { $lte: ["$LATE", 90] }, then: "61-90" },
+              ],
+              default: "90+",
+            },
+          },
+        },
+      },
+      { $group: { _id: "$BUCKET", N: { $count: "*" }, OPEN_AMT: { $sum: "$OPEN_AMT" } } },
+      { $sort: { BUCKET: 1 } },
+    ]),
   );
   const want: Record<string, [number, number]> = {};
   for (const x of AR_INVOICES) {

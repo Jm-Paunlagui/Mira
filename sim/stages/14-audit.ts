@@ -28,21 +28,26 @@ export async function auditStage(sim: Sim, ctx: Ctx, state: State) {
   sim.eq("journals without lines: only the header saved on its own", empty.map((r) => Number(r.JOURNAL_ID)), [orphan]);
 
   // Split payments: consecutive small payments to one supplier, a few days apart, that together pass the limit.
-  const split = await sim.viaSql("split payments under the approval limit", "MATCH_RECOGNIZE (row pattern matching) is not exposed", () =>
-    raw<{ SUPPLIER: string; FIRST_ID: number; LAST_ID: number; N: number; TOTAL: string }>(
-      `SELECT SUPPLIER, FIRST_ID, LAST_ID, N, TOTAL FROM "${E.AP_PAY}"
-       MATCH_RECOGNIZE (PARTITION BY SUPPLIER ORDER BY PDATE, PAY_ID
-                        MEASURES FIRST(PAY_ID) AS FIRST_ID, LAST(PAY_ID) AS LAST_ID, COUNT(*) AS N, SUM(AMOUNT) AS TOTAL
-                        ONE ROW PER MATCH
-                        PATTERN (A B+)
-                        DEFINE A AS AMOUNT < ${APPROVAL_LIMIT / 100},
-                               B AS AMOUNT < ${APPROVAL_LIMIT / 100} AND PDATE - PREV(PDATE) <= 3)
-       WHERE TOTAL > ${APPROVAL_LIMIT / 100}
-       ORDER BY SUPPLIER, FIRST_ID`,
-    ),
+  const split = await sim.mira(() =>
+    coll(E.AP_PAY).aggregate([
+      {
+        $matchRecognize: {
+          partitionBy: ["SUPPLIER"],
+          orderBy: { PDATE: 1, PAY_ID: 1 },
+          measures: { FIRST_ID: { $first: "$PAY_ID" }, LAST_ID: { $last: "$PAY_ID" }, N: { $count: "*" }, TOTAL: { $sum: "$AMOUNT" } },
+          pattern: "A B+",
+          define: {
+            A: { $lt: ["$AMOUNT", APPROVAL_LIMIT / 100] },
+            B: { $and: [{ $lt: ["$AMOUNT", APPROVAL_LIMIT / 100] }, { $lte: [{ $subtract: ["$PDATE", { $prev: "$PDATE" }] }, 3] }] },
+          },
+        },
+      },
+      { $match: { TOTAL: { $gt: APPROVAL_LIMIT / 100 } } },
+      { $sort: { SUPPLIER: 1, FIRST_ID: 1 } },
+    ]),
   );
   sim.eq(
-    "split payments: runs of sub-limit payments that together pass the limit",
+    "split payments ($matchRecognize): runs of sub-limit payments that together pass the limit",
     split.map((r) => ({ supplier: r.SUPPLIER, first: Number(r.FIRST_ID), last: Number(r.LAST_ID), n: Number(r.N), total: Math.round(Number(r.TOTAL) * 100) })),
     splitRuns(),
   );
