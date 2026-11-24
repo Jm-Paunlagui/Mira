@@ -420,6 +420,40 @@ describe("unit: aggregate pipeline", () => {
     expect(one({ $sum: 7 }).sql).toBe("SUM(7)"); // a bare number in an aggregate stays a literal, as before
   });
 
+  it("$matchRecognize: SQL shape, options and every refusal", () => {
+    const mr = (spec: Record<string, unknown>) => agg([{ $matchRecognize: spec }]);
+    const base = { orderBy: { D: 1 }, pattern: "A B*", define: { A: true, B: { $gt: ["$X", { $prev: ["$X", 2] }] } } };
+    const { sql, binds } = mr({ ...base, partitionBy: "K", measures: { L: { $last: "$B.X" }, C: { $classifier: true } }, afterMatch: "nextRow" });
+    expect(sql).toBe(
+      'SELECT * FROM "T" MATCH_RECOGNIZE (PARTITION BY "K" ORDER BY "D" ASC MEASURES LAST(B."X") AS "L", CLASSIFIER() AS "C" ONE ROW PER MATCH AFTER MATCH SKIP TO NEXT ROW PATTERN (A B*) DEFINE A AS 1=1, B AS "X" > (PREV("X", 2)))',
+    );
+    expect(binds).toEqual({});
+    expect(mr({ ...base, define: { A: true, B: { $lt: ["$X", { $next: "$X" }] } } }).sql).toContain('B AS "X" < (NEXT("X"))');
+    expect(mr({ ...base, measures: { N: { $count: "*" } } }).sql).toContain('COUNT(*) AS "N"');
+    for (const [spec, re] of [
+      [null, /expects an object/],
+      [{ ...base, orderBy: {} }, /orderBy is required/],
+      [{ ...base, define: undefined }, /define is required/],
+      [{ ...base, define: { a: true } }, /variable a must be an upper-case name/],
+      [{ ...base, pattern: "" }, /pattern may contain only/],
+      [{ ...base, pattern: 42 }, /pattern may contain only/],
+      [{ ...base, measures: { L: { $last: "X" } } }, /a measure takes/],
+      [{ ...base, measures: { L: { $last: "$Q.X" } } }, /variable Q is not defined/],
+      [{ ...base, measures: { L: {} } }, /measure L: use/],
+      [{ ...base, rowsPerMatch: "some" }, /rowsPerMatch/],
+      [{ ...base, afterMatch: "later" }, /afterMatch/],
+      [{ ...base, define: { A: true, B: { $gt: ["$X", { $prev: ["$X", -1] }] } } }, /\$prev expects/],
+    ] as [unknown, RegExp][])
+      expect(() => mr(spec as never)).toThrow(re);
+  });
+
+  it("connectBy: root (one or several), leaf and cycle flags, chosen path column", () => {
+    const { sql } = buildConnectBy("E", { connectBy: { MGR: "$PRIOR ID" }, root: ["ID", "NAME"], includeIsLeaf: true, includeIsCycle: true, includePath: true, pathColumn: "CODE" } as never);
+    expect(sql).toBe(
+      `SELECT SYS_CONNECT_BY_PATH("CODE", '/') AS "PATH", CONNECT_BY_ROOT "ID" AS "ROOT_ID", CONNECT_BY_ROOT "NAME" AS "ROOT_NAME", CONNECT_BY_ISLEAF AS "IS_LEAF", CONNECT_BY_ISCYCLE AS "IS_CYCLE", "E".* FROM "E" CONNECT BY NOCYCLE PRIOR "ID" = "MGR"`,
+    );
+  });
+
   it("DEFECT: an unknown expression operator is refused, not turned into a column name", () => {
     expect(() => agg([{ $project: { R: { $cosine: ["$A", 0] } } }])).toThrow(/Unsupported expression operator "\$cosine"/);
     expect(() => agg([{ $group: { _id: "$R", s: { $stdDevPop: "$A" } } }])).toThrow(/Unsupported expression operator "\$stdDevPop"/);

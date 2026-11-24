@@ -160,6 +160,8 @@ const oracleMongoWrapperMessages = {
     `[${scope}] ${what} must be a non-negative integer, got ${typeof value === "number" ? value : typeof value}.`,
   PIPELINE_UNKNOWN_STAGE: (stage: unknown) =>
     `[aggregatePipeline] Unsupported stage: ${String(stage)}.`,
+  PIPELINE_MATCH_RECOGNIZE: (why: unknown) =>
+    `[aggregatePipeline] $matchRecognize: ${String(why)}.`,
   PIPELINE_EXPRESSION_ARGS: (op: unknown, expected: unknown) =>
     `[aggregatePipeline] ${String(op)} expects ${String(expected)}.`,
   PIPELINE_UNKNOWN_EXPRESSION: (op: unknown) =>

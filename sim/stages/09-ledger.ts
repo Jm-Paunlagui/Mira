@@ -137,7 +137,7 @@ export async function ledgerStage(sim: Sim, ctx: Ctx, state: State) {
   };
   walk(null, 1);
   sim.eq("connectBy: chart of accounts in tree order with levels", tree.map((r) => [r.CODE, Number(r.LEVEL)]), preorder);
-  const rollup = await sim.viaSql("balances rolled up the account tree", "CONNECT_BY_ROOT is not exposed (connectBy has no root column), so a node cannot be summed with its descendants", () =>
+  const rollup = await sim.viaSql("balances rolled up the account tree", "connectBy now returns ROOT_<col>, but its rows cannot feed a join or $group: the tree has to be joined to a grouped result (aggregate-then-join)", () =>
     raw<{ ROOT: string; TOTAL: string }>(
       `SELECT t.ROOT, NVL(SUM(b.BAL), 0) AS TOTAL
          FROM (SELECT CONNECT_BY_ROOT CODE AS ROOT, CODE FROM "${E.ACCOUNTS}" CONNECT BY PRIOR CODE = PARENT_CODE) t

@@ -90,11 +90,9 @@ export async function kitchenStage(sim: Sim, ctx: Ctx, state: State) {
 
   // A bad recipe line makes a loop (syrup needs sweet mix, which needs syrup).
   await bom.insertOne({ PARENT: "SYRUP", CHILD: "SWEET-MIX", QTY: 0.1 });
-  const cyc = await sim.viaSql("recipe cycle detection", "connectBy always adds NOCYCLE but does not expose CONNECT_BY_ISCYCLE, so a loop is silently cut, not reported", () =>
-    raw<{ PARENT: string; CHILD: string }>(`SELECT PARENT, CHILD FROM "${E.BOM}" WHERE CONNECT_BY_ISCYCLE = 1 START WITH PARENT = 'P-HALO' CONNECT BY NOCYCLE PRIOR CHILD = PARENT`),
-  );
-  sim.ok("cycle detection: the looping recipe line is reported", cyc.length > 0 && cyc.every((r) => ["SYRUP", "SWEET-MIX"].includes(r.PARENT)), cyc);
-  const cut = (await sim.mira(() => bom.connectBy({ startWith: { PARENT: "P-HALO" }, connectBy: { PARENT: "$PRIOR CHILD" }, includeLevel: true }))) as unknown[];
-  sim.ok("connectBy on a looping recipe still returns (NOCYCLE), without saying it was cut", cut.length >= bomTree("P-HALO").length, cut.length);
+  const loop = (await sim.mira(() => bom.connectBy({ startWith: { PARENT: "P-HALO" }, connectBy: { PARENT: "$PRIOR CHILD" }, includeLevel: true, includeIsCycle: true }))) as { PARENT: string; CHILD: string; IS_CYCLE: number }[];
+  const cyc = loop.filter((r) => Number(r.IS_CYCLE) === 1);
+  sim.ok("cycle detection (includeIsCycle): the looping recipe line is reported", cyc.length > 0 && cyc.every((r) => ["SYRUP", "SWEET-MIX"].includes(r.PARENT)), cyc);
+  sim.ok("connectBy on a looping recipe still returns (NOCYCLE)", loop.length >= bomTree("P-HALO").length, loop.length);
   await bom.deleteMany({ PARENT: "SYRUP", CHILD: "SWEET-MIX" });
 }

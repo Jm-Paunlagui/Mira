@@ -873,6 +873,50 @@ const orgTree = await employees.connectBy({
 });
 ```
 
+
+Extra hierarchy columns: `root: "NAME"` adds `ROOT_NAME` (CONNECT_BY_ROOT, the top row's value on every row), `includeIsLeaf: true` adds `IS_LEAF`, `includeIsCycle: true` adds `IS_CYCLE` (NOCYCLE is always on, so a loop is cut; `IS_CYCLE = 1` marks the row that would close it), and `pathColumn` chooses the column `includePath` builds the path from.
+
+### Row Pattern Matching (MATCH_RECOGNIZE)
+
+The `$matchRecognize` stage finds runs of rows that match a pattern: stock-outs, split payments, price streaks.
+
+```js
+// Every run of consecutive zero-stock days, per item
+await daily.aggregate([
+    {
+        $matchRecognize: {
+            partitionBy: ["SKU"],
+            orderBy: { D: 1 },
+            measures: { START_D: { $first: "$D" }, DAYS: { $count: "*" } },
+            pattern: "Z+",
+            define: { Z: { QTY: 0 } },
+        },
+    },
+]);
+
+// Payments to one supplier, each under the limit and ≤ 3 days apart, that together pass it
+await payments.aggregate([
+    {
+        $matchRecognize: {
+            partitionBy: ["SUPPLIER"],
+            orderBy: { PDATE: 1 },
+            measures: { FIRST_ID: { $first: "$ID" }, TOTAL: { $sum: "$AMOUNT" } },
+            pattern: "A B+",
+            define: {
+                A: { $lt: ["$AMOUNT", 10000] },
+                B: { $and: [{ $lt: ["$AMOUNT", 10000] }, { $lte: [{ $subtract: ["$PDATE", { $prev: "$PDATE" }] }, 3] }] },
+            },
+        },
+    },
+    { $match: { TOTAL: { $gt: 10000 } } },
+]);
+```
+
+- `pattern`: variable names with quantifiers (`* + ? {n,m}`), `( )`, `|`, `^`, `$`. Every variable must be defined; anything else is refused before SQL is built.
+- `define`: one condition per variable, written like a `$cond` condition (values bound). `$prev` / `$next` (optionally `["$COL", n]`) look at neighbouring rows; `true` matches any row.
+- `measures`: `$first` / `$last` / `$sum` / `$min` / `$max` / `$avg` / `$count` of `"$COL"` or `"$VAR.COL"`, plus `$classifier` and `$matchNumber`.
+- `rowsPerMatch`: `"one"` (default) or `"all"`; `afterMatch`: `"pastLastRow"` (default) or `"nextRow"`.
+
 ### PIVOT (Rows → Columns)
 
 Turn row values into column headers:

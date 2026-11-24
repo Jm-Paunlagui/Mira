@@ -285,6 +285,14 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
         continue;
       }
 
+      case "$matchRecognize": {
+        const { sql, binds, outputs } = _buildMatchRecognize(stage.$matchRecognize, prevSource, counter);
+        Object.assign(allBinds, binds);
+        ctes.push({ alias: stageAlias, sql });
+        for (const o of outputs) aliases.add(o);
+        break;
+      }
+
       case "$bucket": {
         const { sql, binds } = _buildBucket(stage.$bucket, prevSource, counter);
         Object.assign(allBinds, binds);
@@ -666,6 +674,15 @@ function _buildAggExpr(expr: Record<string, DslSpec>, binds: Record<string, unkn
               throw new Error(MSG.PIPELINE_EXPRESSION_ARGS(op, "unit one of day, week, month, quarter, year"));
           }
         }
+        case "$prev":
+        case "$next": {
+          // Row-pattern navigation (only meaningful inside $matchRecognize define / measures).
+          const fn = op === "$prev" ? "PREV" : "NEXT";
+          if (!Array.isArray(val)) return `${fn}(${one(val)})`;
+          const n = val[1];
+          if (!Number.isInteger(n) || n < 0) throw new Error(MSG.PIPELINE_EXPRESSION_ARGS(op, "[column, a non-negative whole number of rows]"));
+          return `${fn}(${one(val[0])}, ${n})`;
+        }
         case "$lastDayOfMonth":
           return `LAST_DAY(${one(val)})`;
         case "$year":
@@ -944,6 +961,75 @@ function _buildMergeStatement(merge: DslSpec, sourceSql: string): string {
       : "";
   if (!matched && !notMatched) throw new Error(MSG.PIPELINE_MERGE_INVALID("nothing to do: no updatable fields and whenNotMatched is discard"));
   return `MERGE INTO ${quoteIdentifier(into)} tgt USING (${sourceSql}) src ON (${onSql})${matched}${notMatched}`;
+}
+
+/** Pattern variables: unquoted upper-case identifiers, so they can be written into SQL as is. */
+const MR_VAR = /^[A-Z][A-Z0-9_]{0,29}$/;
+const MR_AGGS: Readonly<Record<string, string>> = Object.freeze({ $first: "FIRST", $last: "LAST", $sum: "SUM", $min: "MIN", $max: "MAX", $avg: "AVG", $count: "COUNT" });
+
+/**
+ * Build the $matchRecognize stage: Oracle row pattern matching (MATCH_RECOGNIZE).
+ *
+ *   { $matchRecognize: {
+ *       partitionBy: ["SKU"], orderBy: { D: 1 },
+ *       measures: { START_D: { $first: "$D" }, DAYS: { $count: "*" } },
+ *       rowsPerMatch: "one" | "all",            // default "one"
+ *       afterMatch: "pastLastRow" | "nextRow",  // default "pastLastRow"
+ *       pattern: "Z+",                          // variables, quantifiers, ( ) | ^ $
+ *       define: { Z: { QTY: 0 } },              // a $cond-style condition per variable
+ *   } }
+ *
+ * The pattern is checked token by token and every variable must be defined, so
+ * nothing but a pattern reaches the SQL. Conditions are built like $cond (values
+ * bound); $prev / $next look at neighbouring rows. Measures: $first / $last /
+ * $sum / $min / $max / $avg / $count of a column ("$COL" or "$VAR.COL"),
+ * $classifier, $matchNumber.
+ */
+function _buildMatchRecognize(spec: DslSpec, source: string, counter: Counter): { sql: string; binds: Record<string, unknown>; outputs: string[] } {
+  const binds: Record<string, unknown> = {};
+  const bad = (why: string) => new Error(MSG.PIPELINE_MATCH_RECOGNIZE(why));
+  if (!spec || typeof spec !== "object") throw bad("expects an object");
+  const { partitionBy, orderBy, measures, rowsPerMatch = "one", afterMatch = "pastLastRow", pattern, define } = spec;
+  if (!orderBy || typeof orderBy !== "object" || Object.keys(orderBy).length === 0) throw bad("orderBy is required");
+  if (!define || typeof define !== "object") throw bad("define is required");
+  for (const v of Object.keys(define)) if (!MR_VAR.test(v)) throw bad(`variable ${v} must be an upper-case name`);
+
+  // PATTERN: only variables, quantifiers, grouping, alternation and anchors.
+  const tokens = typeof pattern === "string" ? pattern.match(/[A-Za-z_][A-Za-z0-9_]*|\{\d+(?:,\d*)?\}|[()|*+?^$]|\s+/g) : null;
+  if (!tokens || tokens.join("") !== pattern || !pattern.trim()) throw bad("pattern may contain only variable names, quantifiers (* + ? {n,m}), ( ) | ^ $");
+  for (const t of tokens) if (/^[A-Za-z_]/.test(t) && !(t in define)) throw bad(`variable ${t} is not defined (add it to define)`);
+
+  const col = (ref: unknown): string => {
+    if (ref === "*") return "*";
+    const m = typeof ref === "string" ? /^\$(?:([A-Z][A-Z0-9_]*)\.)?(.+)$/.exec(ref) : null;
+    if (!m) throw bad(`a measure takes "$COLUMN" or "$VARIABLE.COLUMN", got ${JSON.stringify(ref)}`);
+    if (m[1] && !(m[1] in define)) throw bad(`variable ${m[1]} is not defined`);
+    return `${m[1] ? `${m[1]}.` : ""}${quoteIdentifier(m[2])}`;
+  };
+  const outputs: string[] = [];
+  const measureSql = Object.entries((measures ?? {}) as Record<string, Record<string, unknown>>).map(([alias, m]) => {
+    const [op, val] = Object.entries(m ?? {})[0] ?? [];
+    let expr: string;
+    if (op === "$classifier") expr = "CLASSIFIER()";
+    else if (op === "$matchNumber") expr = "MATCH_NUMBER()";
+    else if (op && MR_AGGS[op]) expr = `${MR_AGGS[op]}(${col(val)})`;
+    else throw bad(`measure ${alias}: use $first, $last, $sum, $min, $max, $avg, $count, $classifier or $matchNumber`);
+    outputs.push(alias.toUpperCase());
+    return `${expr} AS ${quoteIdentifier(alias.toUpperCase())}`;
+  });
+
+  const parts: string[] = [];
+  const pcols = partitionBy == null ? [] : Array.isArray(partitionBy) ? partitionBy : [partitionBy];
+  if (pcols.length) parts.push(`PARTITION BY ${pcols.map((c: string) => quoteIdentifier(c)).join(", ")}`);
+  parts.push(`ORDER BY ${_buildSortString(orderBy)}`);
+  if (measureSql.length) parts.push(`MEASURES ${measureSql.join(", ")}`);
+  if (rowsPerMatch !== "one" && rowsPerMatch !== "all") throw bad('rowsPerMatch is "one" or "all"');
+  parts.push(rowsPerMatch === "all" ? "ALL ROWS PER MATCH" : "ONE ROW PER MATCH");
+  if (afterMatch !== "pastLastRow" && afterMatch !== "nextRow") throw bad('afterMatch is "pastLastRow" or "nextRow"');
+  parts.push(afterMatch === "nextRow" ? "AFTER MATCH SKIP TO NEXT ROW" : "AFTER MATCH SKIP PAST LAST ROW");
+  parts.push(`PATTERN (${pattern})`);
+  parts.push(`DEFINE ${Object.entries(define).map(([v, c]) => `${v} AS ${c === true ? "1=1" : _buildCondExpr(c, binds, counter)}`).join(", ")}`);
+  return { sql: `SELECT * FROM ${source} MATCH_RECOGNIZE (${parts.join(" ")})`, binds, outputs };
 }
 
 /**

@@ -203,16 +203,13 @@ export async function inventoryStage(sim: Sim, ctx: Ctx, state: State) {
   // Stock-out runs in December (gaps and islands).
   await schema.createTable(E.DAILY, { SKU: { type: "VARCHAR2(20)" }, D: { type: "DATE" }, QTY: { type: "NUMBER" } });
   await coll(E.DAILY).insertMany(DAILY, { returning: [] });
-  const runs = await sim.viaSql("stock-out runs (consecutive zero days)", "MATCH_RECOGNIZE (row pattern matching) is not exposed", () =>
-    raw<{ SKU: string; START_D: string; DAYS: number }>(
-      `SELECT SKU, TO_CHAR(START_D, 'YYYY-MM-DD') AS START_D, DAYS FROM "${E.DAILY}"
-       MATCH_RECOGNIZE (PARTITION BY SKU ORDER BY D
-                        MEASURES FIRST(D) AS START_D, COUNT(*) AS DAYS
-                        ONE ROW PER MATCH PATTERN (Z+) DEFINE Z AS QTY = 0)
-       ORDER BY SKU, START_D`,
-    ),
+  const runs = await sim.mira(() =>
+    coll(E.DAILY).aggregate([
+      { $matchRecognize: { partitionBy: ["SKU"], orderBy: { D: 1 }, measures: { START_D: { $first: "$D" }, DAYS: { $count: "*" } }, pattern: "Z+", define: { Z: { QTY: 0 } } } },
+      { $sort: { SKU: 1, START_D: 1 } },
+    ]),
   );
-  sim.eq("stock-out runs: start date and length of every run", runs.map((r) => ({ sku: r.SKU, start: r.START_D, days: Number(r.DAYS) })), stockOutRuns());
+  sim.eq("stock-out runs ($matchRecognize): start date and length of every run", runs.map((r) => ({ sku: r.SKU, start: iso(r.START_D as Date), days: Number(r.DAYS) })), stockOutRuns());
 
   // Zero-sales days for two items in Q4, densified against a calendar.
   const dense = await sim.viaSql("zero-sales days (calendar densification)", "partitioned outer join and a row generator (CONNECT BY LEVEL) are not exposed", () =>
