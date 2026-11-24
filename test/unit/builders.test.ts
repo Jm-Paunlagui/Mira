@@ -637,9 +637,14 @@ describe("unit: QueryBuilder SQL (no execution)", () => {
   it("forUpdate: every mode, plain (no paging) and paged", async () => {
     expect(await c.find({}).forUpdate(true).explain()).toBe('SELECT * FROM "T_U" t0 FOR UPDATE');
     expect(await c.find({ A: 1 }).forUpdate("nowait").explain()).toMatch(/NOWAIT$/);
-    expect(await c.find({}).forUpdate("skip locked").limit(1).explain()).toBe(
-      'SELECT * FROM "T_U" t0 WHERE t0.ROWID IN (SELECT t0.ROWID FROM "T_U" t0 FETCH FIRST 1 ROWS ONLY) FOR UPDATE SKIP LOCKED',
+    // A SKIP LOCKED queue read with a limit locks rows as it fetches them and stops after `limit` (maxRows).
+    const q = c.find({}).sort({ A: 1 }).forUpdate("skip locked").limit(2)._buildSQL();
+    expect(q).toEqual({ sql: 'SELECT * FROM "T_U" t0 ORDER BY "A" ASC FOR UPDATE SKIP LOCKED', binds: {}, maxRows: 2 });
+    // With skip, or a limit of 0, it keeps the ROWID subquery page.
+    expect(await c.find({}).forUpdate("skip locked").skip(1).limit(1).explain()).toBe(
+      'SELECT * FROM "T_U" t0 WHERE t0.ROWID IN (SELECT t0.ROWID FROM "T_U" t0 OFFSET 1 ROWS FETCH FIRST 1 ROWS ONLY) FOR UPDATE SKIP LOCKED',
     );
+    expect(await c.find({}).forUpdate({ skipLocked: true }).limit(0).explain()).toContain("ROWID IN");
     expect(await c.find({}).forUpdate({ of: ["A", "B"], wait: 5 }).explain()).toMatch(/FOR UPDATE OF t0\."A", t0\."B" WAIT 5$/);
     expect(await c.find({}).forUpdate({ nowait: true }).explain()).toMatch(/FOR UPDATE NOWAIT$/);
     expect(await c.find({}).forUpdate({ skipLocked: true }).explain()).toMatch(/SKIP LOCKED$/);

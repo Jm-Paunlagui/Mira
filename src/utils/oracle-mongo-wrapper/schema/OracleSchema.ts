@@ -115,14 +115,16 @@ class OracleSchema {
         if (spec.autoIncrement) {
           parts.push("GENERATED ALWAYS AS IDENTITY");
         }
+        // Oracle's column grammar puts DEFAULT before every inline constraint:
+        // "NOT NULL DEFAULT 0" or "PRIMARY KEY DEFAULT 1" is ORA-00907.
+        if (spec.default != null) {
+          parts.push(`DEFAULT ${spec.default}`);
+        }
         if (spec.primaryKey) {
           parts.push("PRIMARY KEY");
         }
         if (spec.notNull) {
           parts.push("NOT NULL");
-        }
-        if (spec.default != null) {
-          parts.push(`DEFAULT ${spec.default}`);
         }
         if (spec.check) {
           parts.push(`CHECK (${spec.check})`);
