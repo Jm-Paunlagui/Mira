@@ -104,19 +104,28 @@ export async function inventoryStage(sim: Sim, ctx: Ctx, state: State) {
   );
 
   // FIFO: issues at Makati consume the oldest layers first.
-  const fifo = await sim.viaSql("FIFO cost of goods issued", "consuming cost layers needs a running total compared with the issued quantity and LEAST/GREATEST; no column-to-column expressions in Mira", () =>
-    raw<{ SKU: string; COGS: string; ENDING: string }>(
-      `WITH layers AS (SELECT SKU, MDATE, MOVE_ID, QTY, UNIT_COST,
-                              SUM(QTY) OVER (PARTITION BY SKU ORDER BY MDATE, MOVE_ID ROWS UNBOUNDED PRECEDING) - QTY AS BEFORE_QTY
-                         FROM "${E.MOVES}" WHERE STORE_ID = 1 AND QTY > 0 AND MTYPE IN ('OPEN','RCV')),
-            out AS (SELECT SKU, -SUM(QTY) AS ISSUED FROM "${E.MOVES}" WHERE STORE_ID = 1 AND QTY < 0 GROUP BY SKU)
-       SELECT l.SKU,
-              SUM(LEAST(l.QTY, GREATEST(0, NVL(o.ISSUED, 0) - l.BEFORE_QTY)) * l.UNIT_COST) AS COGS,
-              SUM((l.QTY - LEAST(l.QTY, GREATEST(0, NVL(o.ISSUED, 0) - l.BEFORE_QTY))) * l.UNIT_COST) AS ENDING
-         FROM layers l LEFT JOIN out o ON o.SKU = l.SKU
-        WHERE l.SKU IN ('P-ADOBO','P-COFFEE')
-        GROUP BY l.SKU ORDER BY l.SKU`,
-    ),
+  // Running receipts per item (windowed), total issued per item, then each receipt layer
+  // takes LEAST(layer, GREATEST(0, issued − quantity received before it)).
+  const fifo = await sim.mira(() =>
+    moves.aggregate([
+      { $match: { STORE_ID: 1, SKU: { $in: ["P-ADOBO", "P-COFFEE"] } } },
+      {
+        $addFields: {
+          INQ: { $cond: { if: { $or: [{ $eq: ["$MTYPE", "OPEN"] }, { $eq: ["$MTYPE", "RCV"] }] }, then: "$QTY", else: 0 } },
+          OUTQ: { $cond: { if: { $lt: ["$QTY", 0] }, then: { $mul: ["$QTY", -1] }, else: 0 } },
+        },
+      },
+      {
+        $addFields: {
+          CUMIN: { $window: { fn: "SUM", field: "INQ", partitionBy: "SKU", orderBy: { MDATE: 1, MOVE_ID: 1 }, frame: "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" } },
+          ISSUED: { $window: { fn: "SUM", field: "OUTQ", partitionBy: "SKU" } },
+        },
+      },
+      { $match: { MTYPE: { $in: ["OPEN", "RCV"] } } },
+      { $addFields: { TAKE: { $min: ["$QTY", { $max: [0, { $subtract: ["$ISSUED", { $subtract: ["$CUMIN", "$QTY"] }] }] }] } } },
+      { $group: { _id: "$SKU", COGS: { $sum: { $mul: ["$TAKE", "$UNIT_COST"] } }, ENDING: { $sum: { $mul: [{ $subtract: ["$QTY", "$TAKE"] }, "$UNIT_COST"] } } } },
+      { $sort: { SKU: 1 } },
+    ]),
   );
   const fifoModel = (sku: string) => {
     const layers = model.moves.filter((m) => m.store === 1 && m.sku === sku && m.qty > 0 && (m.type === "OPEN" || m.type === "RCV")).sort((a, b) => +a.date - +b.date);
@@ -165,13 +174,14 @@ export async function inventoryStage(sim: Sim, ctx: Ctx, state: State) {
   let cum = 0;
   const classOf = new Map(ranked.map(([id, v]) => [id, (cum += v) / total <= 0.8 ? "A" : cum / total <= 0.95 ? "B" : "C"]));
   sim.eq("ABC: class A items (cumulative share of sales ≤ 80%)", abc.map((r) => Number(r.PRODUCT_ID)), ranked.filter(([id]) => classOf.get(id) === "A").map(([id]) => id));
-  const abcAll = await sim.viaSql("ABC classes A / B / C", "a three-way class needs a multi-branch CASE; Mira's $cond takes one condition and cannot nest", () =>
-    raw<{ PRODUCT_ID: number; CLS: string }>(
-      `SELECT PRODUCT_ID, CASE WHEN CUM / TOT <= 0.8 THEN 'A' WHEN CUM / TOT <= 0.95 THEN 'B' ELSE 'C' END AS CLS
-         FROM (SELECT PRODUCT_ID, VAL, SUM(VAL) OVER (ORDER BY VAL DESC, PRODUCT_ID ROWS UNBOUNDED PRECEDING) AS CUM, SUM(VAL) OVER () AS TOT
-                 FROM (SELECT PRODUCT_ID, SUM(QTY * UNIT_PRICE) AS VAL FROM "${T.LINES}" GROUP BY PRODUCT_ID))
-        ORDER BY VAL DESC, PRODUCT_ID`,
-    ),
+  const abcAll = await sim.mira(() =>
+    coll(T.LINES).aggregate([
+      { $addFields: { VAL: { $mul: ["$QTY", "$UNIT_PRICE"] } } },
+      { $group: { _id: "$PRODUCT_ID", VAL: { $sum: "$VAL" } } },
+      { $addFields: { CUM: { $window: { fn: "SUM", field: "VAL", orderBy: { VAL: -1, PRODUCT_ID: 1 }, frame: "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" } }, TOT: { $window: { fn: "SUM", field: "VAL" } } } },
+      { $addFields: { CLS: { $switch: { branches: [{ case: { $lte: [{ $divide: ["$CUM", "$TOT"] }, 0.8] }, then: "A" }, { case: { $lte: [{ $divide: ["$CUM", "$TOT"] }, 0.95] }, then: "B" }], default: "C" } } } },
+      { $sort: { VAL: -1, PRODUCT_ID: 1 } },
+    ]),
   );
   sim.eq("ABC: every item's class", abcAll.map((r) => [Number(r.PRODUCT_ID), r.CLS]), ranked.map(([id]) => [id, classOf.get(id)]));
 

@@ -185,18 +185,18 @@ export async function ledgerStage(sim: Sim, ctx: Ctx, state: State) {
       postedOnly,
       { $match: { STATUS: "posted" } },
       { $lookup: { from: E.ACCOUNTS, localField: "ACCOUNT_CODE", foreignField: "CODE", as: "a", joinType: "inner", select: ["TYPE"] } },
-      { $group: { _id: { $rollup: ["TYPE", "ACCOUNT_CODE"] }, BAL: { $sum: "$NET" } } },
+      { $group: { _id: { $rollup: ["TYPE", "ACCOUNT_CODE"], grouping: true }, BAL: { $sum: "$NET" } } },
     ]),
   );
   const types = [...new Set(posted.map((l) => TYPE_OF.get(l.acct)!))];
   const sub = (t: string) => posted.filter((l) => TYPE_OF.get(l.acct) === t).reduce((s, l) => s + l.dr - l.cr, 0);
-  const ruKey = (r: Record<string, unknown>) => `${r.TYPE ?? "*"}|${r.ACCOUNT_CODE ?? "*"}`;
+  // GROUPING_* flags (not NULL keys) say which rows are subtotals.
+  const ruKey = (r: Record<string, unknown>) => `${Number(r.GROUPING_TYPE) ? "*" : r.TYPE}|${Number(r.GROUPING_ACCOUNT_CODE) ? "*" : r.ACCOUNT_CODE}`;
   const ruGot = Object.fromEntries(ru.map((r) => [ruKey(r), cents(r.BAL)]));
   const ruWant: Record<string, number> = { "*|*": 0 };
   for (const t of types) ruWant[`${t}|*`] = sub(t);
   for (const a of new Set(posted.map((l) => l.acct))) ruWant[`${TYPE_OF.get(a)}|${a}`] = bal(a);
-  sim.eq("ROLLUP: per-account balances, per-type subtotals and a grand total of zero", ruGot, ruWant);
-  sim.gap("ROLLUP subtotal rows", "GROUPING() / GROUPING_ID() are not exposed, so a subtotal row cannot be told from a group whose key is NULL");
+  sim.eq("ROLLUP with GROUPING flags: per-account balances, per-type subtotals and a grand total of zero", ruGot, ruWant);
 
   // ── Quarterly P&L (PIVOT) and month-on-month revenue (LAG) ─────────────────
   const pnl = (await sim.mira(() => lines.pivot({ value: { $sum: "$NET" }, pivotOn: "QUARTER", pivotValues: ["Q1", "Q2", "Q3", "Q4"], groupBy: "ACCOUNT_CODE" }))) as Record<string, unknown>[];

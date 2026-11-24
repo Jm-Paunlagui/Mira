@@ -387,8 +387,41 @@ describe("unit: aggregate pipeline", () => {
     expect(sql).toContain('"R" = :where_R_3'); // not an alias: left as written
   });
 
+  it("expressions: every date unit, $literal, $round/$trunc forms, null and argument errors", () => {
+    const one = (e: unknown) => {
+      const { sql, binds } = agg([{ $project: { X: e } }]);
+      return { sql: sql.replace(/^SELECT /, "").replace(/ AS "X" FROM "T"$/, ""), binds };
+    };
+    expect(one({ $dateAdd: { startDate: "$D", unit: "hour", amount: 3 } }).sql).toBe(`("D" + NUMTODSINTERVAL(:agg_0, 'HOUR'))`);
+    expect(one({ $dateAdd: { startDate: "$D", unit: "minute", amount: 3 } }).sql).toContain("'MINUTE'");
+    expect(one({ $dateAdd: { startDate: "$D", unit: "second", amount: 3 } }).sql).toContain("'SECOND'");
+    expect(one({ $dateAdd: { startDate: "$D", unit: "week", amount: 2 } }).sql).toBe('(CAST("D" AS DATE) + 7 * :agg_0)');
+    expect(one({ $dateAdd: { startDate: "$D", unit: "quarter", amount: 1 } }).sql).toBe('ADD_MONTHS("D", 3 * :agg_0)');
+    expect(one({ $dateAdd: { startDate: "$D", unit: "year", amount: 1 } }).sql).toBe('ADD_MONTHS("D", 12 * :agg_0)');
+    expect(one({ $dateDiff: { startDate: "$S", endDate: "$E", unit: "week" } }).sql).toBe(`((TRUNC(CAST("E" AS DATE), 'IW') - TRUNC(CAST("S" AS DATE), 'IW')) / 7)`);
+    expect(one({ $dateDiff: { startDate: "$S", endDate: "$E", unit: "quarter" } }).sql).toContain("TRUNC(((EXTRACT(YEAR FROM \"E\") * 12");
+    expect(one({ $dateDiff: { startDate: "$S", endDate: "$E", unit: "year" } }).sql).toBe('(EXTRACT(YEAR FROM "E") - EXTRACT(YEAR FROM "S"))');
+    for (const unit of ["year", "quarter", "week", "day", "hour", "minute"]) expect(one({ $dateTrunc: { date: "$D", unit } }).sql).toMatch(/^TRUNC\("D", '/);
+    expect(() => one({ $dateTrunc: { date: "$D", unit: "fortnight" } })).toThrow(/\$dateTrunc expects unit/);
+    expect(() => one({ $dateAdd: { startDate: "$D", unit: "eon", amount: 1 } })).toThrow(/\$dateAdd expects unit/);
+    expect(() => one({ $dateDiff: { startDate: "$S", endDate: "$E", unit: "hour" } })).toThrow(/\$dateDiff expects unit/);
+    expect(one({ $literal: "$NOT_A_COLUMN" })).toEqual({ sql: ":agg_0", binds: { agg_0: "$NOT_A_COLUMN" } });
+    expect(one({ $round: "$A" }).sql).toBe('ROUND("A")');
+    expect(one({ $trunc: ["$A"] }).sql).toBe('TRUNC("A")');
+    expect(one({ $dateToString: { date: new Date(0), format: "YYYY" } }).sql).toBe("TO_CHAR(:agg_0, 'YYYY')");
+    expect(one({ $ifNull: ["$A", null] }).sql).toBe('COALESCE("A", NULL)');
+    expect(one({ $cond: { if: { $eq: ["$A", null] }, then: 1, else: 0 } }).sql).toContain('WHEN "A" IS NULL THEN');
+    expect(one({ $cond: { if: { $ne: ["$A", null] }, then: 1, else: 0 } }).sql).toContain('WHEN "A" IS NOT NULL THEN');
+    expect(one({ $switch: { branches: [{ case: { $gt: ["$A", 1] }, then: "x" }] } }).sql).toBe('CASE WHEN "A" > :agg_0 THEN :agg_1 END');
+    expect(() => one({ $switch: { branches: [] } })).toThrow(/\$switch expects branches/);
+    expect(() => one({ $mod: ["$A"] })).toThrow(/\$mod expects a list of at least 2/);
+    expect(() => one({ $max: ["$A"] })).toThrow(/\$max expects a list of at least 2/);
+    expect(() => one({ $cond: { if: { $gt: ["$A"] }, then: 1, else: 0 } })).toThrow(/\$gt expects two operands/);
+    expect(one({ $sum: 7 }).sql).toBe("SUM(7)"); // a bare number in an aggregate stays a literal, as before
+  });
+
   it("DEFECT: an unknown expression operator is refused, not turned into a column name", () => {
-    expect(() => agg([{ $project: { R: { $round: ["$A", 0] } } }])).toThrow(/Unsupported expression operator "\$round"/);
+    expect(() => agg([{ $project: { R: { $cosine: ["$A", 0] } } }])).toThrow(/Unsupported expression operator "\$cosine"/);
     expect(() => agg([{ $group: { _id: "$R", s: { $stdDevPop: "$A" } } }])).toThrow(/Unsupported expression operator "\$stdDevPop"/);
   });
 

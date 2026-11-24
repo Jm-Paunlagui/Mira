@@ -82,15 +82,17 @@ export async function financeStage(sim: Sim, ctx: Ctx, state: State) {
 
   // ── Bonus pool split across branches to the cent ───────────────────────────
   const POOL = 100_000_00;
-  const split = await sim.viaSql("bonus pool split by revenue share, exact to the cent", "largest-remainder allocation needs FLOOR, ROW_NUMBER over an expression and a final CASE; Mira has no FLOOR and no multi-step expressions", () =>
-    raw<{ STORE_ID: number; PART: number }>(
-      `WITH w AS (SELECT STORE_ID, SUM(TOTAL) AS W FROM "${T.ORDERS}" GROUP BY STORE_ID),
-            b AS (SELECT STORE_ID, :pool * W / SUM(W) OVER () AS EXACT FROM w),
-            f AS (SELECT STORE_ID, FLOOR(EXACT) AS BASE, EXACT - FLOOR(EXACT) AS REM FROM b),
-            r AS (SELECT STORE_ID, BASE, ROW_NUMBER() OVER (ORDER BY REM DESC, STORE_ID) AS RN, :pool - SUM(BASE) OVER () AS LEFTOVER FROM f)
-       SELECT STORE_ID, BASE + CASE WHEN RN <= LEFTOVER THEN 1 ELSE 0 END AS PART FROM r ORDER BY STORE_ID`,
-      { pool: POOL },
-    ),
+  // Largest remainder: floor every exact share, then hand the leftover cents to the
+  // largest remainders (ties to the lower branch id).
+  const split = await sim.mira(() =>
+    coll(T.ORDERS).aggregate([
+      { $group: { _id: "$STORE_ID", W: { $sum: "$TOTAL" } } },
+      { $addFields: { EXACT: { $divide: [{ $mul: [POOL, "$W"] }, { $window: { fn: "SUM", field: "W" } }] } } },
+      { $addFields: { BASE: { $floor: "$EXACT" }, REM: { $subtract: ["$EXACT", { $floor: "$EXACT" }] } } },
+      { $addFields: { RN: { $window: { fn: "ROW_NUMBER", orderBy: { REM: -1, STORE_ID: 1 } } }, SUMBASE: { $window: { fn: "SUM", field: "BASE" } } } },
+      { $addFields: { PART: { $add: ["$BASE", { $cond: { if: { $lte: ["$RN", { $subtract: [POOL, "$SUMBASE"] }] }, then: 1, else: 0 } }] } } },
+      { $sort: { STORE_ID: 1 } },
+    ]),
   );
   const want = allocate(POOL, STORES.map((s) => [String(s.STORE_ID), sum((o) => o.storeId === s.STORE_ID)]));
   sim.eq("allocation: each branch's share (largest remainder)", split.map((r) => [String(r.STORE_ID), Number(r.PART)]), [...want]);

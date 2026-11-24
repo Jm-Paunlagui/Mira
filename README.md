@@ -1111,6 +1111,22 @@ console.log(sql);
 | `$cond`         | `CASE WHEN ... THEN ... ELSE ... END` | `{ tier: { $cond: { if: ..., then: ..., else: ... } } }`    |
 | `$ifNull`       | `COALESCE(col, fallback)`             | `{ name: { $ifNull: ['$nickname', 'N/A'] } }`               |
 | `$dateToString` | `TO_CHAR(col, format)`                | `{ d: { $dateToString: { format: '...', date: '$col' } } }` |
+| `$max` / `$min` with a list | `GREATEST(...)` / `LEAST(...)` (values in the row) | `{ hi: { $max: ['$a', '$b', 0] } }` |
+| `$abs` `$ceil` `$floor` | `ABS` / `CEIL` / `FLOOR` | `{ whole: { $floor: '$qty' } }` |
+| `$round` / `$trunc` | `ROUND(x[, places])` / `TRUNC(x[, places])` | `{ r: { $round: ['$amount', 2] } }` |
+| `$mod` | `MOD(a, b)` | `{ m: { $mod: ['$n', 7] } }` |
+| `$switch` | `CASE WHEN … WHEN … ELSE … END` | `{ g: { $switch: { branches: [{ case: …, then: 'A' }], default: 'C' } } }` |
+| `$literal` | a bound value, never a column | `{ k: { $literal: '$not-a-column' } }` |
+| `$dateDiff` | calendar boundaries between two dates (`day` `week` `month` `quarter` `year`) | `{ late: { $dateDiff: { startDate: '$due', endDate: asOf, unit: 'day' } } }` |
+| `$dateAdd` | `+ n` days / weeks, `ADD_MONTHS`, `NUMTODSINTERVAL` (`second` … `year`) | `{ due: { $dateAdd: { startDate: '$inv', unit: 'day', amount: 30 } } }` |
+| `$dateTrunc` | `TRUNC(date, 'MM')` (`year` `quarter` `month` `week` `day` `hour` `minute`) | `{ m: { $dateTrunc: { date: '$at', unit: 'month' } } }` |
+| `$lastDayOfMonth` `$year` `$month` `$dayOfMonth` | `LAST_DAY`, `EXTRACT(...)` | `{ y: { $year: '$at' } }` |
+
+**Nesting.** Any argument can itself be an expression, a column (`'$col'`) or a literal (always bound), and aggregates accept expressions: `{ $sum: { $mul: ['$qty', '$price'] } }`, `{ $round: [{ $divide: ['$a', '$b'] }, 2] }`.
+
+**Conditions** in `$cond` and `$switch` can compare two operands, either side a column, expression or literal: `{ $gt: ['$score', '$age'] }`, combined with `$and` / `$or` / `$not`. `{ $eq: ['$x', null] }` is `IS NULL`. The older filter form `{ score: { $gte: 90 } }` still works.
+
+**Subtotal flags.** `_id: { $rollup: [...], grouping: true }` (also `$cube` / `$groupingSets`) adds `GROUPING_<col>`, which is 1 on subtotal rows, so a subtotal can be told from a group whose key is NULL.
 
 ### Quick Cheat Sheet
 
@@ -1219,7 +1235,7 @@ bun run test:unit       # or :integration / :performance / :chaos / :security / 
 14. **Audit:** Benford, journals without lines, split payments
 15. **Operations:** pool stats, health, shutdown
 
-Business queries Mira's API cannot express (for example `MATCH_RECOGNIZE`, date arithmetic, `CONNECT_BY_ROOT`) run as hand-written SQL, are still checked, and are listed at the end as **coverage gaps** with the reason: a measured list of what Mira could support next.
+Business queries Mira's API cannot express (for example `MATCH_RECOGNIZE`, `CONNECT_BY_ROOT`, recursion that carries a calculation) run as hand-written SQL, are still checked, and are listed at the end as **coverage gaps** with the reason: a measured list of what Mira could support next.
 
 Every result is checked against an in-memory model of the business or a hand-written SQL read. Then the run proves that **every public Mira function was called** (`sim/lib/tracker.ts`), and lists any that were not.
 

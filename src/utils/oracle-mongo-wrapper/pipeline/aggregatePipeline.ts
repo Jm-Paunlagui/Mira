@@ -442,14 +442,19 @@ function _buildGroup(group: Record<string, DslSpec>, source: string, having: Rec
     groupByParts.push(quoteIdentifier(col));
   } else if (typeof idSpec === "object" && !Array.isArray(idSpec)) {
     // Check for $rollup, $cube, $groupingSets
+    // grouping: true adds GROUPING_<col> (1 on a subtotal row for that column), so a
+    // subtotal can be told from a group whose key really is NULL.
+    const flags = (cols: string[]) => (idSpec.grouping === true ? cols.map((c) => `GROUPING(${quoteIdentifier(c)}) AS ${quoteIdentifier(`GROUPING_${c.toUpperCase()}`)}`) : []);
     if (idSpec.$rollup) {
       const cols = idSpec.$rollup.map((c: string) => quoteIdentifier(c));
       selectParts.push(...idSpec.$rollup.map(quoteIdentifier));
       groupByParts.push(`ROLLUP(${cols.join(", ")})`);
+      selectParts.push(...flags(idSpec.$rollup));
     } else if (idSpec.$cube) {
       const cols = idSpec.$cube.map((c: string) => quoteIdentifier(c));
       selectParts.push(...idSpec.$cube.map(quoteIdentifier));
       groupByParts.push(`CUBE(${cols.join(", ")})`);
+      selectParts.push(...flags(idSpec.$cube));
     } else if (idSpec.$groupingSets) {
       const sets = idSpec.$groupingSets.map((set: string[]) => {
         if (Array.isArray(set) && set.length === 0) return "()";
@@ -465,6 +470,7 @@ function _buildGroup(group: Record<string, DslSpec>, source: string, having: Rec
       });
       selectParts.push(...[...allCols].map(quoteIdentifier));
       groupByParts.push(`GROUPING SETS(${sets.join(", ")})`);
+      selectParts.push(...flags([...allCols]));
     } else {
       // Regular object — { alias: '$field', ... }
       for (const [alias, fieldRef] of Object.entries(idSpec)) {
@@ -542,85 +548,154 @@ function _buildGroup(group: Record<string, DslSpec>, source: string, having: Rec
 function _buildAggExpr(expr: Record<string, DslSpec>, binds: Record<string, unknown>, counter: Counter): string {
   if (typeof expr === "object") {
     for (const [op, val] of Object.entries(expr)) {
+      // Aggregates take a column ("$A"), "*", or any expression ({ $mul: [...] }).
+      const one = (v: DslSpec) => _one(v, binds, counter);
+      const arg = (v: DslSpec) => _fieldRefOrBind(v, binds, counter);
+      const list = (v: DslSpec, min: number) => {
+        if (!Array.isArray(v) || v.length < min) throw new Error(MSG.PIPELINE_EXPRESSION_ARGS(op, `a list of at least ${min} values`));
+        return v.map(arg);
+      };
       switch (op) {
         case "$sum":
-          return `SUM(${_fieldRef(val)})`;
+          return `SUM(${one(val)})`;
         case "$avg":
-          return `AVG(${_fieldRef(val)})`;
+          return `AVG(${one(val)})`;
         case "$min":
-          return `MIN(${_fieldRef(val)})`;
+          // A list compares values in the row (LEAST); a single value aggregates rows (MIN).
+          return Array.isArray(val) ? `LEAST(${list(val, 2).join(", ")})` : `MIN(${one(val)})`;
         case "$max":
-          return `MAX(${_fieldRef(val)})`;
+          return Array.isArray(val) ? `GREATEST(${list(val, 2).join(", ")})` : `MAX(${one(val)})`;
         case "$count":
-          return `COUNT(${val === "*" ? "*" : _fieldRef(val)})`;
+          return `COUNT(${val === "*" ? "*" : one(val)})`;
         case "$first":
-          return `MIN(${_fieldRef(val)})`;
+          return `MIN(${one(val)})`;
         case "$last":
-          return `MAX(${_fieldRef(val)})`;
-        case "$mul": {
-          if (Array.isArray(val)) {
-            return val
-              .map((v) => _fieldRefOrBind(v, binds, counter))
-              .join(" * ");
-          }
-          return _fieldRef(val);
+          return `MAX(${one(val)})`;
+        case "$mul":
+          return Array.isArray(val) ? `(${val.map(arg).join(" * ")})` : one(val);
+        case "$add":
+          return Array.isArray(val) ? `(${val.map(arg).join(" + ")})` : one(val);
+        case "$subtract":
+          return Array.isArray(val) ? `(${val.map(arg).join(" - ")})` : one(val);
+        case "$divide":
+          return Array.isArray(val) ? `(${val.map(arg).join(" / ")})` : one(val);
+        case "$mod": {
+          const [a, b] = list(val, 2);
+          return `MOD(${a}, ${b})`;
         }
-        case "$add": {
-          if (Array.isArray(val)) {
-            return `(${val.map((v) => _fieldRefOrBind(v, binds, counter)).join(" + ")})`;
-          }
-          return _fieldRef(val);
+        case "$abs":
+          return `ABS(${one(val)})`;
+        case "$ceil":
+          return `CEIL(${one(val)})`;
+        case "$floor":
+          return `FLOOR(${one(val)})`;
+        case "$round":
+        case "$trunc": {
+          const fn = op === "$round" ? "ROUND" : "TRUNC";
+          if (!Array.isArray(val)) return `${fn}(${one(val)})`;
+          return `${fn}(${arg(val[0])}${val.length > 1 ? `, ${arg(val[1])}` : ""})`;
         }
-        case "$subtract": {
-          if (Array.isArray(val)) {
-            return `(${val.map((v) => _fieldRefOrBind(v, binds, counter)).join(" - ")})`;
-          }
-          return _fieldRef(val);
-        }
-        case "$divide": {
-          if (Array.isArray(val)) {
-            return `(${val.map((v) => _fieldRefOrBind(v, binds, counter)).join(" / ")})`;
-          }
-          return _fieldRef(val);
-        }
+        case "$literal":
+          return _bindValue(val, binds, counter);
         case "$concat": {
           if (Array.isArray(val)) {
             // "$col" is a column; any other string/number is a literal and is bound.
-            return val.map((v) => _fieldRefOrBind(v, binds, counter)).join(" || ");
+            return val.map(arg).join(" || ");
           }
-          return _fieldRef(val);
+          return one(val);
         }
         case "$toUpper":
-          return `UPPER(${_fieldRef(val)})`;
+          return `UPPER(${one(val)})`;
         case "$toLower":
-          return `LOWER(${_fieldRef(val)})`;
+          return `LOWER(${one(val)})`;
         case "$substr": {
           if (Array.isArray(val)) {
-            return `SUBSTR(${_fieldRef(val[0])}, ${Number(val[1])}, ${Number(val[2])})`;
+            return `SUBSTR(${one(val[0])}, ${Number(val[1])}, ${Number(val[2])})`;
           }
-          return _fieldRef(val);
+          return one(val);
         }
         case "$dateToString": {
           const fmt = (val.format || "YYYY-MM-DD").replace(/'/g, "''");
-          return `TO_CHAR(${_fieldRef(val.date)}, '${fmt}')`;
+          return `TO_CHAR(${one(val.date)}, '${fmt}')`;
         }
+        case "$dateTrunc": {
+          const fmt = DATE_TRUNC_UNITS[val?.unit];
+          if (!fmt) throw new Error(MSG.PIPELINE_EXPRESSION_ARGS(op, `unit one of ${Object.keys(DATE_TRUNC_UNITS).join(", ")}`));
+          return `TRUNC(${one(val.date)}, '${fmt}')`;
+        }
+        case "$dateAdd": {
+          const start = one(val?.startDate);
+          const n = arg(val?.amount);
+          switch (val?.unit) {
+            case "day":
+              return `(CAST(${start} AS DATE) + ${n})`;
+            case "week":
+              return `(CAST(${start} AS DATE) + 7 * ${n})`;
+            case "hour":
+            case "minute":
+            case "second":
+              return `(${start} + NUMTODSINTERVAL(${n}, '${String(val.unit).toUpperCase()}'))`;
+            case "month":
+              return `ADD_MONTHS(${start}, ${n})`;
+            case "quarter":
+              return `ADD_MONTHS(${start}, 3 * ${n})`;
+            case "year":
+              return `ADD_MONTHS(${start}, 12 * ${n})`;
+            default:
+              throw new Error(MSG.PIPELINE_EXPRESSION_ARGS(op, "unit one of second, minute, hour, day, week, month, quarter, year"));
+          }
+        }
+        case "$dateDiff": {
+          // Boundaries crossed between the two dates (MongoDB semantics): days between
+          // the calendar dates, months between the calendar months, and so on.
+          const s = one(val?.startDate);
+          const e = one(val?.endDate);
+          const months = (x: string) => `(EXTRACT(YEAR FROM ${x}) * 12 + EXTRACT(MONTH FROM ${x}))`;
+          switch (val?.unit) {
+            case "day":
+              return `(TRUNC(CAST(${e} AS DATE)) - TRUNC(CAST(${s} AS DATE)))`;
+            case "week":
+              return `((TRUNC(CAST(${e} AS DATE), 'IW') - TRUNC(CAST(${s} AS DATE), 'IW')) / 7)`;
+            case "month":
+              return `(${months(e)} - ${months(s)})`;
+            case "quarter":
+              return `(TRUNC((${months(e)} - 1) / 3) - TRUNC((${months(s)} - 1) / 3))`;
+            case "year":
+              return `(EXTRACT(YEAR FROM ${e}) - EXTRACT(YEAR FROM ${s}))`;
+            default:
+              throw new Error(MSG.PIPELINE_EXPRESSION_ARGS(op, "unit one of day, week, month, quarter, year"));
+          }
+        }
+        case "$lastDayOfMonth":
+          return `LAST_DAY(${one(val)})`;
+        case "$year":
+          return `EXTRACT(YEAR FROM ${one(val)})`;
+        case "$month":
+          return `EXTRACT(MONTH FROM ${one(val)})`;
+        case "$dayOfMonth":
+          return `EXTRACT(DAY FROM ${one(val)})`;
         case "$cond": {
           const { if: ifCond, then: thenVal, else: elseVal } = val;
           const condSql = _buildCondExpr(ifCond, binds, counter);
-          const thenSql = _fieldRefOrBind(thenVal, binds, counter);
-          const elseSql = _fieldRefOrBind(elseVal, binds, counter);
-          return `CASE WHEN ${condSql} THEN ${thenSql} ELSE ${elseSql} END`;
+          return `CASE WHEN ${condSql} THEN ${arg(thenVal)} ELSE ${arg(elseVal)} END`;
+        }
+        case "$switch": {
+          const branches = val?.branches;
+          if (!Array.isArray(branches) || branches.length === 0) throw new Error(MSG.PIPELINE_EXPRESSION_ARGS(op, "branches: [{ case, then }, …]"));
+          const whens = branches.map((b: DslSpec) => `WHEN ${_buildCondExpr(b.case, binds, counter)} THEN ${arg(b.then)}`);
+          const otherwise = val.default !== undefined ? ` ELSE ${arg(val.default)}` : "";
+          return `CASE ${whens.join(" ")}${otherwise} END`;
         }
         case "$ifNull": {
           if (Array.isArray(val)) {
-            const parts = val.map((v) => _fieldRefOrBind(v, binds, counter));
+            const parts = val.map(arg);
             return `COALESCE(${parts.join(", ")})`;
           }
-          return _fieldRef(val);
+          return one(val);
         }
         case "$size":
           // Number of elements in a JSON array column (19c item method size()).
-          return `JSON_VALUE(${_fieldRef(val)}, '$.size()' RETURNING NUMBER)`;
+          return `JSON_VALUE(${one(val)}, '$.size()' RETURNING NUMBER)`;
         case "$window": {
           const { buildWindowExpr } = (require("./windowFunctions") as typeof import("./windowFunctions"));
           return buildWindowExpr(val);
@@ -633,6 +708,33 @@ function _buildAggExpr(expr: Record<string, DslSpec>, binds: Record<string, unkn
     }
   }
   return String(expr);
+}
+
+/** Comparison operators usable in $cond / $switch conditions. */
+const COND_OPS: Readonly<Record<string, string>> = Object.freeze({ $gt: ">", $gte: ">=", $lt: "<", $lte: "<=", $eq: "=", $ne: "<>" });
+
+/** Units $dateTrunc accepts, with the TRUNC format each maps to. */
+const DATE_TRUNC_UNITS: Readonly<Record<string, string>> = Object.freeze({ year: "YYYY", quarter: "Q", month: "MM", week: "IW", day: "DD", hour: "HH24", minute: "MI" });
+
+/** A nested expression: a plain object whose only key is an operator, e.g. { $mul: [...] }. */
+function _isExpr(val: unknown): val is Record<string, unknown> {
+  if (!val || typeof val !== "object" || Array.isArray(val) || val instanceof Date) return false;
+  const keys = Object.keys(val);
+  return keys.length === 1 && keys[0].startsWith("$");
+}
+
+/** Bind any literal value (number, string, boolean, Date, null) and return its placeholder. */
+function _bindValue(val: unknown, binds: Record<string, unknown>, counter: Counter): string {
+  const bname = counter.next("agg");
+  binds[bname] = val;
+  return `:${bname}`;
+}
+
+/** A single-value operand: a column, a nested expression or a Date literal; other values as before. */
+function _one(val: DslSpec, binds: Record<string, unknown>, counter: Counter): string {
+  if (_isExpr(val)) return `(${_buildAggExpr(val as Record<string, DslSpec>, binds, counter)})`;
+  if (val instanceof Date) return _bindValue(val, binds, counter);
+  return _fieldRef(val);
 }
 
 /**
@@ -659,15 +761,10 @@ function _fieldRefOrBind(val: unknown, binds: Record<string, unknown>, counter: 
   if (typeof val === "string" && val.startsWith("$")) {
     return quoteIdentifier(val.substring(1));
   }
-  if (typeof val === "number" || typeof val === "boolean") {
-    const bname = counter.next("agg");
-    binds[bname] = val;
-    return `:${bname}`;
-  }
-  if (typeof val === "string") {
-    const bname = counter.next("agg");
-    binds[bname] = val;
-    return `:${bname}`;
+  if (_isExpr(val)) return `(${_buildAggExpr(val as Record<string, DslSpec>, binds, counter)})`;
+  if (val === null) return "NULL";
+  if (typeof val === "number" || typeof val === "boolean" || typeof val === "string" || typeof val === "bigint" || val instanceof Date) {
+    return _bindValue(val, binds, counter);
   }
   return String(val);
 }
@@ -676,7 +773,22 @@ function _fieldRefOrBind(val: unknown, binds: Record<string, unknown>, counter: 
  * Build a SQL condition for $cond expressions.
  * { $amount: { $gt: 100 } } → '"amount" > :cond_0'
  */
-function _buildCondExpr(cond: DslSpec, binds: Record<string, unknown>, counter: Counter) {
+function _buildCondExpr(cond: DslSpec, binds: Record<string, unknown>, counter: Counter): string {
+  // Expression form (MongoDB $expr style): { $gt: [a, b] } compares two operands,
+  // each a column, a nested expression or a literal; $and / $or / $not combine.
+  if (cond && typeof cond === "object" && !Array.isArray(cond) && Object.keys(cond).length === 1) {
+    const [k, v] = Object.entries(cond)[0];
+    const cmp = COND_OPS[k];
+    if (cmp && Array.isArray(v)) {
+      if (v.length !== 2) throw new Error(MSG.PIPELINE_EXPRESSION_ARGS(k, "two operands"));
+      if (v[1] === null && (k === "$eq" || k === "$ne")) return `${_fieldRefOrBind(v[0], binds, counter)} ${k === "$eq" ? "IS NULL" : "IS NOT NULL"}`;
+      return `${_fieldRefOrBind(v[0], binds, counter)} ${cmp} ${_fieldRefOrBind(v[1], binds, counter)}`;
+    }
+    if ((k === "$and" || k === "$or") && Array.isArray(v) && v.length > 0) {
+      return `(${v.map((c) => _buildCondExpr(c, binds, counter)).join(k === "$and" ? " AND " : " OR ")})`;
+    }
+    if (k === "$not") return `NOT (${_buildCondExpr(v, binds, counter)})`;
+  }
   // Simple condition: { field: { $gt: value } }
   if (typeof cond === "object") {
     for (const [field, ops] of Object.entries(cond)) {

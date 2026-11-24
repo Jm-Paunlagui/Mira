@@ -45,7 +45,7 @@ export async function receivablesStage(sim: Sim, ctx: Ctx, _state: State) {
   );
 
   // Receipts applied to the oldest invoice first.
-  const fifo = await sim.viaSql("receipts applied oldest invoice first (FIFO)", "needs a running total of invoices compared with total receipts and GREATEST/LEAST arithmetic; Mira's $window gives the running total but there is no GREATEST/LEAST or column-to-column expression", () =>
+  const fifo = await sim.viaSql("receipts applied oldest invoice first (FIFO)", "needs each customer's total receipts (a grouped result from another table) joined to the invoices; $lookup joins rows, not a grouped pipeline", () =>
     raw<{ INV_NO: number; OPEN_AMT: string }>(
       `WITH i AS (SELECT INV_NO, CUSTOMER, AMOUNT,
                          SUM(AMOUNT) OVER (PARTITION BY CUSTOMER ORDER BY INV_NO ROWS UNBOUNDED PRECEDING) AS CUM_END
@@ -60,7 +60,7 @@ export async function receivablesStage(sim: Sim, ctx: Ctx, _state: State) {
   sim.eq("FIFO application: open amount of every invoice", fifo.map((r) => [Number(r.INV_NO), cents(r.OPEN_AMT)]), AR_INVOICES.map((x) => [x.INV_NO, open.get(x.INV_NO)]));
 
   // Aging buckets as of year end.
-  const aging = await sim.viaSql("aging buckets as of a date", "days past due needs date arithmetic (DATE - DATE) in a projection; Mira's pipeline has only $dateToString", () =>
+  const aging = await sim.viaSql("aging buckets as of a date", "built on the FIFO open amounts above (aggregate-then-join); the date arithmetic itself is now available ($dateDiff)", () =>
     raw<{ BUCKET: string; N: number; OPEN_AMT: string }>(
       `WITH i AS (SELECT INV_NO, CUSTOMER, AMOUNT, DUE_DATE,
                          SUM(AMOUNT) OVER (PARTITION BY CUSTOMER ORDER BY INV_NO ROWS UNBOUNDED PRECEDING) AS CUM_END
