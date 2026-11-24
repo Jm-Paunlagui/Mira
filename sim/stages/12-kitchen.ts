@@ -38,19 +38,17 @@ export async function kitchenStage(sim: Sim, ctx: Ctx, state: State) {
   const used = (await sim.mira(() => bom.connectBy({ startWith: { CHILD: "SUGAR" }, connectBy: { CHILD: "$PRIOR PARENT" } }))) as { PARENT: string }[];
   sim.eq("where-used: sugar is needed by the syrup, the sweet mix and Halo-Halo", [...new Set(used.map((r) => r.PARENT))].sort(), [...whereUsed("SUGAR")].sort());
 
-  // Quantities multiplied down the levels: raw material per dish.
-  const qty = await sim.viaSql("raw material per dish (quantity explosion)", "the recursive CTE builder joins levels but cannot carry an expression (parent quantity × child quantity) down them", () =>
-    raw<{ DISH: string; ITEM: string; QTY: number }>(
-      `WITH x (DISH, ITEM, QTY) AS (
-         SELECT PARENT, CHILD, QTY FROM "${E.BOM}" WHERE PARENT IN ('P-HALO','P-ADOBO','P-SINIG')
-         UNION ALL
-         SELECT x.DISH, b.CHILD, x.QTY * b.QTY FROM x JOIN "${E.BOM}" b ON b.PARENT = x.ITEM)
-       SELECT x.DISH, x.ITEM, SUM(x.QTY) AS QTY FROM x JOIN "${E.ITEMS}" i ON i.CODE = x.ITEM
-        WHERE i.KIND = 'raw' GROUP BY x.DISH, x.ITEM ORDER BY x.DISH, x.ITEM`,
-    ),
-  );
+  // Quantities multiplied down the levels: the recursion carries the dish (PARENT) and the
+  // running quantity (QTY) to every component; .aggregate() keeps the raw ones and sums.
+  const explosion = () =>
+    api.withRecursiveCTE(db, "X", {
+      anchor: bom.find({ PARENT: { $in: DISHES } }),
+      recursive: { collection: E.BOM, joinOn: { PARENT: "$X.CHILD" }, set: { PARENT: "$prior.PARENT", QTY: { $mul: ["$prior.QTY", "$QTY"] } } },
+    });
+  const rawOnly = [{ $lookup: { from: E.ITEMS, localField: "CHILD", foreignField: "CODE", as: "i", joinType: "inner", select: ["KIND", "COST", "ON_HAND"] } }, { $match: { KIND: "raw" } }];
+  const qty = await sim.mira(() => explosion().aggregate([...rawOnly, { $group: { _id: { DISH: "$PARENT", ITEM: "$CHILD" }, QTY: { $sum: "$QTY" } } }, { $sort: { DISH: 1, ITEM: 1 } }]));
   sim.eq(
-    "quantity explosion: raw material per dish, multiplied through every level",
+    "quantity explosion (recursive set): raw material per dish, multiplied through every level",
     qty.map((r) => [r.DISH, r.ITEM, r4(r.QTY)]),
     [...DISHES].sort().flatMap((dish) => [...explode(dish)].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([item, q]) => [dish, item, r4(q)])),
   );
@@ -60,33 +58,31 @@ export async function kitchenStage(sim: Sim, ctx: Ctx, state: State) {
   for (const o of model.orders) for (const l of o.lines) if (DISHES.includes(l.sku)) sold.set(l.sku, (sold.get(l.sku) ?? 0) + l.qty);
   const need = new Map<string, number>();
   for (const [dish, n] of sold) for (const [item, q] of explode(dish)) need.set(item, (need.get(item) ?? 0) + n * q);
-  const mrp = await sim.viaSql("MRP net requirements", "needs the quantity explosion above joined to demand and on-hand, with GREATEST(0, need − on hand)", () =>
-    raw<{ ITEM: string; NET_NEED: number }>(
-      `WITH demand AS (SELECT p.SKU AS DISH, SUM(l.QTY) AS N FROM SIM_ORDER_LINES l JOIN SIM_PRODUCTS p ON p.ID = l.PRODUCT_ID
-                        WHERE p.SKU IN ('P-HALO','P-ADOBO','P-SINIG') GROUP BY p.SKU),
-            x (DISH, ITEM, QTY) AS (
-              SELECT PARENT, CHILD, QTY FROM "${E.BOM}" WHERE PARENT IN ('P-HALO','P-ADOBO','P-SINIG')
-              UNION ALL
-              SELECT x.DISH, b.CHILD, x.QTY * b.QTY FROM x JOIN "${E.BOM}" b ON b.PARENT = x.ITEM)
-       SELECT i.CODE AS ITEM, GREATEST(0, SUM(x.QTY * d.N) - i.ON_HAND) AS NET_NEED
-         FROM x JOIN demand d ON d.DISH = x.DISH JOIN "${E.ITEMS}" i ON i.CODE = x.ITEM
-        WHERE i.KIND = 'raw' GROUP BY i.CODE, i.ON_HAND ORDER BY i.CODE`,
-    ),
+  const mrp = await sim.mira(() =>
+    explosion().aggregate([
+      ...rawOnly,
+      {
+        $lookup: {
+          from: "SIM_ORDER_LINES",
+          pipeline: [{ $lookup: { from: "SIM_PRODUCTS", localField: "PRODUCT_ID", foreignField: "ID", as: "p", joinType: "inner", select: ["SKU"] } }, { $group: { _id: "$SKU", N: { $sum: "$QTY" } } }],
+          localField: "PARENT",
+          foreignField: "SKU",
+          as: "d",
+          joinType: "inner",
+          select: ["N"],
+        },
+      },
+      { $group: { _id: "$CHILD", NEED: { $sum: { $mul: ["$QTY", "$N"] } }, ON_HAND: { $max: "$ON_HAND" } } },
+      { $addFields: { NET_NEED: { $max: [0, { $subtract: ["$NEED", "$ON_HAND"] }] } } },
+      { $sort: { CHILD: 1 } },
+    ]),
   );
-  sim.eq("MRP: raw material to buy for the dishes sold (need − on hand, never negative)", mrp.map((r) => [r.ITEM, r4(r.NET_NEED)]), [...need].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([item, q]) => [item, r4(Math.max(0, q - (RAW_ON_HAND[item] ?? 0)))]));
+  sim.eq("MRP: raw material to buy for the dishes sold (need − on hand, never negative)", mrp.map((r) => [r.CHILD, r4(r.NET_NEED)]), [...need].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([item, q]) => [item, r4(Math.max(0, q - (RAW_ON_HAND[item] ?? 0)))]));
 
   // Cost roll-up: what one plate costs in raw material.
-  const cost = await sim.viaSql("dish cost roll-up", "same expression-carrying recursion as the quantity explosion", () =>
-    raw<{ DISH: string; COST: number }>(
-      `WITH x (DISH, ITEM, QTY) AS (
-         SELECT PARENT, CHILD, QTY FROM "${E.BOM}" WHERE PARENT IN ('P-HALO','P-ADOBO','P-SINIG')
-         UNION ALL
-         SELECT x.DISH, b.CHILD, x.QTY * b.QTY FROM x JOIN "${E.BOM}" b ON b.PARENT = x.ITEM)
-       SELECT x.DISH, SUM(x.QTY * i.COST) AS COST FROM x JOIN "${E.ITEMS}" i ON i.CODE = x.ITEM WHERE i.KIND = 'raw' GROUP BY x.DISH ORDER BY x.DISH`,
-    ),
-  );
+  const cost = await sim.mira(() => explosion().aggregate([...rawOnly, { $group: { _id: "$PARENT", COST: { $sum: { $mul: ["$QTY", "$COST"] } } } }, { $sort: { PARENT: 1 } }]));
   const costOf = (dish: string) => [...explode(dish)].reduce((s, [item, q]) => s + q * ITEMS.find((i) => i.CODE === item)!.COST, 0) / 100;
-  sim.eq("cost roll-up: raw-material cost of one plate", cost.map((r) => [r.DISH, r4(r.COST)]), [...DISHES].sort().map((dish) => [dish, r4(costOf(dish))]));
+  sim.eq("cost roll-up: raw-material cost of one plate", cost.map((r) => [r.PARENT, r4(r.COST)]), [...DISHES].sort().map((dish) => [dish, r4(costOf(dish))]));
 
   // A bad recipe line makes a loop (syrup needs sweet mix, which needs syrup).
   await bom.insertOne({ PARENT: "SYRUP", CHILD: "SWEET-MIX", QTY: 0.1 });

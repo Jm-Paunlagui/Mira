@@ -858,6 +858,51 @@ const orgChart = await withRecursiveCTE(db, "org", {
     .toArray();
 ```
 
+**Carrying a calculation down the levels.** `set` computes columns on each level, with `"$prior.X"` for the parent row and `"$X"` for the child row; `while` keeps recursing only while a condition holds; `.aggregate(pipeline)` runs a pipeline over the result:
+
+```js
+// Raw material per dish, quantities multiplied through every recipe level
+await withRecursiveCTE(db, "x", {
+    anchor: bom.find({ parent: { $in: ["CAKE", "PIE"] } }),
+    recursive: {
+        collection: "bom",
+        joinOn: { parent: "$x.child" },
+        set: { parent: "$prior.parent", qty: { $mul: ["$prior.qty", "$qty"] } }, // keep the dish, multiply the quantity
+    },
+}).aggregate([{ $group: { _id: { dish: "$parent", item: "$child" }, qty: { $sum: "$qty" } } }]);
+
+// A loan schedule from a one-row table of terms: each instalment from the previous balance
+await withRecursiveCTE(db, "a", {
+    anchor: terms.find({}),
+    recursive: {
+        collection: "terms",
+        joinOn: {}, // no join: the row recurses on itself — needs `while`
+        set: { n: { $add: ["$prior.n", 1] }, bal: { $subtract: ["$prior.bal", { $subtract: ["$pmt", { $round: { $mul: ["$prior.bal", 0.0075] } }] }] } },
+        while: { $lt: ["$prior.n", 12] },
+    },
+}).toArray();
+```
+
+`set` can only compute the anchor table's own columns. An empty `joinOn` must have a `while`; a `joinOn` recursion keeps Oracle's own cycle check, so looping data stops with ORA-32044 instead of running forever.
+
+### Series (Row Generator)
+
+`series(db, { start, end, step?, unit?, as? })` gives one row per value from `start` to `end` inclusive: numbers, or dates by `day` / `week` / `month` / `quarter` / `year`. Use `.toArray()` or `.aggregate(pipeline)`:
+
+```js
+const { series } = require("./oracle-mongo-wrapper");
+
+// Month-ends of 2026 (a depreciation schedule)
+await series(db, { start: new Date(2026, 0, 1), end: new Date(2026, 11, 1), unit: "month", as: "m" })
+    .aggregate([{ $project: { d: { $lastDayOfMonth: "$m" } } }]);
+
+// A calendar with daily sales, zero on days without a sale
+await series(db, { start: new Date(2026, 9, 1), end: new Date(2026, 11, 31), unit: "day", as: "d" }).aggregate([
+    { $lookup: { from: "sales", pipeline: [{ $group: { _id: "$day", q: { $sum: "$qty" } } }], localField: "d", foreignField: "day", as: "s", joinType: "left", select: ["Q"] } },
+    { $project: { d: 1, sold: { $ifNull: ["$Q", 0] } } },
+]);
+```
+
 ### CONNECT BY (Oracle Hierarchical Queries)
 
 Oracle's native syntax for tree traversal (alternative to recursive CTEs):
@@ -1317,7 +1362,7 @@ bun run test:unit       # or :integration / :performance / :chaos / :security / 
 14. **Audit:** Benford, journals without lines, split payments
 15. **Operations:** pool stats, health, shutdown
 
-Business queries Mira's API cannot express (for example `MATCH_RECOGNIZE`, `CONNECT_BY_ROOT`, recursion that carries a calculation) run as hand-written SQL, are still checked, and are listed at the end as **coverage gaps** with the reason: a measured list of what Mira could support next.
+Every business query runs through Mira's API (50 of 50 today). A query Mira could not express would run as hand-written SQL, still be checked, and be listed at the end as a **coverage gap** with the reason, so any new gap shows up as a measured item for what Mira should support next.
 
 Every result is checked against an in-memory model of the business or a hand-written SQL read. Then the run proves that **every public Mira function was called** (`sim/lib/tracker.ts`), and lists any that were not.
 

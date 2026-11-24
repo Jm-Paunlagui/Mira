@@ -70,7 +70,7 @@ Fix order: the five silent wrong-data defects (6, 7, 10, 11, 16) come first. Fol
 
 ### Coverage gaps closed (phases 1–3, branch `feat/coverage-gaps`)
 
-17 gaps → 6. Through Mira now: ROLLUP subtotals (GROUPING flags), inventory FIFO cost, ABC classes, penny allocation (expression engine), stock-out runs and split payments (`$matchRecognize`), recipe cycle detection (`includeIsCycle`), receivables FIFO and aging (`$lookup` pipeline, `$dateDiff`, `$switch`), the account-tree roll-up (`$connectBy` stage), FX at the rate in force (outer `$lateralJoin`). Remaining: recursion that carries a calculation (quantity explosion, MRP, cost roll-up, loan schedule) and row generators (depreciation dates, calendar densification).
+17 gaps → 6. Through Mira now: ROLLUP subtotals (GROUPING flags), inventory FIFO cost, ABC classes, penny allocation (expression engine), stock-out runs and split payments (`$matchRecognize`), recipe cycle detection (`includeIsCycle`), receivables FIFO and aging (`$lookup` pipeline, `$dateDiff`, `$switch`), the account-tree roll-up (`$connectBy` stage), FX at the rate in force (outer `$lateralJoin`). Phase 4 (branch `feat/recursion-generators`) closed the rest: `withRecursiveCTE` `set` / `while` / `.aggregate()` (quantity explosion, MRP, cost roll-up, loan schedule) and `series()` (depreciation month-ends, calendar densification). **All 17 gaps closed: 50 of 50 business queries run through Mira's API.**
 
 ## 1.2 Sim expansion plan (built: stages 9–14)
 

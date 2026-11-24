@@ -7,7 +7,9 @@
 import type { Ctx } from "../lib/context";
 import { cents, type Sim } from "../lib/harness";
 import { STORES, T, type State } from "../lib/data";
-import { DEPRECIATION_MONTHLY, E, FX, IMPORTS, LOAN, allocate, amortize, convert, iso } from "../lib/enterprise";
+import { DEPRECIATION_MONTHLY, E, FX, IMPORTS, LOAN, allocate, amortize, convert, d, iso } from "../lib/enterprise";
+
+const LOAN_TERMS = "SIM_LOAN_TERMS";
 
 export async function financeStage(sim: Sim, ctx: Ctx, state: State) {
   const { api, db, raw } = ctx;
@@ -33,33 +35,34 @@ export async function financeStage(sim: Sim, ctx: Ctx, state: State) {
   sim.eq("FX: each import in pesos at the rate in force that day; no JPY rate → no amount", fx.map((r) => [r.INV_NO, r.PHP == null ? null : cents(r.PHP)]), IMPORTS.map((x) => [x.INV_NO, convert(x)]));
 
   // ── Loan schedule (recursive) vs what the ledger posted ─────────────────────
-  const sched = await sim.viaSql("loan amortization schedule", "a running balance where each row depends on the previous row's result needs a recursive WITH carrying expressions (or MODEL)", () =>
-    raw<{ N: number; INTEREST: number; PRINCIPAL: number; BAL: number }>(
-      `WITH pay AS (SELECT ROUND(:p * :r / (1 - POWER(1 + :r, -:m))) AS PMT FROM DUAL),
-            a (N, BAL, INTEREST, PRINCIPAL) AS (
-              SELECT 0, :p, 0, 0 FROM DUAL
-              UNION ALL
-              SELECT a.N + 1,
-                     a.BAL - CASE WHEN a.N + 1 = :m THEN a.BAL ELSE (SELECT PMT FROM pay) - ROUND(a.BAL * :r) END,
-                     ROUND(a.BAL * :r),
-                     CASE WHEN a.N + 1 = :m THEN a.BAL ELSE (SELECT PMT FROM pay) - ROUND(a.BAL * :r) END
-                FROM a WHERE a.N < :m)
-       SELECT N, INTEREST, PRINCIPAL, BAL FROM a WHERE N > 0 ORDER BY N`,
-      { p: LOAN.PRINCIPAL, r: LOAN.RATE_MONTH, m: LOAN.MONTHS },
-    ),
-  );
+  // The schedule as a recursion over a one-row table of loan terms: each instalment is computed
+  // from the previous balance ($prior), the last one clears the balance; while stops at the term.
   const loan = amortize();
-  sim.eq("loan: interest, principal and balance for all 12 instalments", sched.map((r) => [Number(r.N), Number(r.INTEREST), Number(r.PRINCIPAL), Number(r.BAL)]), loan.rows.map((r) => [r.n, r.interest, r.principal, r.balance]));
+  await schema.createTable(LOAN_TERMS, { N: { type: "NUMBER" }, BAL: { type: "NUMBER" }, INTEREST: { type: "NUMBER" }, PRINCIPAL: { type: "NUMBER" }, PMT: { type: "NUMBER" } });
+  await coll(LOAN_TERMS).insertMany([{ N: 0, BAL: LOAN.PRINCIPAL, INTEREST: 0, PRINCIPAL: 0, PMT: loan.pay }], { returning: [] });
+  const interest = { $round: { $mul: ["$prior.BAL", LOAN.RATE_MONTH] } };
+  const principal = { $cond: { if: { $eq: [{ $add: ["$prior.N", 1] }, LOAN.MONTHS] }, then: "$prior.BAL", else: { $subtract: ["$PMT", interest] } } };
+  const sched = await sim.mira(() =>
+    api.withRecursiveCTE(db, "A", {
+      anchor: coll(LOAN_TERMS).find({}),
+      recursive: { collection: LOAN_TERMS, joinOn: {}, set: { N: { $add: ["$prior.N", 1] }, INTEREST: interest, PRINCIPAL: principal, BAL: { $subtract: ["$prior.BAL", principal] } }, while: { $lt: ["$prior.N", LOAN.MONTHS] } },
+    })
+      .sort({ N: 1 })
+      .skip(1)
+      .toArray<{ N: number; INTEREST: number; PRINCIPAL: number; BAL: number }>(),
+  );
+
+  sim.eq("loan (recursive set / while): interest, principal and balance for all 12 instalments", sched.map((r) => [Number(r.N), Number(r.INTEREST), Number(r.PRINCIPAL), Number(r.BAL)]), loan.rows.map((r) => [r.n, r.interest, r.principal, r.balance]));
   const loanGl = await sim.mira(() => lines.aggregate([postedOnly, { $match: { STATUS: "posted", ACCOUNT_CODE: { $in: ["2400", "5400"] }, DEBIT: { $gt: 0 } } }, { $group: { _id: "$ACCOUNT_CODE", D: { $sum: "$DEBIT" } } }, { $sort: { ACCOUNT_CODE: 1 } }]));
   sim.eq("ledger: principal repaid and interest expensed match the schedule", loanGl.map((r) => [r.ACCOUNT_CODE, cents(r.D)]), [["2400", LOAN.PRINCIPAL], ["5400", loan.rows.reduce((s, r) => s + r.interest, 0)]]);
   sim.eq("loan account is fully repaid", model.gl.filter((l) => l.acct === "2400" && l.status === "posted").reduce((s, l) => s + l.dr - l.cr, 0), 0);
 
   // ── Depreciation schedule (row generator) vs the ledger ────────────────────
-  const dep = await sim.viaSql("depreciation schedule (month-end dates)", "a row generator (CONNECT BY LEVEL) and date functions (ADD_MONTHS, LAST_DAY) are not exposed", () =>
-    raw<{ D: string }>(`SELECT TO_CHAR(LAST_DAY(ADD_MONTHS(DATE '2026-01-01', LEVEL - 1)), 'YYYY-MM-DD') AS D FROM DUAL CONNECT BY LEVEL <= 12`),
+  const dep = await sim.mira(() =>
+    api.series(db, { start: d(2026, 1, 1), end: d(2026, 12, 1), unit: "month", as: "M" }).aggregate([{ $project: { D: { $dateToString: { date: { $lastDayOfMonth: "$M" }, format: "YYYY-MM-DD" } } } }, { $sort: { D: 1 } }]),
   );
   const depGl = await sim.mira(() => lines.aggregate([postedOnly, { $match: { STATUS: "posted", ACCOUNT_CODE: "5300", DEBIT: { $gt: 0 } } }, { $sort: { JDATE: 1 } }]));
-  sim.eq("depreciation: one 2,000.00 charge on each month-end of the schedule", depGl.map((r) => [iso(r.JDATE as Date), cents(r.DEBIT)]), dep.map((r) => [r.D, DEPRECIATION_MONTHLY]));
+  sim.eq("depreciation: one 2,000.00 charge on each month-end (series of months → $lastDayOfMonth)", depGl.map((r) => [iso(r.JDATE as Date), cents(r.DEBIT)]), dep.map((r) => [r.D, DEPRECIATION_MONTHLY]));
 
   // ── Sales CUBE and GROUPING SETS ───────────────────────────────────────────
   const orders = coll(T.ORDERS);
