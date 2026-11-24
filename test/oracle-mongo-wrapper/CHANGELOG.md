@@ -1,5 +1,82 @@
 # Changelog
 
+## [2.0.0] — 2026-11-24
+
+Major release: TypeScript on Bun, and a far more capable wrapper. Full notes: GitHub release `v2.0.0`.
+
+### Breaking
+
+- **Runtime:** TypeScript on Bun ≥ 1.4 (`.ts` sources, `bun.lock`, `main` → `src/utils/oracle-mongo-wrapper/index.ts`). Tests run on `bun test`; mocha and chai are removed.
+- **Driver:** oracledb 7.0.1. Thick mode needs Oracle Client 19c or later.
+- **Connections:** the `userAccount` / `unitInventory` registry is replaced by `appDb` / `appDbBulk` on `APP_DB_*` credentials. There is an optional test-database switch (`NODE_ENV=development` + `APP_TEST_DB_USERNAME`).
+- **Behaviour fixes that change results:**
+  - `$eq` / `$ne` with null → `IS [NOT] NULL`.
+  - `$now` → database wall-clock time (`withTimeZone: true` for TIMESTAMP WITH TIME ZONE columns).
+  - `findOneAndUpdate` / `findOneAndReplace` change one row.
+  - `bulkWrite` joins a session's transaction.
+  - `skip locked` + `limit` locks while fetching.
+  - Locking reads never auto-commit.
+  - Filter `$case` / `$coalesce` / `$nullif` compare the field.
+  - Views from filtered queries inline their literals.
+  - Unknown stages, operators and join types throw.
+  - Window, PIVOT, subquery and set-operation options are allow-listed or integer-only.
+  - `$merge` needs `fields`.
+  - `isHealthy()` is false after `closePool()`.
+
+### Added
+
+- **Expression engine:**
+  - nesting everywhere; aggregates over expressions
+  - `$abs` `$ceil` `$floor` `$round` `$trunc` `$mod` `$literal`
+  - GREATEST / LEAST
+  - `$switch`
+  - `$dateDiff` `$dateAdd` `$dateTrunc` `$lastDayOfMonth` `$year` `$month` `$dayOfMonth`
+  - column-to-column conditions with `$and` / `$or` / `$not`
+  - `grouping: true` subtotal flags
+- **`$matchRecognize` stage**, with `$prev` / `$next`.
+- **`connectBy` columns:** `root`, `includeIsLeaf`, `includeIsCycle`, `pathColumn`.
+- **Joins and trees in the pipeline:**
+  - `$lookup` with a `pipeline`
+  - `$lateralJoin` with `outer: true`
+  - a `$connectBy` stage
+  - nested pipelines hoisted into the outer WITH
+- **Recursion and generators:**
+  - `withRecursiveCTE` `set` / `while` / `.aggregate()`
+  - `series()` row generator
+- **Collections and transactions:**
+  - `insertMany` `returning` / `batchErrors`
+  - `bulkUpdateByKeys`
+  - `session.execute()`
+  - `$in` over 1,000 values as one collection bind
+  - `forUpdate` `{ of, wait, nowait, skipLocked }`
+  - precise `$currentDate` timestamps
+
+### Fixed
+
+- **43 defects, each proven by a failing test first.** About ten of them returned wrong data with no error:
+  - time zone (`$now`)
+  - null comparisons
+  - bind-name clashes
+  - multi-row find-and-modify
+  - `bulkWrite` and the session
+  - SKIP LOCKED queues
+  - lateral cross join
+  - async `forEach`
+  - silently skipped stages
+  - lost money digits
+- The full list is in the GitHub release `v2.0.0`.
+
+### Security
+
+- Window, frame, PIVOT, subquery and set-operation options are no longer spliced into SQL.
+- Bind names are cleaned.
+- `$in` lists are linear-time (DoS).
+
+### Tests
+
+- **363 / 363** (unit, integration, performance, chaos, security, reliability), 100% lines and functions, on a live Oracle 19c.
+- **`bun run sim`:** 287 / 287 checks, 119 / 119 public functions, 50 / 50 business queries through Mira.
+
 ## [1.0.5] — 2026-04-05
 
 ### Security
