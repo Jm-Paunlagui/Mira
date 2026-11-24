@@ -26,13 +26,14 @@ Oracle Database
 - [Hard — Aggregation, Transactions & Joins](#-hard--aggregation-transactions--joins)
 - [Advanced — Window Functions, CTEs, Hierarchies & More](#-advanced--window-functions-ctes-hierarchies--more)
 - [Operator Reference](#operator-reference)
+- [Testing](#testing)
 
 ---
 
 ## Setup
 
 ```bash
-npm install oracledb  # peer dependency — should already be in parent project
+bun add oracledb  # peer dependency — should already be in parent project
 ```
 
 ### Prerequisites — Database Configuration
@@ -42,86 +43,86 @@ Before using `oracle-mongo-wrapper`, you need 3 config files and a `.env` file. 
 ```
 src/config/
 ├── adapters/
-│   └── oracle.js       ← Pool management: creates/reuses connection pools,
+│   └── oracle.ts       ← Pool management: creates/reuses connection pools,
 │                          withConnection(), withTransaction(), health monitoring
-├── database.js          ← Connection registry: maps names like "userAccount"
+├── database.ts          ← Connection registry: maps names like "appDb"
 │                          to { user, password, connectString } credentials
-└── index.js             ← Adapter factory: exports everything from the active
-                           adapter + database.js as one unified import
+└── index.ts             ← Adapter factory: exports everything from the active
+                           adapter + database.ts as one unified import
 ```
 
 **How it flows:**
 
 ```
-.env  →  database.js (reads credentials)  →  oracle.js (creates pools)  →  config/index.js (exports API)
+.env  →  database.ts (reads credentials)  →  oracle.ts (creates pools)  →  config/index.ts (exports API)
                                                                                     ↓
-                                                                           oracle-mongo-wrapper/db.js
-                                                                           createDb("userAccount")
+                                                                           oracle-mongo-wrapper/db.ts
+                                                                           createDb("appDb")
 ```
 
 #### Step 1 — Set Up Your `.env` File
 
-Create a `.env` file in your project root with your Oracle database credentials:
+Copy `.env.example` to `.env` and fill in your Oracle details. The essentials:
 
 ```env
-# ── Database connection ──────────────────────────────────────
-NODE_ENV=development
 DB_TYPE=oracle
-
-# Connection details (used by database.js to build connect strings)
 DB_HOST=your-oracle-host.example.com
 DB_PORT=1521
-DB_SERVICE_NAME=ORCL
+# Used as the Oracle SID: (CONNECT_DATA=(SID=<value>)). Typical SIDs: XE, ORCL.
+DB_APP_SERVICE_NAME=ORCL
 
-# "userAccount" connection credentials
-UA_DB_USERNAME=your_username
-UA_DB_PASSWORD=your_password
+# Credentials shared by the appDb and appDbBulk pools
+APP_DB_USERNAME=your_schema_user
+APP_DB_PASSWORD=your_schema_password
 
-# Add more connections as needed — just follow the pattern
-# for environment-specific configs, you can do:
-SI_DB_USERNAME=inventory_user
-SI_DB_PASSWORD=inventory_pass
-SI_TEST_DB_USERNAME=test_user
-SI_TEST_DB_PASSWORD=test_pass
-DB_TEST_HOST=test-oracle-host.example.com
-DB_TEST_PORT=1521
-DB_TEST_SID=TESTDB
-
-# ── Oracle Instant Client (optional) ────────────────────────
-# Path to Oracle Instant Client directory. If not set, the system PATH is used.
-ORACLE_INSTANT_CLIENT=C:\oracle\instantclient_23_0
+# Optional: Instant Client directory enables Thick mode; blank = Thin mode
+ORACLE_INSTANT_CLIENT=
 ```
 
-#### Step 2 — Register Connections in `database.js`
+Pool sizing (`APP_POOL_*`, `APP_BULK_*`) and logging (`LOG_*`) are documented in `.env.example`.
 
-Each connection gets a name (like `"userAccount"`) and its credentials from `.env`. You never hardcode passwords here — only `process.env` references.
+**Test database (optional):** with `NODE_ENV=development` and `APP_TEST_DB_USERNAME` set, both pools connect with `APP_TEST_DB_USERNAME` / `APP_TEST_DB_PASSWORD` instead. `DB_TEST_HOST` / `DB_TEST_PORT` / `DB_TEST_SID` fall back to the main values, so a test schema on the same server needs only its credentials.
 
-```js
-// src/config/database.js (already set up — add new connections as needed)
+#### Step 2 — Register Connections in `database.ts`
+
+Each connection gets a name and its credentials from `.env`. You never hardcode passwords here — only `process.env` references. Two pools ship, on the same credentials:
+
+- **`appDb`** — interactive work; the default for `createDb("appDb")`.
+- **`appDbBulk`** — long-held work (exports, backups, bulk loads) so it cannot starve `appDb`.
+
+```ts
+// src/config/database.ts (already set up — add new connections as needed)
 
 const connections = {
-    // This is called with: createDb("userAccount")
-    userAccount: {
-        user: process.env.UA_DB_USERNAME,
-        password: process.env.UA_DB_PASSWORD,
-        connectString: `${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_SERVICE_NAME}`,
+    appDb: {
+        ...appDbCredentials, // APP_DB_USERNAME / APP_DB_PASSWORD / DB_HOST:DB_PORT, SID DB_APP_SERVICE_NAME
+        poolMin: parseInt(process.env.APP_POOL_MIN ?? "", 10) || 5,
+        poolMax: parseInt(process.env.APP_POOL_MAX ?? "", 10) || 20,
+        queueMax: parseInt(process.env.APP_QUEUE_MAX ?? "", 10) || 40,
+        poolTimeout: nonNegativeInt(process.env.APP_POOL_TIMEOUT, 30),
     },
+
+    appDbBulk: { ...appDbCredentials, poolMin: 1, poolMax: 6 /* APP_BULK_* in .env */ },
 
     // Add more connections as needed:
     // reportingDb: {
     //     user:          process.env.RPT_DB_USERNAME,
     //     password:      process.env.RPT_DB_PASSWORD,
-    //     connectString: `${process.env.RPT_DB_HOST}:${process.env.RPT_DB_PORT}/${process.env.RPT_DB_SERVICE}`,
-    //     poolMax:       10,   // optional — override default pool size
+    //     connectString: buildSimpleConnectString(
+    //         process.env.RPT_DB_HOST,
+    //         process.env.RPT_DB_PORT,
+    //         process.env.RPT_DB_SERVICE_NAME,
+    //     ),
+    //     poolMax: 10, // optional — override default pool size
     // },
 };
 ```
 
 > **To add a new connection:** Add env vars to `.env`, add one entry to `connections`, then use `createDb("yourNewName")`. No other file needs to change.
 
-#### Step 3 — The Adapter (`oracle.js`) Handles the Rest
+#### Step 3 — The Adapter (`oracle.ts`) Handles the Rest
 
-You don't need to edit `oracle.js` — it automatically:
+You don't need to edit `oracle.ts` — it automatically:
 
 - Creates connection pools on first use (lazy initialization)
 - Retries failed connections up to 3 times with exponential backoff
@@ -129,7 +130,7 @@ You don't need to edit `oracle.js` — it automatically:
 - Releases connections automatically after each operation
 - Handles graceful shutdown
 
-**Key pool defaults** (configurable per-connection in `database.js`):
+**Key pool defaults** (configurable per-connection in `database.ts`):
 
 | Setting          | Default | What it means                          |
 | ---------------- | ------- | -------------------------------------- |
@@ -138,22 +139,23 @@ You don't need to edit `oracle.js` — it automatically:
 | `poolIncrement`  | 5       | How many to add when pool is exhausted |
 | `poolTimeout`    | 30s     | Idle connection timeout                |
 | `connectTimeout` | 15s     | Max wait to establish a connection     |
-| `callTimeout`    | 60s     | Max wait for a query to return         |
+| `queueMax`       | 40      | Acquire-queue depth before NJS-076     |
+| `callTimeout`    | 60s     | Documentation only: node-oracledb ignores it at pool level; set `conn.callTimeout` per connection |
 | `stmtCacheSize`  | 50      | Cached prepared statements per conn    |
 
-#### Step 4 — `config/index.js` Ties It Together
+#### Step 4 — `config/index.ts` Ties It Together
 
 This file auto-detects the adapter from `DB_TYPE` env var (defaults to `"oracle"`) and exports everything:
 
 ```js
-// src/config/index.js — you usually don't need to edit this
+// src/config/index.ts — you usually don't need to edit this
 // It exports: withConnection, withTransaction, withBatchConnection,
 //             closeAll, getPoolStats, isPoolHealthy, getConnectionConfig,
 //             oracledb, and more.
 ```
 
-The wrapper's `db.js` imports from this file, so when you call `createDb("userAccount")`, it flows through:
-`createDb() → config/index.js → config/adapters/oracle.js → database.js credentials → Oracle pool`
+The wrapper's `db.ts` imports from this file, so when you call `createDb("appDb")`, it flows through:
+`createDb() → config/index.ts → config/adapters/oracle.ts → database.ts credentials → Oracle pool`
 
 ### Imports & Connection
 
@@ -170,8 +172,8 @@ const {
     createPerformance,
 } = require("./oracle-mongo-wrapper");
 
-// Connect to your database pool (configured in src/config/database.js)
-const db = createDb("userAccount");
+// Connect to your database pool (configured in src/config/database.ts)
+const db = createDb("appDb");
 ```
 
 That's it. `db` is your gateway to everything.
@@ -1170,5 +1172,28 @@ await employees.merge(
     { whenMatched: { $set: { salary: 60000 } }, whenNotMatched: "insert" },
 );
 ```
+
+## Testing
+
+The suite runs on `bun test` against a real Oracle schema (the `appDb` connection in `.env`). It is split into six categories, one folder each under `test/`:
+
+| Category | What it proves |
+| --- | --- |
+| `unit` | SQL builders, error paths (stub connections), config, and the adapter (stub driver: pool lifecycle, retries, health monitor, shutdown) |
+| `integration` | Every collection, query, transaction, DDL, DCL and performance-utility method against the live schema |
+| `performance` | Throughput / latency floors; numbers recorded per run |
+| `chaos` | Dead host, bad credentials, pool exhaustion, cancelled calls, dropped connections, deadlocks, injected mid-transaction crashes, fuzzed filters |
+| `security` | Injection payloads (values, identifiers, raw-SQL splice points), secret redaction in errors, least privilege, resource abuse |
+| `reliability` | No lost updates or leaked connections, idempotent upserts, exact data round-trips, soak stability |
+
+```bash
+bun run test            # all six categories
+bun run test:coverage   # + coverage (threshold 100% lines/functions for src/config and the wrapper)
+bun run test:unit       # or :integration / :performance / :chaos / :security / :reliability
+```
+
+**Database prerequisites.** The schema user needs `CREATE TABLE`, `CREATE VIEW`, `CREATE SEQUENCE`, `CREATE SYNONYM`, `CREATE MATERIALIZED VIEW` and a tablespace quota (`ALTER USER <user> QUOTA UNLIMITED ON USERS;`). Every suite creates its own `MIRA_<suite>_*` tables and drops them afterwards.
+
+**Results.** The runner prints a scorecard per category. Tests named `DEFECT:` / `SECURITY:` assert the *fixed* behaviour of a known open issue and are reported separately from unexpected failures. Each run is stored under one `RUN_ID` in two tables that are kept between runs: `MIRA_TEST_RESULTS` (one row per test) and `MIRA_TEST_METRICS` (latencies, throughput, counts). Set `MIRA_SKIP_PERSIST=1` to skip writing them; performance budgets can be tightened with `MIRA_PERF_*` env vars (see `test/performance/perf.test.ts`).
 
 ## Apache License 2.0 © 2026 John Moises Paunlagui. All rights reserved. See LICENSE.txt for details.

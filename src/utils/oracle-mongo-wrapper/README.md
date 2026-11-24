@@ -32,7 +32,7 @@ Oracle Database
 ## Setup
 
 ```bash
-npm install oracledb  # peer dependency — should already be in parent project
+bun add oracledb  # peer dependency — should already be in parent project
 ```
 
 ### Prerequisites — Database Configuration
@@ -44,8 +44,9 @@ src/config/
 ├── adapters/
 │   └── oracle.js       ← Pool management: creates/reuses connection pools,
 │                          withConnection(), withTransaction(), health monitoring
-├── database.js          ← Connection registry: maps names like "userAccount"
+├── database.js          ← Connection registry: maps names like "appDb"
 │                          to { user, password, connectString } credentials
+│                          via buildSimpleConnectString / buildTNSConnectString
 └── index.js             ← Adapter factory: exports everything from the active
                            adapter + database.js as one unified import
 ```
@@ -56,7 +57,7 @@ src/config/
 .env  →  database.js (reads credentials)  →  oracle.js (creates pools)  →  config/index.js (exports API)
                                                                                     ↓
                                                                            oracle-mongo-wrapper/db.js
-                                                                           createDb("userAccount")
+                                                                           createDb("appDb")
 ```
 
 #### Step 1 — Set Up Your `.env` File
@@ -64,60 +65,75 @@ src/config/
 Create a `.env` file in your project root with your Oracle database credentials:
 
 ```env
-# ── Database connection ──────────────────────────────────────
+# ── Database engine ──────────────────────────────────────────
 NODE_ENV=development
-DB_TYPE=oracle
+DB_TYPE=oracle               # oracle is the only adapter today (MySQL/Postgres planned)
 
-# Connection details (used by database.js to build connect strings)
-DB_HOST=your-oracle-host.example.com
+# ── Connection details (used by database.js to build the connect string) ──
+DB_HOST=localhost
 DB_PORT=1521
-DB_SERVICE_NAME=ORCL
+DB_APP_SERVICE_NAME=XEPDB1   # service name (Simple/EZConnect) or SID (TNS) of your DB
 
-# "userAccount" connection credentials
-UA_DB_USERNAME=your_username
-UA_DB_PASSWORD=your_password
+# ── "appDb" connection credentials — the one connection a fresh template needs ──
+APP_DB_USERNAME=your_schema_user
+APP_DB_PASSWORD=your_schema_password
 
-# Add more connections as needed — just follow the pattern
-# for environment-specific configs, you can do:
-SI_DB_USERNAME=inventory_user
-SI_DB_PASSWORD=inventory_pass
-SI_TEST_DB_USERNAME=test_user
-SI_TEST_DB_PASSWORD=test_pass
-DB_TEST_HOST=test-oracle-host.example.com
-DB_TEST_PORT=1521
-DB_TEST_SID=TESTDB
+# Optional per-connection pool sizing (falls back to 2 / 10 when unset)
+APP_POOL_MIN=2
+APP_POOL_MAX=10
 
-# ── Oracle Instant Client (optional) ────────────────────────
-# Path to Oracle Instant Client directory. If not set, the system PATH is used.
-ORACLE_INSTANT_CLIENT=C:\oracle\instantclient_23_0
+# Add more connections by defining their own env vars, e.g.:
+# RPT_DB_USERNAME=reporting_user
+# RPT_DB_PASSWORD=reporting_pass
+# RPT_DB_HOST=localhost
+# RPT_DB_PORT=1521
+# RPT_DB_SERVICE_NAME=XEPDB1
+
+# ── Oracle Instant Client ────────────────────────────────────
+# Required for node-oracledb Thick mode. Point at the unzipped Instant Client folder.
+ORACLE_INSTANT_CLIENT=C:\oracle\instantclient_23_8
 ```
 
 #### Step 2 — Register Connections in `database.js`
 
-Each connection gets a name (like `"userAccount"`) and its credentials from `.env`. You never hardcode passwords here — only `process.env` references.
+Each connection gets a name (like `"appDb"`) and its credentials from `.env`. You never hardcode passwords here — only `process.env` references. Two helpers build the connect string for you:
+
+- `buildSimpleConnectString(host, port, service)` → `"host:port/service"` (EZConnect — simplest)
+- `buildTNSConnectString(host, port, sid)` → full `(DESCRIPTION=(ADDRESS=…)…)` with load-balance + failover
 
 ```js
-// src/config/database.js (already set up — add new connections as needed)
+// src/config/database.ts (already set up — add new connections as needed)
 
 const connections = {
-    // This is called with: createDb("userAccount")
-    userAccount: {
-        user: process.env.UA_DB_USERNAME,
-        password: process.env.UA_DB_PASSWORD,
-        connectString: `${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_SERVICE_NAME}`,
-    },
+  // appDb — the only connection a fresh template needs. Used by createDb("appDb").
+  // Skipped entirely when DEMO_MODE=true (no Oracle pool is opened).
+  appDb: {
+    user: process.env.APP_DB_USERNAME,
+    password: process.env.APP_DB_PASSWORD,
+    connectString: buildTNSConnectString(
+      process.env.DB_HOST,
+      process.env.DB_PORT,
+      process.env.DB_APP_SERVICE_NAME,
+    ),
+    poolMin: parseInt(process.env.APP_POOL_MIN, 10) || 2,
+    poolMax: parseInt(process.env.APP_POOL_MAX, 10) || 10,
+  },
 
-    // Add more connections as needed:
-    // reportingDb: {
-    //     user:          process.env.RPT_DB_USERNAME,
-    //     password:      process.env.RPT_DB_PASSWORD,
-    //     connectString: `${process.env.RPT_DB_HOST}:${process.env.RPT_DB_PORT}/${process.env.RPT_DB_SERVICE}`,
-    //     poolMax:       10,   // optional — override default pool size
-    // },
+  // Add more connections as needed (EZConnect example):
+  // reportingDb: {
+  //   user:          process.env.RPT_DB_USERNAME,
+  //   password:      process.env.RPT_DB_PASSWORD,
+  //   connectString: buildSimpleConnectString(
+  //     process.env.RPT_DB_HOST,
+  //     process.env.RPT_DB_PORT,
+  //     process.env.RPT_DB_SERVICE_NAME,
+  //   ),
+  //   poolMax: 10, // optional — overrides the global default
+  // },
 };
 ```
 
-> **To add a new connection:** Add env vars to `.env`, add one entry to `connections`, then use `createDb("yourNewName")`. No other file needs to change.
+> **To add a new connection:** Add env vars to `.env`, add one entry to `connections` (reusing `buildSimpleConnectString` / `buildTNSConnectString`), then use `createDb("yourNewName")`. No other file needs to change.
 
 #### Step 3 — The Adapter (`oracle.js`) Handles the Rest
 
@@ -146,13 +162,13 @@ You don't need to edit `oracle.js` — it automatically:
 This file auto-detects the adapter from `DB_TYPE` env var (defaults to `"oracle"`) and exports everything:
 
 ```js
-// src/config/index.js — you usually don't need to edit this
+// src/config/index.ts — you usually don't need to edit this
 // It exports: withConnection, withTransaction, withBatchConnection,
 //             closeAll, getPoolStats, isPoolHealthy, getConnectionConfig,
 //             oracledb, and more.
 ```
 
-The wrapper's `db.js` imports from this file, so when you call `createDb("userAccount")`, it flows through:
+The wrapper's `db.js` imports from this file, so when you call `createDb("appDb")`, it flows through:
 `createDb() → config/index.js → config/adapters/oracle.js → database.js credentials → Oracle pool`
 
 ### Imports & Connection
@@ -170,8 +186,8 @@ const {
     createPerformance,
 } = require("./oracle-mongo-wrapper");
 
-// Connect to your database pool (configured in src/config/database.js)
-const db = createDb("userAccount");
+// Connect to your database pool (configured in src/config/database.ts)
+const db = createDb("appDb");
 ```
 
 That's it. `db` is your gateway to everything.
@@ -217,6 +233,27 @@ await users.insertMany([
     { name: "Maria", email: "maria@email.com" },
     { name: "Pedro", email: "pedro@email.com" },
 ]);
+
+// insertMany options:
+//   returning    — column names to RETURN per inserted row. Defaults to
+//                  ["ID"] (backward compatible). Pass [] for tables whose
+//                  key column is not named ID. Intended for NUMBER keys.
+//   batchErrors  — when true, a row-level error (e.g. ORA-00001) rejects
+//                  ONLY that row; the rest of the batch still inserts and
+//                  result.batchErrors lists { offset, message } per failure.
+//                  Mutually exclusive with a non-empty `returning`.
+const r1 = await accounts.insertMany(rows, { returning: ["ACCOUNT_ID"] });
+// r1.returning → [{ ACCOUNT_ID: 7 }, { ACCOUNT_ID: 8 }, …]
+
+const r2 = await orders.insertMany(rows, {
+    returning: [],
+    batchErrors: true,
+});
+// r2.batchErrors → [{ offset: 3, message: "ORA-00001: …" }]
+
+// Session binding: inside Transaction sessions, insertMany joins the
+// surrounding transaction (same rule as insertOne):
+//   await session.collection("T_ACCOUNTS").insertMany(rows, { returning: [] });
 ```
 
 ### Find Data
@@ -246,6 +283,19 @@ await users.updateOne(
 
 // Update all rows matching a filter
 await users.updateMany({ status: "trial" }, { $set: { status: "expired" } });
+
+// Update MANY rows in ONE round trip, each matched by its own key values —
+// the bulk counterpart of looping updateOne when every row carries different
+// values. options.keys names the WHERE columns; every other property of each
+// row becomes the SET clause. All rows must share the same property set.
+await accounts.bulkUpdateByKeys(
+    [
+        { ACCOUNT_ID: 7, ROW_HASH: "ab…" },
+        { ACCOUNT_ID: 8, ROW_HASH: "cd…" },
+    ],
+    { keys: ["ACCOUNT_ID"] },
+);
+// → UPDATE "T_ACCOUNTS" SET "ROW_HASH" = :s0 WHERE "ACCOUNT_ID" = :k0  (executeMany)
 ```
 
 ### Delete Data
@@ -359,6 +409,19 @@ const results = await users
 
 **Projection:** `{ name: 1, email: 1 }` = include only name and email. `{ password: 0 }` = exclude password, include everything else.
 
+**Row locks:** `.forUpdate(mode)` inside a transaction locks the selected rows until commit or rollback.
+
+| Mode | SQL |
+| --- | --- |
+| `true` | `FOR UPDATE` (waits forever) |
+| `"nowait"` | `FOR UPDATE NOWAIT` (ORA-00054 if locked) |
+| `"skip locked"` | `FOR UPDATE SKIP LOCKED` |
+| `{ of: ["ID"], wait: 5 }` | `FOR UPDATE OF t0."ID" WAIT 5` (ORA-30006 after 5 s) |
+
+With `.limit()` / `.skip()` / `.next()`, the page is picked in a `ROWID IN (…)` subquery and the outer query takes the lock, because Oracle rejects `FETCH FIRST … FOR UPDATE` (ORA-02014). With `"skip locked"`, a page can come back with fewer rows than the limit. An unknown mode throws instead of falling back to a plain wait.
+
+Read terminals (`toArray`, `next`, `count`, set operations) never commit a session connection, so they are safe between a lock and the write it protects.
+
 ### Terminal Methods (What Actually Runs the Query)
 
 | Method         | What it does                                             |
@@ -394,8 +457,9 @@ await products.updateMany(
 await users.updateOne({ id: 1 }, { $min: { lowScore: 50 } }); // LEAST(lowScore, 50)
 await users.updateOne({ id: 1 }, { $max: { highScore: 99 } }); // GREATEST(highScore, 99)
 
-// $currentDate — set to current timestamp
-await users.updateOne({ id: 1 }, { $currentDate: { lastLogin: true } }); // SYSDATE
+// $currentDate — set to the current date/time
+await users.updateOne({ id: 1 }, { $currentDate: { lastLogin: true } }); // SYSDATE (DATE, whole seconds)
+await users.updateOne({ id: 1 }, { $currentDate: { updatedAt: { $type: "timestamp" } } }); // SYSTIMESTAMP — use for TIMESTAMP columns
 
 // $unset — set a field to NULL
 await users.updateOne({ id: 1 }, { $unset: { temporaryNote: "" } });
@@ -467,7 +531,7 @@ An aggregation pipeline is an **ordered array of stages**. Data flows through ea
 ```
 
 ```js
-// "Top 5 regions by total completed sales"
+// "Top 5 regions by total completed revenue"
 const report = await orders.aggregate([
     { $match: { status: "completed" } }, // Step 1: filter
     { $group: { _id: "$region", total: { $sum: "$amount" } } }, // Step 2: group & sum
@@ -519,8 +583,8 @@ await orders.aggregate([
 ### $having — Filter After Grouping
 
 ```js
-// Only show regions with total sales over 10,000
-await sales.aggregate([
+// Only show regions with total revenue over 10,000
+await orders.aggregate([
     { $group: { _id: "$region", total: { $sum: "$amount" } } },
     { $having: { total: { $gt: 10000 } } }, // filters AFTER the GROUP BY
     { $sort: { total: -1 } },
@@ -595,6 +659,64 @@ await employees.aggregate([
     },
 ]);
 ```
+
+#### `select` — Avoid ORA-00918 When Tables Share Column Names
+
+When two tables have a column with the same name (e.g. both have `USERID`), the default
+`SELECT left.*, right.*` produces a duplicate column in the result set. Oracle then raises
+**ORA-00918: column ambiguously defined** when a later `$project` references that column.
+
+Use `select` to list only the columns you need from the **right-hand (joined) table**.
+The left table is always included in full.
+
+```js
+// Without select — raises ORA-00918 if T_USERS and T_USER_PROFILES both have USERID
+await users.aggregate([
+    { $match: { USERID: "48022603" } },
+    {
+        $lookup: {
+            from: "T_USER_PROFILES",
+            localField: "USERID",
+            foreignField: "USERID",
+            as: "pi",
+            joinType: "left",
+            // ← no select: both tables expose USERID → ambiguous
+        },
+    },
+    { $project: { USERID: 1, EMAILADDRESS: 1 } }, // ORA-00918 ❌
+]);
+
+// With select — only EMAILADDRESS is pulled from T_USER_PROFILES
+await users.aggregate([
+    { $match: { USERID: "48022603" } },
+    {
+        $lookup: {
+            from: "T_USER_PROFILES",
+            localField: "USERID",
+            foreignField: "USERID",
+            as: "pi",
+            joinType: "left",
+            select: ["EMAILADDRESS"], // ← pull only this column from the right side
+        },
+    },
+    { $project: { USERID: 1, EMAILADDRESS: 1 } }, // unambiguous
+]);
+```
+
+Generated SQL comparison:
+
+```sql
+-- Without select (ambiguous USERID):
+SELECT "stage_0".*, "pi".*
+FROM "stage_0" LEFT OUTER JOIN "T_USER_PROFILES" "pi" ON "stage_0"."USERID" = "pi"."USERID"
+
+-- With select: ["EMAILADDRESS"] (no duplicate columns):
+SELECT "stage_0".*, "pi"."EMAILADDRESS"
+FROM "stage_0" LEFT OUTER JOIN "T_USER_PROFILES" "pi" ON "stage_0"."USERID" = "pi"."USERID"
+```
+
+> **Rule of thumb:** Any time the joined table shares a column name with the left table,
+> use `select` to list only the columns you actually need from the right side.
 
 ### Transactions with Savepoints
 
@@ -870,7 +992,7 @@ Turn row values into column headers:
 // Before: { region: "East", quarter: "Q1", amount: 100 }, { region: "East", quarter: "Q2", amount: 200 }
 // After:  { region: "East", Q1: 100, Q2: 200, Q3: ..., Q4: ... }
 
-const pivotResult = await sales.pivot({
+const pivotResult = await orders.pivot({
     value: { $sum: "$amount" },
     pivotOn: "quarter",
     pivotValues: ["Q1", "Q2", "Q3", "Q4"],
@@ -897,7 +1019,7 @@ const unpivotResult = await quarterly.unpivot({
 
 ```js
 // ROLLUP — subtotals + grand total
-await sales.aggregate([
+await orders.aggregate([
     {
         $group: {
             _id: { $rollup: ["region", "product"] },
@@ -908,7 +1030,7 @@ await sales.aggregate([
 // Result includes: per product per region, per region subtotal, grand total
 
 // CUBE — all possible combination subtotals
-await sales.aggregate([
+await orders.aggregate([
     {
         $group: {
             _id: { $cube: ["region", "product"] },
@@ -918,7 +1040,7 @@ await sales.aggregate([
 ]);
 
 // GROUPING SETS — custom combos
-await sales.aggregate([
+await orders.aggregate([
     {
         $group: {
             _id: { $groupingSets: [["region"], ["product"], []] },
@@ -1015,16 +1137,16 @@ await perf.analyze("orders");
 
 // Create a materialized view (pre-computed query — cached on disk)
 await perf.createMaterializedView(
-    "monthly_sales_mv",
+    "monthly_revenue_mv",
     "SELECT region, SUM(amount) AS total FROM orders GROUP BY region",
     { refreshMode: "force", refreshOn: "demand" },
 );
 
 // Refresh the materialized view
-await perf.refreshMaterializedView("monthly_sales_mv", "complete");
+await perf.refreshMaterializedView("monthly_revenue_mv", "complete");
 
 // Drop when no longer needed
-await perf.dropMaterializedView("monthly_sales_mv");
+await perf.dropMaterializedView("monthly_revenue_mv");
 ```
 
 ### Debug: See the Generated SQL
@@ -1087,6 +1209,7 @@ console.log(sql);
 | `$min`         | `SET col = LEAST(col, N)`    | `{ $min: { lowScore: 50 } }`            |
 | `$max`         | `SET col = GREATEST(col, N)` | `{ $max: { highScore: 99 } }`           |
 | `$currentDate` | `SET col = SYSDATE`          | `{ $currentDate: { updatedAt: true } }` |
+| `$currentDate` | `SET col = SYSTIMESTAMP`     | `{ $currentDate: { updatedAt: { $type: "timestamp" } } }` (TIMESTAMP columns; `true` would store `.000000`) |
 
 ### Aggregate Expressions
 
@@ -1127,8 +1250,8 @@ await users.updateOne(
     },
 );
 
-// AGGREGATE: "Total sales per region, only regions over 10000"
-await sales.aggregate([
+// AGGREGATE: "Total revenue per region, only regions over 10000"
+await orders.aggregate([
     { $group: { _id: "$region", total: { $sum: "$amount" } } },
     { $having: { total: { $gt: 10000 } } },
     { $sort: { total: -1 } },

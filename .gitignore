@@ -31,3 +31,4 @@ test/oracle-mongo-wrapper/test.dev.js
 
 # Ignore AI instruction files
 CLAUDE.md
+coverage/
