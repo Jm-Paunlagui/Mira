@@ -33,7 +33,7 @@
     "test:reliability": "bun test/run.ts test/reliability"
   },
   "dependencies": {
-    "dotenv": "^17.4.0",
+    "dotenv": "^17.4.2",
     "oracledb": "^6.10.0"
   },
   "engines": {
