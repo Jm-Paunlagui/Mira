@@ -42,7 +42,7 @@
 
 import type { DbConnection } from "../db";
 import type { QueryBuilder } from "../core/QueryBuilder";
-import { quoteIdentifier } from "../utils";
+import { quoteIdentifier, inlineBinds } from "../utils";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
@@ -304,7 +304,6 @@ class OracleSchema {
   async createView(viewName: string, queryBuilderOrSQL: QueryBuilder | string, options: { orReplace?: boolean; force?: boolean; } = {}): Promise<{ acknowledged: boolean; }> {
     return this.db.withConnection(async (conn: DbConnection) => {
       let selectSql;
-      let binds: Record<string, unknown> = {};
 
       if (typeof queryBuilderOrSQL === "string") {
         selectSql = queryBuilderOrSQL;
@@ -312,9 +311,9 @@ class OracleSchema {
         queryBuilderOrSQL &&
         typeof queryBuilderOrSQL._buildSQL === "function"
       ) {
+        // DDL cannot take bind values: the filter values become literals.
         const built = queryBuilderOrSQL._buildSQL();
-        selectSql = built.sql;
-        binds = built.binds;
+        selectSql = inlineBinds(built.sql, built.binds, "OracleSchema.createView");
       } else {
         throw new Error(MSG.SCHEMA_CREATE_VIEW_INVALID_INPUT);
       }
@@ -326,7 +325,7 @@ class OracleSchema {
       const sql = `${prefix} VIEW ${quoteIdentifier(viewName)} AS ${selectSql}`;
 
       try {
-        await conn.execute(sql, binds, { autoCommit: true });
+        await conn.execute(sql, {}, { autoCommit: true });
         return { acknowledged: true };
       } catch (err) {
         throw new Error(MSG.wrapError("OracleSchema.createView", err, sql));

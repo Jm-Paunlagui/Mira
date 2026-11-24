@@ -70,7 +70,7 @@
  * ============================================================================
  */
 
-import { quoteIdentifier } from "../utils";
+import { quoteIdentifier, renameBinds } from "../utils";
 import { parseFilter } from "../parsers/filterParser";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
@@ -145,17 +145,31 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
     }
   }
 
+  // Upper-case aliases the stages so far have produced ($group, $project …),
+  // so a later $match can name them in the case the caller wrote them.
+  const aliases = new Set<string>();
+
+  // A stage built by its own parseFilter / QueryBuilder numbers its binds from 0,
+  // so it can reuse a name an earlier stage already bound (two $match stages on
+  // one column, a $lateralJoin subquery). Renaming on collision keeps each value.
+  const addStageBinds = (sql: string, binds: Record<string, unknown>, prefix: string) => {
+    const clash = Object.keys(binds).some((k) => k in allBinds);
+    const out = clash ? renameBinds(sql, binds, prefix) : { sql, binds };
+    Object.assign(allBinds, out.binds);
+    return out.sql;
+  };
+
   for (const stage of pipeline) {
     const stageAlias = `stage_${stageIdx}`;
     const key = Object.keys(stage).filter((k) => k !== "_having")[0];
 
     switch (key) {
       case "$match": {
-        const { whereClause, binds } = parseFilter(stage.$match);
-        Object.assign(allBinds, binds);
+        const { whereClause, binds } = parseFilter(_alignToAliases(stage.$match, aliases));
+        const where = addStageBinds(whereClause, binds, `m${stageIdx}_`);
         ctes.push({
           alias: stageAlias,
-          sql: `SELECT * FROM ${prevSource} ${whereClause}`,
+          sql: `SELECT * FROM ${prevSource} ${where}`,
         });
         break;
       }
@@ -169,6 +183,9 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
         );
         Object.assign(allBinds, binds);
         ctes.push({ alias: stageAlias, sql });
+        const id = stage.$group._id;
+        for (const k of Object.keys(stage.$group)) if (k !== "_id") aliases.add(k.toUpperCase());
+        if (id && typeof id === "object" && !id.$rollup && !id.$cube && !id.$groupingSets) for (const k of Object.keys(id)) aliases.add(k.toUpperCase());
         break;
       }
 
@@ -202,6 +219,7 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
           alias: stageAlias,
           sql: `SELECT COUNT(*) AS ${quoteIdentifier(stage.$count.toUpperCase())} FROM ${prevSource}`,
         });
+        aliases.add(stage.$count.toUpperCase());
         break;
       }
 
@@ -215,6 +233,7 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
           alias: stageAlias,
           sql: `SELECT ${projCols} FROM ${prevSource}`,
         });
+        _addComputedAliases(stage.$project, aliases);
         break;
       }
 
@@ -228,6 +247,7 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
           alias: stageAlias,
           sql: `SELECT ${prevSource}.*, ${addCols} FROM ${prevSource}`,
         });
+        _addComputedAliases(stage.$addFields, aliases);
         break;
       }
 
@@ -240,11 +260,8 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
 
       case "$lateralJoin": {
         const lj = stage.$lateralJoin;
-        const { sql: subSql, binds: subBinds } = _buildLateralSub(
-          lj,
-          prevSource,
-        );
-        Object.assign(allBinds, subBinds);
+        const built = _buildLateralSub(lj, prevSource);
+        const subSql = addStageBinds(built.sql, built.binds, `lj${stageIdx}_`);
         ctes.push({
           alias: stageAlias,
           sql: `SELECT ${prevSource}.*, ${quoteIdentifier(lj.as)}.* FROM ${prevSource}, LATERAL (${subSql}) ${quoteIdentifier(lj.as)}`,
@@ -367,6 +384,29 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
   if (hasMerge) return { sql: _buildMergeStatement(mergeSpec, sql), binds: allBinds };
   if (outTable) sql = `INSERT INTO ${quoteIdentifier(outTable)} ${sql}`;
   return { sql, binds: allBinds };
+}
+
+/**
+ * Rewrite a $match filter's field names to the upper-case aliases earlier stages
+ * produced ($group, $project, $addFields and $count upper-case their aliases), so
+ * `{ $match: { total: … } }` after `{ $group: { total: … } }` finds TOTAL. Names that
+ * are not aliases, and operator keys, are left alone; $and / $or / $nor / $not recurse.
+ */
+function _alignToAliases(filter: Record<string, any>, aliases: Set<string>): Record<string, any> {
+  if (aliases.size === 0 || !filter || typeof filter !== "object") return filter;
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(filter)) {
+    if ((k === "$and" || k === "$or" || k === "$nor") && Array.isArray(v)) out[k] = v.map((f) => _alignToAliases(f, aliases));
+    else if (k === "$not") out[k] = _alignToAliases(v, aliases);
+    else if (!k.startsWith("$") && !aliases.has(k) && aliases.has(k.toUpperCase())) out[k.toUpperCase()] = v;
+    else out[k] = v;
+  }
+  return out;
+}
+
+/** Record the aliases a $project / $addFields stage computes (pass-through `col: 1` keeps its own name). */
+function _addComputedAliases(spec: Record<string, any>, aliases: Set<string>): void {
+  for (const [k, v] of Object.entries(spec)) if (v !== 1 && v !== 0 && v !== true && v !== false) aliases.add(k.toUpperCase());
 }
 
 /**
@@ -579,13 +619,16 @@ function _buildAggExpr(expr: Record<string, DslSpec>, binds: Record<string, unkn
           return _fieldRef(val);
         }
         case "$size":
-          return `JSON_ARRAY_LENGTH(${_fieldRef(val)})`;
+          // Number of elements in a JSON array column (19c item method size()).
+          return `JSON_VALUE(${_fieldRef(val)}, '$.size()' RETURNING NUMBER)`;
         case "$window": {
           const { buildWindowExpr } = (require("./windowFunctions") as typeof import("./windowFunctions"));
           return buildWindowExpr(val);
         }
         default:
-          return _fieldRef(val);
+          // An unknown operator used to fall through to a column named after its
+          // argument ("$round" → "$A,0"), failing later with a misleading ORA-00904.
+          throw new Error(MSG.PIPELINE_UNKNOWN_EXPRESSION(op));
       }
     }
   }

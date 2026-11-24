@@ -158,17 +158,24 @@ describe("unit: parseFilter", () => {
     expect(parseFilter({ A: { $all: [1] } }).whereClause).toBe('WHERE "A" = ALL(:where_A_0)');
   });
 
+  it("DEFECT: $eq / $ne with null become IS NULL / IS NOT NULL (a bound NULL matches nothing)", () => {
+    expect(parseFilter({ A: { $eq: null } })).toEqual({ whereClause: 'WHERE "A" IS NULL', binds: {} });
+    expect(parseFilter({ A: { $ne: null } })).toEqual({ whereClause: 'WHERE "A" IS NOT NULL', binds: {} });
+    expect(parseFilter({ A: { $ne: undefined } }).whereClause).toBe('WHERE "A" IS NOT NULL');
+  });
+
   it("$case with and without $else", () => {
     const r = parseFilter({ T: { $case: [{ when: { S: { $gte: 10 } }, then: "VIP" }], $else: "Reg" } });
-    expect(r.whereClause).toBe('WHERE CASE WHEN "S" >= :where_S_0 THEN :where_T_then_1 ELSE :where_T_else_2 END');
+    expect(r.whereClause).toBe('WHERE "T" = CASE WHEN "S" >= :where_S_0 THEN :where_T_then_1 ELSE :where_T_else_2 END');
     expect(r.binds).toEqual({ where_S_0: 10, where_T_then_1: "VIP", where_T_else_2: "Reg" });
     expect(parseFilter({ T: { $case: [{ when: { S: 1 }, then: "X" }] } }).whereClause).not.toContain("ELSE");
   });
 
-  it("$coalesce: literals bind, $refs and non-strings become identifiers; $nullif", () => {
+  it("$coalesce: $refs are columns, every other value is bound; $nullif (both compared with the field)", () => {
     const r = parseFilter({ X: { $coalesce: ["$NICK", "anon", 5] } });
-    expect(r.whereClause).toBe('WHERE COALESCE("NICK", :where_X_0, "5")');
-    expect(parseFilter({ X: { $nullif: ["D", 0] } }).whereClause).toBe('WHERE NULLIF("D", :where_X_0)');
+    expect(r.whereClause).toBe('WHERE "X" = COALESCE("NICK", :where_X_0, :where_X_1)');
+    expect(r.binds).toEqual({ where_X_0: "anon", where_X_1: 5 });
+    expect(parseFilter({ X: { $nullif: ["D", 0] } }).whereClause).toBe('WHERE "X" = NULLIF("D", :where_X_0)');
   });
 
   it("$outer. reference is bound (rewritten to the outer column by $lateralJoin)", () => {
@@ -183,12 +190,13 @@ describe("unit: parseFilter", () => {
     expect(parseFilter({ SAL: { $subquery: { collection: "E", where: { D: "$outer.D" } } } }).whereClause).toContain('t0."D"');
   });
 
-  it("$now: true, empty, minus/plus with every unit", () => {
-    expect(parseFilter({ T: { $lt: { $now: true } } }).whereClause).toBe('WHERE "T" < SYSTIMESTAMP');
-    expect(parseFilter({ T: { $lt: { $now: {} } } }).whereClause).toBe('WHERE "T" < SYSTIMESTAMP');
+  it("$now: true, empty, minus/plus with every unit (database wall-clock time, no session time zone)", () => {
+    expect(parseFilter({ T: { $lt: { $now: true } } }).whereClause).toBe('WHERE "T" < CAST(SYSTIMESTAMP AS TIMESTAMP)');
+    expect(parseFilter({ T: { $lt: { $now: {} } } }).whereClause).toBe('WHERE "T" < CAST(SYSTIMESTAMP AS TIMESTAMP)');
+    expect(parseFilter({ T: { $lt: { $now: { withTimeZone: true } } } }).whereClause).toBe('WHERE "T" < SYSTIMESTAMP');
     const r = parseFilter({ T: { $gte: { $now: { minus: { days: 7, hours: 1 }, plus: { minutes: 2, seconds: 3 } } } } });
     expect(r.whereClause).toBe(
-      "WHERE \"T\" >= SYSTIMESTAMP - NUMTODSINTERVAL(:where_T_now_0, 'DAY') - NUMTODSINTERVAL(:where_T_now_1, 'HOUR') + NUMTODSINTERVAL(:where_T_now_2, 'MINUTE') + NUMTODSINTERVAL(:where_T_now_3, 'SECOND')",
+      "WHERE \"T\" >= CAST(SYSTIMESTAMP AS TIMESTAMP) - NUMTODSINTERVAL(:where_T_now_0, 'DAY') - NUMTODSINTERVAL(:where_T_now_1, 'HOUR') + NUMTODSINTERVAL(:where_T_now_2, 'MINUTE') + NUMTODSINTERVAL(:where_T_now_3, 'SECOND')",
     );
     expect(r.binds).toEqual({ where_T_now_0: 7, where_T_now_1: 1, where_T_now_2: 2, where_T_now_3: 3 });
   });
@@ -209,8 +217,9 @@ describe("unit: parseFilter", () => {
     expect(parseFilter({ ID: { $inSelect: Array.from({ length: 1500 }, (_, i) => i) } }).whereClause).toBe('WHERE "ID" IN (SELECT COLUMN_VALUE FROM TABLE(:where_ID_0))');
     const qb = c.find({ S: "a" }).project({ ID: 1 });
     const viaQb = parseFilter({ ID: { $inSelect: qb } });
-    expect(viaQb.whereClause).toBe('WHERE "ID" IN (SELECT "ID" FROM "T_U" t0 WHERE "S" = :where_S_0)');
-    expect(viaQb.binds).toEqual({ where_S_0: "a" });
+    // The subquery's binds are prefixed (sq_0_) so they cannot collide with the outer filter's.
+    expect(viaQb.whereClause).toBe('WHERE "ID" IN (SELECT "ID" FROM "T_U" t0 WHERE "S" = :sq_0_where_S_0)');
+    expect(viaQb.binds).toEqual({ sq_0_where_S_0: "a" });
     expect(parseFilter({ ID: { $inSelect: { _buildSQL: () => "SELECT 1 FROM DUAL" } } }).whereClause).toBe('WHERE "ID" IN (SELECT 1 FROM DUAL)');
     expect(parseFilter({ ID: { $inSelect: "SELECT 1 FROM DUAL" } }).whereClause).toBe('WHERE "ID" IN (SELECT 1 FROM DUAL)');
   });
@@ -351,7 +360,6 @@ describe("unit: aggregate pipeline", () => {
           inl: { $ifNull: ["$N", "anon"] }, inl1: { $ifNull: "$N" },
           sz: { $size: "$ARR" },
           w: { $window: { fn: "ROW_NUMBER" } },
-          dflt: { $unknownOp: "$Z" },
           keep: 1, alias: "$A", star: { $count: "*" }, num: { $sum: 5 },
         },
       },
@@ -360,12 +368,28 @@ describe("unit: aggregate pipeline", () => {
       'AVG("A")', 'MIN("A")', 'MAX("A")', '"A" * :agg_0', '("A" + :agg_1 + :agg_2)', '("A" - :agg_3)', '("A" / :agg_4)',
       '"F" || "L"', 'UPPER("F")', 'LOWER("F")', 'SUBSTR("F", 1, 3)', "TO_CHAR(\"D\", 'YYYY''Q')", "TO_CHAR(\"D\", 'YYYY-MM-DD')",
       'CASE WHEN "A" >= :cond_5 THEN :agg_6 ELSE "B" END', 'CASE WHEN "A" = :cond_7', "CASE WHEN 1=1 THEN :agg_",
-      'COALESCE("N", :agg_', 'JSON_ARRAY_LENGTH("ARR")', "ROW_NUMBER() OVER ()", '"Z" AS "DFLT"', '"keep"', '"A" AS "ALIAS"',
+      'COALESCE("N", :agg_', "JSON_VALUE(\"ARR\", '$.size()' RETURNING NUMBER)", "ROW_NUMBER() OVER ()", '"keep"', '"A" AS "ALIAS"',
       'COUNT(*) AS "STAR"', 'SUM(5) AS "NUM"', '"A" AS "MUL1"', '"F" AS "SS1"', '"N" AS "INL1"', "[object Object]",
     ])
       expect(sql).toContain(frag);
     expect(binds.agg_0).toBe(2);
     expect(binds.agg_2).toBe(true);
+  });
+
+  it("DEFECT: $match names a $group / $project alias in the case it was written ($and / $or / $not too)", () => {
+    const { sql } = agg([
+      { $group: { _id: "$R", total: { $sum: "$A" } } },
+      { $project: { R: 1, total: 1, twice: { $mul: ["$total", 2] } } },
+      { $match: { $or: [{ total: { $gt: 1 } }, { twice: 4 }], $not: { total: 5 }, R: "x" } },
+    ]);
+    expect(sql).toContain('("TOTAL" > :where_TOTAL_0 OR "TWICE" = :where_TWICE_1)');
+    expect(sql).toContain('NOT ("TOTAL" = :where_TOTAL_2)');
+    expect(sql).toContain('"R" = :where_R_3'); // not an alias: left as written
+  });
+
+  it("DEFECT: an unknown expression operator is refused, not turned into a column name", () => {
+    expect(() => agg([{ $project: { R: { $round: ["$A", 0] } } }])).toThrow(/Unsupported expression operator "\$round"/);
+    expect(() => agg([{ $group: { _id: "$R", s: { $stdDevPop: "$A" } } }])).toThrow(/Unsupported expression operator "\$stdDevPop"/);
   });
 
   it("$project with nothing selectable falls back to *", () => {
@@ -691,7 +715,8 @@ describe("unit: QueryBuilder SQL (no execution)", () => {
 describe("unit: CTE / set-operation SQL (no execution)", () => {
   it("withCTE: default source, from, join (every type), sort, skip, limit", () => {
     const defs = { A: c.find({ S: "a" }), B: c.find({}) };
-    expect(withCTE(db, defs)._buildSQL().sql).toBe('WITH "A" AS (SELECT * FROM "T_U" t0 WHERE "S" = :where_S_0),\n     "B" AS (SELECT * FROM "T_U" t0)\nSELECT * FROM A');
+    // Each CTE's binds carry its own prefix (c0_, c1_ …).
+    expect(withCTE(db, defs)._buildSQL().sql).toBe('WITH "A" AS (SELECT * FROM "T_U" t0 WHERE "S" = :c0_where_S_0),\n     "B" AS (SELECT * FROM "T_U" t0)\nSELECT * FROM A');
     const full = withCTE(db, defs).from("A").join({ from: "B", localField: "ID", foreignField: "UID" }).sort({ X: -1, Y: 1 }).skip(1).limit(2)._buildSQL().sql;
     expect(full).toContain('SELECT "A".*, "B".* FROM "A" INNER JOIN "B" ON "A"."ID" = "B"."UID" ORDER BY "X" DESC, "Y" ASC OFFSET 1 ROWS FETCH FIRST 2 ROWS ONLY');
     expect(() => withCTE(db, defs).from("A").join({ from: "B", localField: "I", foreignField: "U", joinType: "weird" })._buildSQL()).toThrow(/Unknown joinType "weird"/);

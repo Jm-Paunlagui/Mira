@@ -38,7 +38,7 @@
 
 import type { DbConnection } from "../db";
 import type { QueryBuilder } from "../core/QueryBuilder";
-import { quoteIdentifier } from "../utils";
+import { quoteIdentifier, inlineBinds } from "../utils";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
@@ -159,7 +159,6 @@ function createPerformance(db: Record<string, any>): Record<string, unknown> {
     async createMaterializedView(name: string, queryBuilderOrSQL: QueryBuilder | string, options: { refreshMode?: "fast" | "complete" | "force"; refreshOn?: "commit" | "demand"; buildMode?: "immediate" | "deferred"; orReplace?: boolean } = {}): Promise<{ acknowledged: boolean; }> {
       return db.withConnection(async (conn: DbConnection) => {
         let selectSql;
-        let binds: Record<string, unknown> = {};
 
         if (typeof queryBuilderOrSQL === "string") {
           selectSql = queryBuilderOrSQL;
@@ -167,9 +166,9 @@ function createPerformance(db: Record<string, any>): Record<string, unknown> {
           queryBuilderOrSQL &&
           typeof queryBuilderOrSQL._buildSQL === "function"
         ) {
+          // DDL cannot take bind values: the filter values become literals.
           const built = queryBuilderOrSQL._buildSQL();
-          selectSql = built.sql;
-          binds = built.binds;
+          selectSql = inlineBinds(built.sql, built.binds, "performance.createMaterializedView");
         } else {
           throw new Error(MSG.PERF_CREATE_MVIEW_INVALID_INPUT);
         }
@@ -217,7 +216,7 @@ function createPerformance(db: Record<string, any>): Record<string, unknown> {
         const sql = `CREATE MATERIALIZED VIEW ${quoteIdentifier(name)} ${buildModeClause} REFRESH ${refreshModeClause} ${refreshOnClause} AS ${selectSql}`;
 
         try {
-          await conn.execute(sql, binds, { autoCommit: true });
+          await conn.execute(sql, {}, { autoCommit: true });
           return { acknowledged: true };
         } catch (err) {
           _wrapPrivilegeError(

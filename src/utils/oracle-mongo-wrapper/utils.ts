@@ -159,6 +159,55 @@ function mergeBinds(a: Record<string, unknown>, b: Record<string, unknown>): Rec
   return merged;
 }
 
+// ─── renameBinds ────────────────────────────────────────────────
+/**
+ * Gives every bind of a sub-statement a prefix, in its SQL and its bind object.
+ *
+ * Each parseFilter / QueryBuilder numbers its binds from 0 (`where_SCORE_0`), so
+ * two independently built queries that filter the same column use the same
+ * name. Merging them without renaming lets one value silently overwrite the
+ * other: a wrong result with no error. Call this on the inner statement before
+ * merging its binds into the outer one.
+ *
+ * @example
+ *   renameBinds('"A" = :where_A_0', { where_A_0: 1 }, "sq0_")
+ *   // → { sql: '"A" = :sq0_where_A_0', binds: { sq0_where_A_0: 1 } }
+ */
+function renameBinds(sql: string, binds: Record<string, unknown>, prefix: string): { sql: string; binds: Record<string, unknown> } {
+  const out: Record<string, unknown> = {};
+  let renamed = sql;
+  for (const [k, v] of Object.entries(binds)) {
+    renamed = renamed.replace(new RegExp(`:${k.replace(/[^A-Za-z0-9_$#]/g, "\\$&")}\\b`, "g"), `:${prefix}${k}`);
+    out[`${prefix}${k}`] = v;
+  }
+  return { sql: renamed, binds: out };
+}
+
+// ─── inlineBinds ────────────────────────────────────────────────
+/**
+ * Writes bind values into SQL as literals, for statements that cannot take
+ * binds at all: CREATE VIEW and CREATE MATERIALIZED VIEW are DDL, and Oracle
+ * stores the view's text, so a filter value has to become part of it.
+ *
+ * Only values with an exact, injection-safe literal form are accepted:
+ * finite numbers, bigints, strings (single quotes doubled) and null. Anything
+ * else (Dates, collection binds for long $in lists, objects) is refused with a
+ * TypeError instead of guessing a format; pass the view as SQL text for those.
+ */
+function inlineBinds(sql: string, binds: Record<string, unknown>, where: string): string {
+  let out = sql;
+  for (const [k, v] of Object.entries(binds)) {
+    let literal: string;
+    if (v === null || v === undefined) literal = "NULL";
+    else if (typeof v === "number" && Number.isFinite(v)) literal = String(v);
+    else if (typeof v === "bigint") literal = v.toString();
+    else if (typeof v === "string") literal = `'${v.replace(/'/g, "''")}'`;
+    else throw new TypeError(MSG.INLINE_BIND_UNSUPPORTED(where, k, v instanceof Date ? "Date" : typeof v));
+    out = out.replace(new RegExp(`:${k.replace(/[^A-Za-z0-9_$#]/g, "\\$&")}\\b`, "g"), () => literal);
+  }
+  return out;
+}
+
 // ─── buildOrderBy ───────────────────────────────────────────────
 /**
  * Converts a sort specification object into an SQL ORDER BY clause.
@@ -258,4 +307,4 @@ function buildProjection(projection: Record<string, unknown> | null | undefined)
   };
 }
 
-export { quoteIdentifier, bindSafe, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection };
+export { quoteIdentifier, bindSafe, convertTypes, rowToDoc, mergeBinds, renameBinds, inlineBinds, buildOrderBy, buildProjection };

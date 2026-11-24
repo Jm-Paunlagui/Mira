@@ -47,7 +47,7 @@
 
 import type { DbConnection } from "../db";
 import type { QueryBuilder } from "../core/QueryBuilder";
-import { quoteIdentifier } from "../utils";
+import { quoteIdentifier, renameBinds } from "../utils";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
@@ -163,8 +163,12 @@ class CTEResult {
     const withParts: string[] = [];
     const allBinds: Record<string, unknown> = {};
 
+    // Each named query numbers its binds from 0; prefix them per CTE so two CTEs
+    // filtering the same column keep their own values.
+    let i = 0;
     for (const [name, qb] of Object.entries(this._cteDefs)) {
-      const { sql, binds } = qb._buildSQL();
+      const built = qb._buildSQL();
+      const { sql, binds } = renameBinds(built.sql, built.binds, `c${i++}_`);
       Object.assign(allBinds, binds);
       withParts.push(`${quoteIdentifier(name)} AS (${sql})`);
     }

@@ -23,7 +23,7 @@ const failing = () => {
 describe("unit/errors: OracleCollection wraps every driver failure", () => {
   const cases: Array<[string, (c: OracleCollection) => Promise<unknown>]> = [
     ["findOne", (c) => c.findOne({ A: 1 })],
-    ["findOneAndUpdate (MERGE fast path)", (c) => c.findOneAndUpdate({ A: 1 }, { $set: { B: 2 } }, { upsert: true, returnDocument: "after" })],
+    ["findOneAndUpdate (upsert)", (c) => c.findOneAndUpdate({ A: 1 }, { $set: { B: 2 } }, { upsert: true, returnDocument: "after" })],
     ["findOneAndDelete", (c) => c.findOneAndDelete({ A: 1 })],
     ["countDocuments", (c) => c.countDocuments({ A: 1 })],
     ["estimatedDocumentCount", (c) => c.estimatedDocumentCount()],
@@ -54,6 +54,15 @@ describe("unit/errors: OracleCollection wraps every driver failure", () => {
       await expect(run(coll)).rejects.toThrow(/ORA-00942/);
     });
   }
+
+  it("findOneAndUpdate upsert: an INSERT failure after an empty lock is wrapped", async () => {
+    const conn = stubConn((sql) => {
+      if (sql.startsWith("SELECT")) return { rows: [] };
+      throw oraError(1400, "cannot insert NULL");
+    });
+    const c = new OracleCollection("T_X", stubDb(conn) as never, conn as never);
+    await expect(c.findOneAndUpdate({ A: 1 }, { $set: { B: 2 } }, { upsert: true })).rejects.toThrow(/findOneAndUpdate.*ORA-01400/s);
+  });
 
   it("findOneAndUpdate standard path: UPDATE failure is wrapped", async () => {
     const conn = stubConn((sql) => {
@@ -288,7 +297,7 @@ describe("unit: aggregate() keeps QueryBuilders intact through its pipeline copy
     ]);
     p.catch(() => {});
     const { sql } = p._buildSQL();
-    expect(sql).toContain('"ID" IN (SELECT "UID" FROM "O" t0 WHERE "S" = :where_S_0)');
+    expect(sql).toContain('"ID" IN (SELECT "UID" FROM "O" t0 WHERE "S" = :sq_0_where_S_0)');
     expect(sql).toContain('LATERAL (SELECT * FROM "O" t0 WHERE "UID" = "stage_0"."ID")');
     expect(sql).not.toContain("DUAL");
   });
