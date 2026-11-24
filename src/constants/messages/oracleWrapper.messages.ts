@@ -155,9 +155,9 @@ const oracleMongoWrapperMessages = {
   SET_OP_COLUMN_COUNT_MISMATCH:
     "[SetResultBuilder] Column counts differ between queries",
   COLLECTION_INVALID_TABLE_NAME: (name: unknown) =>
-    `[OracleCollection] tableName must be a non-empty string, got ${typeof name === "string" ? '""' : typeof name}.`,
+    `[OracleCollection] tableName must be a non-empty string, got ${JSON.stringify(name)?.slice(0, 40) ?? typeof name}.`,
   INVALID_ROW_COUNT: (scope: unknown, what: unknown, value: unknown) =>
-    `[${scope}] ${what} must be a non-negative integer, got ${typeof value === "number" ? value : typeof value}.`,
+    `[${scope}] ${what} must be a non-negative integer, got ${typeof value === "number" ? value : (JSON.stringify(value)?.slice(0, 40) ?? typeof value)}.`,
   PIPELINE_UNKNOWN_STAGE: (stage: unknown) =>
     `[aggregatePipeline] Unsupported stage: ${String(stage)}.`,
   CTE_SET_UNKNOWN_COLUMN: (col: unknown, table: unknown) =>
@@ -183,7 +183,7 @@ const oracleMongoWrapperMessages = {
   WINDOW_UNKNOWN_FUNCTION: (fn: unknown) =>
     `[windowFunctions] Unsupported window function: ${String(fn)}.`,
   WINDOW_INVALID_ARGUMENT: (name: unknown, value: unknown) =>
-    `[windowFunctions] ${name} must be a positive integer, got ${typeof value === "number" ? value : typeof value}.`,
+    `[windowFunctions] ${name} must be a positive integer, got ${typeof value === "number" ? value : (JSON.stringify(value)?.slice(0, 40) ?? typeof value)}.`,
   WINDOW_INVALID_FRAME: (frame: unknown) =>
     `[windowFunctions] Invalid frame "${String(frame).slice(0, 80)}". Use ROWS|RANGE with UNBOUNDED PRECEDING / n PRECEDING / CURRENT ROW / n FOLLOWING / UNBOUNDED FOLLOWING.`,
   AGGREGATE_UNKNOWN_FUNCTION: (scope: unknown, fn: unknown) =>
