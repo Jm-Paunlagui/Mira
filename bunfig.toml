@@ -1,0 +1,17 @@
+[test]
+# Global hooks (pool shutdown, metrics persistence) — see test/helpers/setup.ts.
+preload = ["./test/helpers/setup.ts"]
+coverageSkipTestFiles = true
+# Coverage scope = the query layer: oracle-mongo-wrapper + config/adapter.
+# Logger, redaction and message catalogs are not DB query code.
+coveragePathIgnorePatterns = [
+  "src/utils/logger.ts",
+  "src/utils/logRedaction.ts",
+  "src/utils/runtimePaths.ts",
+  "src/utils/requestContext.ts",
+  "src/constants/**",
+  "test/**",
+]
+coverageThreshold = { lines = 1.0, functions = 1.0 }
+coverageReporter = ["text", "lcov"]
+coverageDir = "coverage"

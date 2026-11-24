@@ -1,0 +1,26 @@
+{
+    // Type-check only. Bun runs src/**/*.ts directly, so tsc never emits.
+    // Run: bun run typecheck
+    "compilerOptions": {
+        "target": "ES2024",
+        "lib": ["ES2024"],
+        "module": "preserve",
+        "moduleResolution": "bundler",
+        // Every file is a module, even CommonJS ones with no import/export.
+        "moduleDetection": "force",
+        "types": ["bun"],
+        "resolveJsonModule": true,
+        "esModuleInterop": true,
+        "noEmit": true,
+        "skipLibCheck": true,
+
+        "strict": true,
+        // Catch bindings stay `any` (strict makes them `unknown`): the wrapper
+        // reads err.message / err.code directly, as in CATHERINE.
+        "useUnknownInCatchVariables": false,
+        "noImplicitOverride": true,
+        "noFallthroughCasesInSwitch": true,
+        "forceConsistentCasingInFileNames": true
+    },
+    "include": ["src/**/*.ts"]
+}
