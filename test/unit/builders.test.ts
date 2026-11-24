@@ -447,6 +447,18 @@ describe("unit: aggregate pipeline", () => {
       expect(() => mr(spec as never)).toThrow(re);
   });
 
+  it("$lookup pipeline / $connectBy stage / outer $lateralJoin: SQL shape and refusals", () => {
+    expect(() => agg([{ $lookup: { from: "O", pipeline: { $match: {} }, localField: "A", foreignField: "B" } }])).toThrow(/pipeline must be an array/);
+    const lk = agg([{ $lookup: { from: "O", pipeline: [{ $match: { S: 1 } }], localField: "ID", foreignField: "UID" } }]).sql;
+    expect(lk).toBe('SELECT "T".*, "SUB".* FROM "T" LEFT OUTER JOIN (SELECT * FROM "O" WHERE "S" = :where_S_0) "SUB" ON "T"."ID" = "SUB"."UID"');
+    expect(() => agg([{ $lookup: { from: "O", pipeline: [], localField: "A", foreignField: "B", as: "x", joinType: "weird" } }])).toThrow(/Unknown joinType/);
+    expect(agg([{ $connectBy: { connectBy: { M: "$PRIOR ID" } } }]).sql).toBe('SELECT "T".* FROM "T" CONNECT BY NOCYCLE PRIOR "ID" = "M"');
+    const cb = agg([{ $match: { A: 1 } }, { $sort: { A: 1 } }, { $connectBy: { startWith: { A: 2 }, connectBy: { M: "$PRIOR ID" }, root: ["ID", "A"] } }, { $match: { root_id: 1 } }]);
+    expect(cb.sql).toContain('START WITH "A" = :cb2_where_A_0');
+    expect(cb.sql).toContain('"ROOT_ID" = :');
+    expect(cb.binds).toMatchObject({ where_A_0: 1, cb2_where_A_0: 2 });
+  });
+
   it("connectBy: root (one or several), leaf and cycle flags, chosen path column", () => {
     const { sql } = buildConnectBy("E", { connectBy: { MGR: "$PRIOR ID" }, root: ["ID", "NAME"], includeIsLeaf: true, includeIsCycle: true, includePath: true, pathColumn: "CODE" } as never);
     expect(sql).toBe(
@@ -545,10 +557,15 @@ describe("unit: aggregate pipeline", () => {
 
   it("DEFECT: $facet keeps the binds of its sub-pipelines", () => {
     const { sql, binds } = agg([{ $facet: { a: [{ $match: { S: "x" } }], b: [{ $match: { S: "y" } }] } }]);
-    expect(sql).toContain(":f0_where_S_0");
+    // The first facet keeps its names; the second, which would clash, is renamed.
+    expect(sql).toContain(":where_S_0");
     expect(sql).toContain(":f1_where_S_0");
-    expect(sql).not.toMatch(/:where_S_0/);
-    expect(binds).toEqual({ f0_where_S_0: "x", f1_where_S_0: "y" });
+    expect(binds).toEqual({ where_S_0: "x", f1_where_S_0: "y" });
+    // A multi-stage facet after another stage hoists its steps into the outer WITH (no nested WITH).
+    const deep = agg([{ $match: { A: 1 } }, { $facet: { a: [{ $match: { S: "x" } }, { $count: "n" }] } }]).sql;
+    expect(deep.match(/\bWITH\b/g)).toHaveLength(1);
+    expect(deep).toContain('"stage_1_f0_stage_0" AS (SELECT * FROM "stage_0" WHERE "S" = :where_S_0)');
+    expect(() => agg([{ $facet: { a: [{ $out: "X" }] } }])).toThrow(/cannot be used inside a \$facet or \$lookup/);
   });
 
   it("DEFECT: an unknown stage is rejected (not silently dropped)", () => {

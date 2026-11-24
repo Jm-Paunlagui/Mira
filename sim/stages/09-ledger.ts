@@ -127,6 +127,7 @@ export async function ledgerStage(sim: Sim, ctx: Ctx, state: State) {
   const bal = (a: string) => posted.filter((l) => l.acct === a).reduce((s, l) => s + l.dr - l.cr, 0);
 
   // ── Chart of accounts tree ─────────────────────────────────────────────────
+  const postedOnlyEarly = { $lookup: { from: E.JOURNALS, localField: "JOURNAL_ID", foreignField: "JOURNAL_ID", as: "j", joinType: "inner", select: ["STATUS"] } };
   const tree = (await sim.mira(() => coll(E.ACCOUNTS).connectBy({ startWith: { PARENT_CODE: null }, connectBy: { PARENT_CODE: "$PRIOR CODE" }, includeLevel: true, orderSiblings: { CODE: 1 } }))) as { CODE: string; LEVEL: number }[];
   const preorder: [string, number][] = [];
   const walk = (parent: string | null, lvl: number) => {
@@ -137,16 +138,18 @@ export async function ledgerStage(sim: Sim, ctx: Ctx, state: State) {
   };
   walk(null, 1);
   sim.eq("connectBy: chart of accounts in tree order with levels", tree.map((r) => [r.CODE, Number(r.LEVEL)]), preorder);
-  const rollup = await sim.viaSql("balances rolled up the account tree", "connectBy now returns ROOT_<col>, but its rows cannot feed a join or $group: the tree has to be joined to a grouped result (aggregate-then-join)", () =>
-    raw<{ ROOT: string; TOTAL: string }>(
-      `SELECT t.ROOT, NVL(SUM(b.BAL), 0) AS TOTAL
-         FROM (SELECT CONNECT_BY_ROOT CODE AS ROOT, CODE FROM "${E.ACCOUNTS}" CONNECT BY PRIOR CODE = PARENT_CODE) t
-         LEFT JOIN (SELECT l.ACCOUNT_CODE, SUM(l.NET) AS BAL FROM "${E.LINES}" l JOIN "${E.JOURNALS}" j ON j.JOURNAL_ID = l.JOURNAL_ID WHERE j.STATUS = 'posted' GROUP BY l.ACCOUNT_CODE) b ON b.ACCOUNT_CODE = t.CODE
-        GROUP BY t.ROOT ORDER BY t.ROOT`,
-    ),
+  // Every account with all accounts under it ($connectBy root), joined to posted balances
+  // per account (a grouped $lookup pipeline), summed per root.
+  const rollup = await sim.mira(() =>
+    coll(E.ACCOUNTS).aggregate([
+      { $connectBy: { connectBy: { PARENT_CODE: "$PRIOR CODE" }, root: "CODE" } },
+      { $lookup: { from: E.LINES, pipeline: [postedOnlyEarly, { $match: { STATUS: "posted" } }, { $group: { _id: "$ACCOUNT_CODE", BAL: { $sum: "$NET" } } }], localField: "CODE", foreignField: "ACCOUNT_CODE", as: "b", joinType: "left", select: ["BAL"] } },
+      { $group: { _id: "$ROOT_CODE", TOTAL: { $sum: { $ifNull: ["$BAL", 0] } } } },
+      { $sort: { ROOT_CODE: 1 } },
+    ]),
   );
   const below = (code: string): string[] => [code, ...ACCOUNTS.filter((a) => a.PARENT_CODE === code).flatMap((a) => below(a.CODE))];
-  sim.eq("roll-up: every account's balance includes its sub-accounts", rollup.map((r) => [r.ROOT, cents(r.TOTAL)]), ACCOUNTS.map((a) => a.CODE).sort().map((c) => [c, below(c).reduce((s, x) => s + bal(x), 0)]));
+  sim.eq("roll-up ($connectBy → $lookup pipeline → $group): every account's balance includes its sub-accounts", rollup.map((r) => [r.ROOT_CODE, cents(r.TOTAL)]), ACCOUNTS.map((a) => a.CODE).sort().map((c) => [c, below(c).reduce((s, x) => s + bal(x), 0)]));
 
   // ── Cash ledger card: running balance in date order ────────────────────────
   const card = await sim.mira(() =>

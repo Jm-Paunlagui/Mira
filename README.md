@@ -876,6 +876,44 @@ const orgTree = await employees.connectBy({
 
 Extra hierarchy columns: `root: "NAME"` adds `ROOT_NAME` (CONNECT_BY_ROOT, the top row's value on every row), `includeIsLeaf: true` adds `IS_LEAF`, `includeIsCycle: true` adds `IS_CYCLE` (NOCYCLE is always on, so a loop is cut; `IS_CYCLE = 1` marks the row that would close it), and `pathColumn` chooses the column `includePath` builds the path from.
 
+### Joins and Trees Inside the Pipeline
+
+```js
+// Join a GROUPED result, not rows: each customer's total receipts next to every invoice
+await invoices.aggregate([
+    {
+        $lookup: {
+            from: "receipts",
+            pipeline: [{ $group: { _id: "$customer", paid: { $sum: "$amount" } } }],
+            localField: "customer",
+            foreignField: "customer",
+            as: "p",
+            joinType: "left",
+            select: ["PAID"],
+        },
+    },
+]);
+
+// The latest rate on or before each invoice date; outer: true keeps invoices with no rate (OUTER APPLY)
+await invoices.aggregate([
+    {
+        $lateralJoin: {
+            subquery: rates.find({ ccy: "$outer.ccy", rdate: { $lte: "$outer.idate" } }).sort({ rdate: -1 }).limit(1),
+            as: "r",
+            outer: true,
+        },
+    },
+]);
+
+// A tree as a stage: every manager with the salary of their whole team
+await employees.aggregate([
+    { $connectBy: { connectBy: { manager_id: "$PRIOR id" }, root: "id" } },
+    { $group: { _id: "$ROOT_ID", team: { $sum: "$salary" } } },
+]);
+```
+
+A `$lookup` or `$facet` pipeline can have several stages and come after other stages: its steps are written into the outer `WITH` (Oracle refuses a `WITH` nested inside another, ORA-32034). `$merge` / `$out` are not allowed inside them.
+
 ### Row Pattern Matching (MATCH_RECOGNIZE)
 
 The `$matchRecognize` stage finds runs of rows that match a pattern: stock-outs, split payments, price streaks.

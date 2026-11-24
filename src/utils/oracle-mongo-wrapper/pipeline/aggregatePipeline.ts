@@ -113,7 +113,7 @@ function _createCounter(): Counter {
  *     { $group: { _id: "$region", total: { $sum: "$amount" } } },
  *   ], db);
  */
-function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<string, unknown>): { sql: string; binds: Record<string, unknown>; } {
+function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<string, unknown>, aliasPrefix = "", hoist?: Array<{ alias: string; sql: string }>): { sql: string; binds: Record<string, unknown>; } {
   const counter = _createCounter();
   const ctes: Array<{ alias: string; sql: string }> = [];
   const allBinds: Record<string, unknown> = {};
@@ -159,8 +159,22 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
     return out.sql;
   };
 
+  // A nested pipeline ($facet branch, $lookup.pipeline) cannot be a WITH inside this
+  // statement's WITH (Oracle: ORA-32034). Its steps are hoisted into this WITH list,
+  // named apart with a prefix, and only its final SELECT is used in place; its binds
+  // are renamed if they clash with names already bound.
+  const nested = (from: string, stages: unknown[], prefix: string, bindPrefix: string): string => {
+    const inner: Array<{ alias: string; sql: string }> = [];
+    const sub = buildAggregateSQL(from, stages as Array<any>, db, prefix, inner);
+    const clash = Object.keys(sub.binds).some((k) => k in allBinds);
+    const fix = (sql: string) => (clash ? renameBinds(sql, sub.binds, bindPrefix).sql : sql);
+    for (const c of inner) ctes.push({ alias: c.alias, sql: fix(c.sql) });
+    Object.assign(allBinds, clash ? renameBinds("", sub.binds, bindPrefix).binds : sub.binds);
+    return fix(sub.sql);
+  };
+
   for (const stage of pipeline) {
-    const stageAlias = `stage_${stageIdx}`;
+    const stageAlias = `${aliasPrefix}stage_${stageIdx}`;
     const key = Object.keys(stage).filter((k) => k !== "_having")[0];
 
     switch (key) {
@@ -253,8 +267,28 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
 
       case "$lookup": {
         const { buildJoinSQL } = (require("../joins/joinBuilder") as typeof import("../joins/joinBuilder"));
-        const joinSql = buildJoinSQL(prevSource, stage.$lookup);
-        ctes.push({ alias: stageAlias, sql: joinSql });
+        const lk = stage.$lookup;
+        if (lk && lk.pipeline !== undefined) {
+          // Join the RESULT of a pipeline on `from` (e.g. a grouped total per key), not its rows.
+          if (!Array.isArray(lk.pipeline)) throw new Error(MSG.PIPELINE_LOOKUP_PIPELINE);
+          const subSql = nested(lk.from, lk.pipeline, `${stageAlias}_`, `lk${stageIdx}_`);
+          // buildJoinSQL validates the join type, on and select; the placeholder table becomes the subquery.
+          const joinSql = buildJoinSQL(prevSource, { ...lk, from: LOOKUP_SUB, as: lk.as ?? "SUB" });
+          ctes.push({ alias: stageAlias, sql: joinSql.replace(quoteIdentifier(LOOKUP_SUB), () => `(${subSql})`) });
+        } else {
+          ctes.push({ alias: stageAlias, sql: buildJoinSQL(prevSource, lk) });
+        }
+        break;
+      }
+
+      case "$connectBy": {
+        // The tree as a stage: CONNECT BY over the rows so far, so it can feed $lookup / $group.
+        const { buildConnectBy } = (require("../advanced/oracleAdvanced") as typeof import("../advanced/oracleAdvanced"));
+        const spec = stage.$connectBy;
+        const built = buildConnectBy(prevSource.slice(1, -1).replace(/""/g, '"'), spec);
+        ctes.push({ alias: stageAlias, sql: addStageBinds(built.sql, built.binds, `cb${stageIdx}_`) });
+        if (spec?.includeLevel) aliases.add("LEVEL");
+        for (const c of spec?.root == null ? [] : Array.isArray(spec.root) ? spec.root : [spec.root]) aliases.add(`ROOT_${String(c).toUpperCase()}`);
         break;
       }
 
@@ -264,7 +298,11 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
         const subSql = addStageBinds(built.sql, built.binds, `lj${stageIdx}_`);
         ctes.push({
           alias: stageAlias,
-          sql: `SELECT ${prevSource}.*, ${quoteIdentifier(lj.as)}.* FROM ${prevSource}, LATERAL (${subSql}) ${quoteIdentifier(lj.as)}`,
+          // outer: true keeps outer rows the subquery returns nothing for (OUTER APPLY),
+          // e.g. an invoice in a currency with no rate yet.
+          sql: lj.outer === true
+            ? `SELECT ${prevSource}.*, ${quoteIdentifier(lj.as)}.* FROM ${prevSource} OUTER APPLY (${subSql}) ${quoteIdentifier(lj.as)}`
+            : `SELECT ${prevSource}.*, ${quoteIdentifier(lj.as)}.* FROM ${prevSource}, LATERAL (${subSql}) ${quoteIdentifier(lj.as)}`,
         });
         break;
       }
@@ -305,21 +343,9 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
         const facetCtes: string[] = [];
         let facetIdx = 0;
         for (const [facetName, facetPipeline] of Object.entries(stage.$facet as Record<string, unknown[]>)) {
-          const built = buildAggregateSQL(
-            prevSource.replace(/"/g, ""),
-            facetPipeline,
-            db,
-          );
-          // Every facet numbers its binds from 0, so rename them per facet
-          // (f0_where_S_0, f1_where_S_0) before merging — otherwise facets
-          // would overwrite each other's values, and dropping them entirely
-          // fails with ORA-01008.
-          let sql = built.sql;
-          for (const [k, v] of Object.entries(built.binds)) {
-            const nk = `f${facetIdx}_${k}`;
-            sql = sql.replace(new RegExp(`:${k}\\b`, "g"), `:${nk}`);
-            allBinds[nk] = v;
-          }
+          // Every facet numbers its binds from 0 (renamed on clash: f0_where_S_0 …) and its
+          // steps are hoisted into this WITH list (see nested()).
+          const sql = nested(prevSource.slice(1, -1).replace(/""/g, '"'), facetPipeline, `${stageAlias}_f${facetIdx}_`, `f${facetIdx}_`);
           facetIdx++;
           facetCtes.push(
             `SELECT '${facetName.replace(/'/g, "''")}' AS "facet_name", sub.* FROM (${sql}) sub`,
@@ -373,6 +399,13 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
 
     prevSource = quoteIdentifier(stageAlias);
     stageIdx++;
+  }
+
+  // Nested pipeline: hand its steps to the outer WITH, return only the final SELECT.
+  if (hoist) {
+    if (hasMerge || outTable) throw new Error(MSG.PIPELINE_NESTED_WRITE);
+    hoist.push(...ctes.slice(0, -1));
+    return { sql: ctes.length ? ctes[ctes.length - 1].sql : `SELECT * FROM ${quoteIdentifier(tableName)}`, binds: allBinds };
   }
 
   // Build final SQL: the SELECT the pipeline produces …
@@ -726,6 +759,9 @@ function _buildAggExpr(expr: Record<string, DslSpec>, binds: Record<string, unkn
   }
   return String(expr);
 }
+
+/** Placeholder table name a $lookup pipeline's subquery replaces in the join builder's SQL. */
+const LOOKUP_SUB = "MIRA_LOOKUP_SUB$";
 
 /** Comparison operators usable in $cond / $switch conditions. */
 const COND_OPS: Readonly<Record<string, string>> = Object.freeze({ $gt: ">", $gte: ">=", $lt: "<", $lte: "<=", $eq: "=", $ne: "<>" });

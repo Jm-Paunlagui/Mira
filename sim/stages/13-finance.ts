@@ -22,13 +22,13 @@ export async function financeStage(sim: Sim, ctx: Ctx, state: State) {
   await schema.createTable(E.IMPORTS, { INV_NO: { type: "VARCHAR2(10)", primaryKey: true }, CCY: { type: "CHAR(3)" }, IDATE: { type: "DATE" }, AMOUNT: { type: "NUMBER(14,2)" } });
   await coll(E.FX).insertMany(FX, { returning: [] });
   await coll(E.IMPORTS).insertMany(IMPORTS.map((x) => ({ ...x, AMOUNT: x.AMOUNT / 100 })), { returning: [] });
-  const fx = await sim.viaSql("conversion at the rate in force on the invoice date", "the latest rate on or before a date needs a correlated subquery with a <= condition (or KEEP (DENSE_RANK LAST)); Mira's correlated subqueries only take equality", () =>
-    raw<{ INV_NO: string; PHP: string | null }>(
-      `SELECT i.INV_NO,
-              ROUND(i.AMOUNT * (SELECT MAX(r.RATE) KEEP (DENSE_RANK LAST ORDER BY r.RDATE)
-                                  FROM "${E.FX}" r WHERE r.CCY = i.CCY AND r.RDATE <= i.IDATE), 2) AS PHP
-         FROM "${E.IMPORTS}" i ORDER BY i.INV_NO`,
-    ),
+  // Latest rate on or before the invoice date: an outer lateral subquery, so a currency with no rate keeps its row.
+  const fx = await sim.mira(() =>
+    coll(E.IMPORTS).aggregate([
+      { $lateralJoin: { subquery: coll(E.FX).find({ CCY: "$outer.CCY", RDATE: { $lte: "$outer.IDATE" } }).sort({ RDATE: -1 }).limit(1).project({ RATE: 1 }), as: "R", outer: true } },
+      { $project: { INV_NO: 1, PHP: { $round: [{ $mul: ["$AMOUNT", "$RATE"] }, 2] } } },
+      { $sort: { INV_NO: 1 } },
+    ]),
   );
   sim.eq("FX: each import in pesos at the rate in force that day; no JPY rate → no amount", fx.map((r) => [r.INV_NO, r.PHP == null ? null : cents(r.PHP)]), IMPORTS.map((x) => [x.INV_NO, convert(x)]));
 
