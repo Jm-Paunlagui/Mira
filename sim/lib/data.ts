@@ -100,6 +100,11 @@ export class Model {
   addOnsKept = 0;
   addOnsRolledBack = 0;
   key = (storeId: number, sku: string) => `${storeId}:${sku}`;
+  /** General ledger lines as posted (seq = insertion order, which LINE_ID follows). */
+  gl: { jid: number; seq: number; date: Date; acct: string; dr: number; cr: number; status: "posted" | "draft"; source: string }[] = [];
+  nextJid = 1;
+  /** Inventory movements: on hand per store:sku follows these exactly. */
+  moves: { store: number; sku: string; type: string; qty: number; cost: number; date: Date; lot: string }[] = [];
 }
 
 /** Shared between stages. */
@@ -109,5 +114,7 @@ export interface State {
   createdAt: number;
   /** SCN and timestamp taken just before the back office changes prices. */
   scnBeforeBackOffice?: number;
+  /** The year's profit, closed into retained earnings by the ledger stage. */
+  profit?: number;
   tsBeforeBackOffice?: string;
 }

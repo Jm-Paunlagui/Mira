@@ -277,7 +277,7 @@ class QueryBuilder {
      *
      * @returns {{ sql: string, binds: Object }} The SQL string and bind variables
      */
-    _buildSQL(): { sql: string; binds: Record<string, unknown>; } {
+    _buildSQL(): { sql: string; binds: Record<string, unknown>; maxRows?: number } {
         const { whereClause, binds } = parseFilter(this.filter, "t0");
 
         // Projection
@@ -387,6 +387,16 @@ class QueryBuilder {
             return { sql: `SELECT ${selectCols} FROM ${tableRef}${where}${orderBy}${lock}`, binds };
         }
 
+        // A work queue: SKIP LOCKED with a limit. Picking the page in a subquery
+        // would choose rows before the lock skips the busy ones, so a second
+        // worker got nothing while free rows were waiting. Instead the cursor
+        // locks rows as it fetches them, and _execute stops after `limit`
+        // (maxRows, with prefetch sized to match so no extra row is locked).
+        const skipLocked = this._forUpdate === "skip locked" || (typeof this._forUpdate === "object" && (this._forUpdate as ForUpdateOptions).skipLocked === true);
+        if (skipLocked && this._skip == null && Number(this._limit) > 0) {
+            return { sql: `SELECT ${selectCols} FROM ${tableRef}${where}${orderBy}${lock}`, binds, maxRows: Number(this._limit) };
+        }
+
         // Oracle rejects FETCH FIRST / OFFSET together with FOR UPDATE
         // (ORA-02014): pick the page's ROWIDs in a subquery, lock in the outer
         // query. The filter is repeated outside so a row changed between the
@@ -450,13 +460,21 @@ class QueryBuilder {
      */
     async _execute(): Promise<Array<any>> {
         await this._resolveFilterPromises();
-        const { sql, binds } = this._buildSQL();
+        const { sql, binds, maxRows } = this._buildSQL();
+        // SKIP LOCKED queue reads stop after `maxRows`; prefetch no more than that,
+        // since every row the server fetches is locked.
+        const rowLimit = maxRows ? { maxRows, fetchArraySize: maxRows, prefetchRows: maxRows } : {};
 
         const fn = async (conn: DbConnection) => {
             try {
                 const result = await conn.execute(sql, binds, {
                     outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
-                    autoCommit: !this._conn,
+                    // Never auto-commit a locking read: the commit ends the FOR UPDATE
+                    // cursor before every row is fetched (ORA-01002 once rows are
+                    // skipped or the result needs a second round trip). A standalone
+                    // read's locks end when its connection returns to the pool.
+                    autoCommit: !this._conn && !this._forUpdate,
+                    ...rowLimit,
                 });
                 let rows = result.rows || [];
 

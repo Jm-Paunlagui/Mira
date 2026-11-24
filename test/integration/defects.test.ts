@@ -125,6 +125,40 @@ describe("integration: defects that returned wrong data with no error", () => {
     await n.deleteMany({});
   });
 
+  it("DEFECT: forUpdate('skip locked') with limit hands the next free row to a second worker, and locks only that row", async () => {
+    const L = "MIRA_SD_LOTS";
+    await dropIfExists(L);
+    await schema.createTable(L, { LOT: { type: "VARCHAR2(5)", primaryKey: true }, EXP: { type: "NUMBER" } });
+    await coll(L).insertMany(["A", "B", "C", "D"].map((LOT, i) => ({ LOT, EXP: i })), { returning: [] });
+    const tx = new Transaction(db);
+    const lots = (rows: unknown[]) => (rows as { LOT: string }[]).map((r) => r.LOT);
+    await tx.withTransaction(async (a) => {
+      expect(lots(await a.collection(L).find({}).sort({ EXP: 1 }).limit(1).forUpdate("skip locked").toArray())).toEqual(["A"]);
+      await tx.withTransaction(async (b) => {
+        // Before the fix the page was picked in a FETCH FIRST subquery: it chose A, the lock skipped it, B got nothing.
+        expect(lots(await b.collection(L).find({}).sort({ EXP: 1 }).limit(1).forUpdate({ skipLocked: true }).toArray())).toEqual(["B"]);
+        // Only B was locked (no prefetched rows): C and D are still free for a third worker.
+        expect(lots(await coll(L).find({}).sort({ EXP: 1 }).forUpdate("skip locked").toArray())).toEqual(["C", "D"]);
+      });
+    });
+    expect(await coll(L).find({}).limit(0).forUpdate("skip locked").toArray()).toEqual([]);
+    await dropIfExists(L);
+  });
+
+  it("DEFECT: a standalone forUpdate('skip locked') read works while another session holds locks", async () => {
+    const L = "MIRA_SD_LOTS2";
+    await dropIfExists(L);
+    await schema.createTable(L, { LOT: { type: "VARCHAR2(5)", primaryKey: true } });
+    await coll(L).insertMany(["A", "B", "C", "D"].map((LOT) => ({ LOT })), { returning: [] });
+    await new Transaction(db).withTransaction(async (a) => {
+      await a.collection(L).find({ LOT: { $in: ["A", "B"] } }).forUpdate(true).toArray();
+      // autoCommit on a FOR UPDATE cursor committed before the fetch finished: ORA-01002.
+      const free = await coll(L).find({}).sort({ LOT: 1 }).forUpdate("skip locked").toArray<{ LOT: string }>();
+      expect(free.map((r) => r.LOT)).toEqual(["C", "D"]);
+    });
+    await dropIfExists(L);
+  });
+
   it("DEFECT: bulkWrite on a session collection joins the session's transaction", async () => {
     await expect(
       new Transaction(db).withTransaction(async (s) => {
@@ -157,6 +191,16 @@ describe("integration: defects that failed loudly", () => {
     await new Transaction(db).withTransaction((s) => s.collection(N).insertOne({ A: 11, B: "tx" }));
     expect(await coll(N).countDocuments({ A: { $in: [10, 11] } })).toBe(2);
     await expect(coll(N).insertOne({ NOPE: 1 })).rejects.toThrow(/ORA-00904/);
+  });
+
+  it("DEFECT: createTable accepts a column with both a default and NOT NULL / PRIMARY KEY", async () => {
+    const T = "MIRA_SD_DEFNN";
+    await dropIfExists(T);
+    // Oracle wants DEFAULT before the constraints; NOT NULL DEFAULT 0 was ORA-00907.
+    await schema.createTable(T, { ID: { type: "NUMBER", primaryKey: true, default: 1 }, QTY: { type: "NUMBER", notNull: true, default: 0, check: "QTY >= 0" }, NOTE: { type: "VARCHAR2(10)" } });
+    await coll(T).insertMany([{ NOTE: "x" }], { returning: [] });
+    expect(await coll(T).findOne({ NOTE: "x" })).toEqual({ ID: 1, QTY: 0, NOTE: "x" });
+    await dropIfExists(T);
   });
 
   it("DEFECT: getIndexes names a descending column", async () => {

@@ -1201,7 +1201,7 @@ bun run test:unit       # or :integration / :performance / :chaos / :security / 
 
 ## Simulation
 
-`bun run sim` plays out a three-branch canteen end to end through Mira, in an Oracle schema that belongs to the simulation alone. It covers:
+`bun run sim` plays out a three-branch canteen, and the small enterprise behind it, end to end through Mira, in an Oracle schema that belongs to the simulation alone. It covers:
 
 1. **Schema:** DDL and grants
 2. **Opening stock and menu:** inserts, batch errors, `bulkWrite`, indexes and views
@@ -1211,6 +1211,15 @@ bun run test:unit       # or :integration / :performance / :chaos / :security / 
 6. **The standalone SQL builders:** each one is run and compared with the method it backs
 7. **Statistics, plans and materialized views**
 8. **Hostile input:** against every option that reaches SQL
+9. **General ledger:** every event of the year posted as double-entry journals; trial balance, account-tree roll-up, cash ledger card (running balance), budget vs actual, `ROLLUP`, quarterly P&L (`PIVOT`), month-on-month (`LAG`), year-end close into retained earnings
+10. **Receivables and payables:** FIFO cash application, aging, invoice-number gaps, duplicate payments
+11. **Inventory:** a movement ledger reconciled to the stock table, weighted average and FIFO cost, FEFO lot picking by two workers at once (`SKIP LOCKED`), ABC analysis, reorder alerts, stock-out runs, zero-sales days
+12. **Kitchen production:** multi-level recipes (bill of materials): explosion, where-used, MRP net requirements, cost roll-up, cycle detection
+13. **Finance:** FX at the rate in force, loan and depreciation schedules checked against the ledger, `CUBE` / `GROUPING SETS`, an allocation exact to the cent
+14. **Audit:** Benford, journals without lines, split payments
+15. **Operations:** pool stats, health, shutdown
+
+Business queries Mira's API cannot express (for example `MATCH_RECOGNIZE`, date arithmetic, `CONNECT_BY_ROOT`) run as hand-written SQL, are still checked, and are listed at the end as **coverage gaps** with the reason: a measured list of what Mira could support next.
 
 Every result is checked against an in-memory model of the business or a hand-written SQL read. Then the run proves that **every public Mira function was called** (`sim/lib/tracker.ts`), and lists any that were not.
 

@@ -15,7 +15,23 @@
  *   6 builders     every standalone SQL builder, run and compared with the API
  *   7 performance  statistics, EXPLAIN PLAN, materialized views
  *   8 security     hostile input against every option that reaches SQL
- *   9 operations   pool stats, health, shutdown
+ *   9 ledger       double-entry general ledger for the year: trial balance,
+ *                  account-tree roll-up, cash ledger card, budget vs actual,
+ *                  ROLLUP, quarterly P&L, month-on-month, year-end close
+ *  10 receivables  corporate invoices and receipts, FIFO application, aging,
+ *                  invoice-number gaps, duplicate supplier payments
+ *  11 inventory    movement ledger reconciled to stock, weighted average and
+ *                  FIFO cost, FEFO picking by two workers, ABC, reorder
+ *                  alerts, stock-out runs, zero-sales days
+ *  12 kitchen      multi-level recipes: explosion, where-used, MRP, cost roll-up
+ *  13 finance      FX at the rate in force, loan and depreciation schedules vs
+ *                  the ledger, CUBE / GROUPING SETS, allocation to the cent
+ *  14 audit        Benford, orphan journals, split payments
+ *  15 operations   pool stats, health, shutdown
+ *
+ * Queries Mira's API cannot express run as hand-written SQL through an
+ * untracked handle, are still checked against the model, and are listed as
+ * coverage gaps at the end: a measured list of what Mira could support next.
  *
  * Then it proves every public Mira function was called by the simulation
  * (sim/lib/tracker.ts). Exit code 0 only when every check passed AND no public
@@ -38,6 +54,12 @@ import { reportsStage } from "./stages/05-reports";
 import { buildersStage } from "./stages/06-builders";
 import { performanceStage } from "./stages/07-performance";
 import { securityStage } from "./stages/08-security";
+import { ledgerStage } from "./stages/09-ledger";
+import { receivablesStage } from "./stages/10-receivables";
+import { inventoryStage } from "./stages/11-inventory";
+import { kitchenStage } from "./stages/12-kitchen";
+import { financeStage } from "./stages/13-finance";
+import { auditStage } from "./stages/14-audit";
 
 const t0 = performance.now();
 const ctx = await buildContext();
@@ -77,7 +99,13 @@ await sim.stage("5 reports", () => reportsStage(sim, ctx, state));
 await sim.stage("6 builders", () => buildersStage(sim, ctx, state));
 await sim.stage("7 performance", () => performanceStage(sim, ctx, state));
 await sim.stage("8 security", () => securityStage(sim, ctx, state));
-await sim.stage("9 operations", async () => {
+await sim.stage("9 ledger", () => ledgerStage(sim, ctx, state));
+await sim.stage("10 receivables", () => receivablesStage(sim, ctx, state));
+await sim.stage("11 inventory", () => inventoryStage(sim, ctx, state));
+await sim.stage("12 kitchen", () => kitchenStage(sim, ctx, state));
+await sim.stage("13 finance", () => financeStage(sim, ctx, state));
+await sim.stage("14 audit", () => auditStage(sim, ctx, state));
+await sim.stage("15 operations", async () => {
   sim.eq("isHealthy: the pool is up", ctx.db.isHealthy(), true);
   const stats = (await ctx.db.getPoolStats()) as { pools?: Record<string, unknown> | unknown[] };
   sim.ok("getPoolStats: reports the appDb pool", JSON.stringify(stats).includes("appDb"), stats);
@@ -113,7 +141,12 @@ if (unexpected.length) {
   unexpected.forEach(show);
 }
 
-console.log(`\n  API surface: ${surface.used.length}/${surface.total} public Mira functions called by the simulation`);
+if (sim.gaps.length) {
+  console.log(`\n  Coverage gaps: ${sim.gaps.length} business queries Mira's API cannot express (run as hand-written SQL, still checked):`);
+  for (const g of sim.gaps) console.log(`   · [${g.stage}] ${g.label}\n       ${g.reason}`);
+}
+console.log(`\n  Query coverage: ${sim.viaMira} queries through Mira's API, ${sim.gaps.length} gaps (${((100 * sim.viaMira) / Math.max(1, sim.viaMira + sim.gaps.length)).toFixed(0)}% expressible)`);
+console.log(`  API surface: ${surface.used.length}/${surface.total} public Mira functions called by the simulation`);
 if (surface.unused.length) {
   console.log("  NOT exercised:");
   for (const u of surface.unused) console.log(`   ✗ ${u}`);
