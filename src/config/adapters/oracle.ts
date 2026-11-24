@@ -1159,7 +1159,9 @@ function _timeout(ms: number, msg: string) {
 // SECTION 5 — Exports
 // ─────────────────────────────────────────────────────────────────────────────
 
-const __export_isPoolHealthy = (name: string) => healthMonitor.isHealthy(name);
+// After closeAll() the pools are gone for good (getPool refuses while shutting down), so
+// no pool is healthy any more, including one that was never created.
+const __export_isPoolHealthy = (name: string) => !isShuttingDown && healthMonitor.isHealthy(name);
 const __export_getHealthMetrics = () => healthMonitor.getMetrics();
 const __export___setPoolHealthForTest = (name: string, healthy: unknown) => {
         if (process.env.NODE_ENV !== "test") {

@@ -27,6 +27,7 @@ Oracle Database
 - [Advanced — Window Functions, CTEs, Hierarchies & More](#-advanced--window-functions-ctes-hierarchies--more)
 - [Operator Reference](#operator-reference)
 - [Testing](#testing)
+- [Simulation](#simulation)
 
 ---
 
@@ -302,6 +303,14 @@ await users.find({ age: { $between: [18, 65] } }).toArray();
 
 // Check if a field is NOT null
 await users.find({ email: { $exists: true } }).toArray();
+await users.find({ email: { $ne: null } }).toArray(); // same: IS NOT NULL ({ $eq: null } is IS NULL)
+
+// Compare with the database clock (never the app's)
+await sessions.find({ last_seen: { $gte: { $now: { minus: { minutes: 30 } } } } }).toArray();
+// $now is the database server's wall-clock time as a plain TIMESTAMP, the same value
+// $currentDate stores, so DATE / TIMESTAMP columns compare correctly whatever the app's
+// time zone. For a TIMESTAMP WITH TIME ZONE column add withTimeZone: true.
+await events.find({ at_tz: { $lt: { $now: { withTimeZone: true } } } }).toArray();
 
 // Pattern matching
 await users.find({ name: { $like: "J%" } }).toArray(); // SQL LIKE
@@ -986,20 +995,14 @@ await users
     })
     .toArray();
 
-// COALESCE — first non-null value
+// COALESCE — the field equals the first non-null value ("$col" is a column, anything else a value)
 await users
-    .find({})
-    .project({
-        displayName: { $coalesce: ["$nickname", "$name", "Anonymous"] },
-    })
+    .find({ displayName: { $coalesce: ["$nickname", "$name", "Anonymous"] } })
     .toArray();
 
-// NULLIF — returns NULL if two values are equal
+// NULLIF — the field equals NULLIF(column, value)
 await users
-    .find({})
-    .project({
-        effectiveDiscount: { $nullif: ["$discount", 0] },
-    })
+    .find({ discount: { $nullif: ["base_discount", 0] } })
     .toArray();
 ```
 
@@ -1195,5 +1198,43 @@ bun run test:unit       # or :integration / :performance / :chaos / :security / 
 **Database prerequisites.** The schema user needs `CREATE TABLE`, `CREATE VIEW`, `CREATE SEQUENCE`, `CREATE SYNONYM`, `CREATE MATERIALIZED VIEW` and a tablespace quota (`ALTER USER <user> QUOTA UNLIMITED ON USERS;`). Every suite creates its own `MIRA_<suite>_*` tables and drops them afterwards.
 
 **Results.** The runner prints a scorecard per category. Tests named `DEFECT:` / `SECURITY:` assert the *fixed* behaviour of a known open issue and are reported separately from unexpected failures. Each run is stored under one `RUN_ID` in two tables that are kept between runs: `MIRA_TEST_RESULTS` (one row per test) and `MIRA_TEST_METRICS` (latencies, throughput, counts). Set `MIRA_SKIP_PERSIST=1` to skip writing them; performance budgets can be tightened with `MIRA_PERF_*` env vars (see `test/performance/perf.test.ts`).
+
+## Simulation
+
+`bun run sim` plays out a three-branch canteen end to end through Mira, in an Oracle schema that belongs to the simulation alone. It covers:
+
+1. **Schema:** DDL and grants
+2. **Opening stock and menu:** inserts, batch errors, `bulkWrite`, indexes and views
+3. **A trading day:** 36 till sales, each one transaction with row locks, a savepoint for an add-on dessert, check constraints that refuse an oversell, and payment from credit
+4. **Back office:** price feed `MERGE`, upserts, replace, find-and-modify, deletes, `UPDATE … FROM JOIN`, `INSERT … SELECT`, `PIVOT` / `UNPIVOT`
+5. **Reports:** every filter operator and pipeline stage, set operations, CTEs, `CONNECT BY`, flashback and `SAMPLE`
+6. **The standalone SQL builders:** each one is run and compared with the method it backs
+7. **Statistics, plans and materialized views**
+8. **Hostile input:** against every option that reaches SQL
+
+Every result is checked against an in-memory model of the business or a hand-written SQL read. Then the run proves that **every public Mira function was called** (`sim/lib/tracker.ts`), and lists any that were not.
+
+**One-time setup (DBA).** Create the schema with `sim/setup-schema.sql`, then add its credentials to `.env`:
+
+```bash
+docker cp sim/setup-schema.sql oracle19c:/tmp/s.sql
+docker exec oracle19c sqlplus -s / as sysdba @/tmp/s.sql '<password>'
+# .env
+MIRA_SIM_DB_USERNAME=MIRA_SIM
+MIRA_SIM_DB_PASSWORD=<password>
+```
+
+The simulation drops and rebuilds its `SIM_*` objects on every run. It refuses to start when `MIRA_SIM_DB_USERNAME` is the app or test schema, or when the connection is not that user.
+
+- **`MIRA_SIM_DB_HOST` / `_PORT` / `_SID`:** default to the main `DB_*` values.
+- **`MIRA_SIM_GRANTEE`:** the schema the DCL checks grant to (default `APP_DB_USERNAME`).
+- **`MIRA_SIM_KEEP=1`:** leaves the `SIM_*` objects in place for inspection.
+- **`MIRA_LOGS=1`:** shows Mira's own logs.
+
+**Results.** The run prints a table per stage, then any failed checks. Checks named `DEFECT:` assert the correct behaviour of a known open defect and are listed separately, as in the test suite. The exit code is 0 only when every check passed and no public function went unused.
+
+Unlike `bun test`, which always runs with `TZ=UTC`, the simulation runs in the machine's real time zone, so time-zone bugs show up here.
+
+`sim/RESEARCH.md` collects the Oracle 19c query research (a catalog from basic to expert, plus accounting and inventory patterns), a map of what SQL Mira's API can express, the defects confirmed so far, and the plan for growing the simulation.
 
 ## Apache License 2.0 © 2026 John Moises Paunlagui. All rights reserved. See LICENSE.txt for details.

@@ -312,170 +312,69 @@ class OracleCollection {
     async findOneAndUpdate<T = Record<string, unknown>>(filter: Record<string, unknown>, update: Record<string, unknown>, options: Record<string, unknown> = {}): Promise<T | null> {
         return this._execute(async (conn) => {
             const { whereClause, binds: filterBinds } = parseFilter(filter);
-            const selectSql = `SELECT * FROM ${quoteIdentifier(this.tableName)} t0 ${whereClause} FETCH FIRST 1 ROW ONLY`;
+            // Lock exactly one matching row, then change that row only (by ROWID):
+            // updating by the filter again would change EVERY matching row.
+            const found = await this._lockOne<T>(conn, whereClause, filterBinds, "OracleCollection.findOneAndUpdate");
 
-            // Fast path: MERGE-based atomic upsert (saves one round-trip)
-            // Applies when: upsert + returnDocument:"after" + simple equality filter
-            if (options.upsert && options.returnDocument === "after") {
-                const filterEntries = Object.entries(filter);
-                const isSimpleEquality =
-                    filterEntries.length > 0 &&
-                    filterEntries.every(
-                        ([, v]) =>
-                            v !== null &&
-                            v !== undefined &&
-                            typeof v !== "object",
-                    );
-
-                if (isSimpleEquality) {
-                    const { setClause, binds: updateBinds } =
-                        parseUpdate(update);
-                    const mergeBinds: Record<string, unknown> = {};
-
-                    // Source row from filter equality values
-                    const srcParts: unknown[] = [];
-                    filterEntries.forEach(([col, val], i) => {
-                        const bname = `src_${i}`;
-                        srcParts.push(`:${bname} AS ${quoteIdentifier(col)}`);
-                        mergeBinds[bname] = val;
-                    });
-
-                    // ON clause: target.col = source.col for each filter key
-                    const onParts = filterEntries.map(
-                        ([col]) =>
-                            `tgt.${quoteIdentifier(col)} = src.${quoteIdentifier(col)}`,
-                    );
-
-                    // WHEN MATCHED: apply update operators
-                    Object.assign(mergeBinds, updateBinds);
-
-                    // WHEN NOT MATCHED: insert filter scalars + $set values
-                    const insertFields: Record<string, unknown> = {};
-                    filterEntries.forEach(([k, v]) => {
-                        insertFields[k] = v;
-                    });
-                    if (update.$set) Object.assign(insertFields, update.$set);
-
-                    const filterColSet = new Set(filterEntries.map(([k]) => k));
-                    const insertCols: string[] = [];
-                    const insertVals: string[] = [];
-                    for (const [col, val] of Object.entries(insertFields)) {
-                        insertCols.push(quoteIdentifier(col));
-                        if (filterColSet.has(col)) {
-                            insertVals.push(`src.${quoteIdentifier(col)}`);
-                        } else {
-                            const bname = `ins_${insertCols.length}`;
-                            mergeBinds[bname] = val;
-                            insertVals.push(`:${bname}`);
-                        }
-                    }
-
-                    const mergeSql: string =
-                        `MERGE INTO ${quoteIdentifier(this.tableName)} tgt ` +
-                        `USING (SELECT ${srcParts.join(", ")} FROM DUAL) src ` +
-                        `ON (${onParts.join(" AND ")}) ` +
-                        `WHEN MATCHED THEN UPDATE ${setClause} ` +
-                        `WHEN NOT MATCHED THEN INSERT (${insertCols.join(", ")}) VALUES (${insertVals.join(", ")})`;
-
-                    try {
-                        await conn.execute(mergeSql, mergeBinds, {
-                            autoCommit: !this._conn,
-                        });
-                    } catch (err) {
-                        throw new Error(
-                            MSG.wrapError(
-                                "OracleCollection.findOneAndUpdate",
-                                err,
-                                mergeSql,
-                                mergeBinds,
-                            ),
-                        );
-                    }
-
-                    const afterResult = await conn.execute<T>(
-                        selectSql,
-                        filterBinds,
-                        {
-                            outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
-                        },
-                    );
-                    return (afterResult.rows ?? [])[0] ?? null;
-                }
-            }
-
-            // Standard path: SELECT first to get the before-document
-            const found = await conn.execute<T & Record<string, unknown>>(selectSql, filterBinds, {
-                outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
-            });
-            const beforeDoc = (found.rows ?? [])[0] ?? null;
-
-            if (!beforeDoc && options.upsert) {
-                // Upsert: insert
+            if (!found) {
+                if (!options.upsert) return null;
+                // Upsert: insert the filter's equality values plus $set.
                 const fields: Record<string, unknown> = {};
                 if (update.$set) Object.assign(fields, update.$set);
                 for (const [k, v] of Object.entries(filter)) {
                     if (typeof v !== "object") fields[k] = v;
                 }
                 const cols = Object.keys(fields);
-                const vals = cols.map((_, i) => `:v${i}`);
                 const insertBinds: Record<string, unknown> = {};
                 cols.forEach((c, i) => {
                     insertBinds[`v${i}`] = fields[c];
                 });
-                const insertSql = `INSERT INTO ${quoteIdentifier(this.tableName)} (${cols.map(quoteIdentifier).join(", ")}) VALUES (${vals.join(", ")})`;
-                await conn.execute(insertSql, insertBinds, {
-                    autoCommit: !this._conn,
-                });
-
-                if (options.returnDocument === "after") {
-                    const afterResult = await conn.execute<T>(
-                        selectSql,
-                        filterBinds,
-                        {
-                            outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
-                        },
-                    );
-                    return (afterResult.rows ?? [])[0] ?? null;
+                const insertSql = `INSERT INTO ${quoteIdentifier(this.tableName)} (${cols.map(quoteIdentifier).join(", ")}) VALUES (${cols.map((_, i) => `:v${i}`).join(", ")}) RETURNING ROWID INTO :mira_rid`;
+                let rid: unknown;
+                try {
+                    const ins = await conn.execute(insertSql, { ...insertBinds, mira_rid: { dir: this.db.oracledb.BIND_OUT, type: this.db.oracledb.STRING } }, { autoCommit: !this._conn });
+                    rid = (ins.outBinds as Record<string, unknown[]> | undefined)?.mira_rid?.[0];
+                } catch (err) {
+                    throw new Error(MSG.wrapError("OracleCollection.findOneAndUpdate", err, insertSql, insertBinds));
                 }
-                return null;
+                return options.returnDocument === "after" ? this._readByRowid<T>(conn, rid) : null;
             }
 
-            if (!beforeDoc) return null;
-
-            // Build update
+            const rid = found.MIRA_RID_;
+            delete found.MIRA_RID_;
             const { setClause, binds: updateBinds } = parseUpdate(update);
-            const allBinds = mergeBinds(filterBinds, updateBinds);
-            const updateSql = `UPDATE ${quoteIdentifier(this.tableName)} t0 ${setClause} ${whereClause}`;
-
+            const updateSql = `UPDATE ${quoteIdentifier(this.tableName)} t0 ${setClause} WHERE t0.ROWID = :mira_rid`;
             try {
-                await conn.execute(updateSql, allBinds, {
-                    autoCommit: !this._conn,
-                });
+                await conn.execute(updateSql, { ...updateBinds, mira_rid: rid }, { autoCommit: !this._conn });
             } catch (err) {
-                throw new Error(
-                    MSG.wrapError(
-                        "OracleCollection.findOneAndUpdate",
-                        err,
-                        updateSql,
-                    ),
-                );
+                throw new Error(MSG.wrapError("OracleCollection.findOneAndUpdate", err, updateSql));
             }
-
-            if (options.returnDocument === "after") {
-                // Re-select after update — use filter or original ID
-                const afterFilter =
-                    beforeDoc.ID != null ? { ID: beforeDoc.ID } : filter;
-                const { whereClause: afterWhere, binds: afterBinds } =
-                    parseFilter(afterFilter);
-                const afterSql = `SELECT * FROM ${quoteIdentifier(this.tableName)} t0 ${afterWhere} FETCH FIRST 1 ROW ONLY`;
-                const afterResult = await conn.execute<T>(afterSql, afterBinds, {
-                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
-                });
-                return (afterResult.rows ?? [])[0] ?? null;
-            }
-
-            return beforeDoc;
+            // The changed row by its ROWID: the filter may no longer match it.
+            return options.returnDocument === "after" ? this._readByRowid<T>(conn, rid) : found;
         });
+    }
+
+    /**
+     * Internal: select ONE row matching `whereClause` and lock it (FOR UPDATE),
+     * with its ROWID as MIRA_RID_. FETCH FIRST cannot be combined with FOR UPDATE
+     * (ORA-02014), so the row is picked in a subquery and locked outside it.
+     */
+    async _lockOne<T>(conn: DbConnection, whereClause: string, binds: Record<string, unknown>, scope: string): Promise<(T & Record<string, unknown>) | null> {
+        const t = quoteIdentifier(this.tableName);
+        const sql = `SELECT t0.*, t0.ROWID AS "MIRA_RID_" FROM ${t} t0 WHERE t0.ROWID IN (SELECT t0.ROWID FROM ${t} t0 ${whereClause} FETCH FIRST 1 ROW ONLY) FOR UPDATE`;
+        try {
+            const r = await conn.execute<T & Record<string, unknown>>(sql, binds, { outFormat: this.db.oracledb.OUT_FORMAT_OBJECT });
+            return (r.rows ?? [])[0] ?? null;
+        } catch (err) {
+            throw new Error(MSG.wrapError(scope, err, sql, binds));
+        }
+    }
+
+    /** Internal: the current version of the row at `rid`. */
+    async _readByRowid<T>(conn: DbConnection, rid: unknown): Promise<T | null> {
+        const sql = `SELECT * FROM ${quoteIdentifier(this.tableName)} t0 WHERE t0.ROWID = :mira_rid`;
+        const r = await conn.execute<T>(sql, { mira_rid: rid }, { outFormat: this.db.oracledb.OUT_FORMAT_OBJECT });
+        return (r.rows ?? [])[0] ?? null;
     }
 
     /**
@@ -551,13 +450,11 @@ class OracleCollection {
     async findOneAndReplace<T = Record<string, unknown>>(filter: Record<string, unknown>, replacement: Record<string, unknown>, options: Record<string, unknown> = {}): Promise<T | null> {
         return this._execute(async (conn) => {
             const { whereClause, binds: filterBinds } = parseFilter(filter);
-            const selectSql = `SELECT * FROM ${quoteIdentifier(this.tableName)} t0 ${whereClause} FETCH FIRST 1 ROW ONLY`;
-
-            const found = await conn.execute<T & Record<string, unknown>>(selectSql, filterBinds, {
-                outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
-            });
-            const beforeDoc = (found.rows ?? [])[0] ?? null;
+            // One locked row, replaced by ROWID (the filter alone would replace every match).
+            const beforeDoc = await this._lockOne<T>(conn, whereClause, filterBinds, "OracleCollection.findOneAndReplace");
             if (!beforeDoc) return null;
+            const rid = beforeDoc.MIRA_RID_;
+            delete beforeDoc.MIRA_RID_;
 
             // Build SET from replacement (exclude ID/primary key)
             const cols = Object.keys(replacement).filter((c) => c !== "ID");
@@ -569,34 +466,13 @@ class OracleCollection {
                 setParts.push(`${quoteIdentifier(c)} = :${bname}`);
             });
 
-            const allBinds = mergeBinds(filterBinds, replBinds);
-            const updateSql = `UPDATE ${quoteIdentifier(this.tableName)} t0 SET ${setParts.join(", ")} ${whereClause}`;
-
+            const updateSql = `UPDATE ${quoteIdentifier(this.tableName)} t0 SET ${setParts.join(", ")} WHERE t0.ROWID = :mira_rid`;
             try {
-                await conn.execute(updateSql, allBinds, {
-                    autoCommit: !this._conn,
-                });
+                await conn.execute(updateSql, { ...replBinds, mira_rid: rid }, { autoCommit: !this._conn });
             } catch (err) {
-                throw new Error(
-                    MSG.wrapError(
-                        "OracleCollection.findOneAndReplace",
-                        err,
-                        updateSql,
-                    ),
-                );
+                throw new Error(MSG.wrapError("OracleCollection.findOneAndReplace", err, updateSql));
             }
-
-            if (options.returnDocument === "after") {
-                const afterFilter =
-                    beforeDoc.ID != null ? { ID: beforeDoc.ID } : filter;
-                const { whereClause: aw, binds: ab } = parseFilter(afterFilter);
-                const afterSql = `SELECT * FROM ${quoteIdentifier(this.tableName)} t0 ${aw} FETCH FIRST 1 ROW ONLY`;
-                const afterResult = await conn.execute<T>(afterSql, ab, {
-                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
-                });
-                return (afterResult.rows ?? [])[0] ?? null;
-            }
-            return beforeDoc;
+            return options.returnDocument === "after" ? this._readByRowid<T>(conn, rid) : beforeDoc;
         });
     }
 
@@ -778,13 +654,23 @@ class OracleCollection {
                 }
             }
 
-            const allBinds = { ...binds, ...outBinds };
-            const sql = `INSERT INTO ${quoteIdentifier(this.tableName)} (${cols.map(quoteIdentifier).join(", ")}) VALUES (${bindNames.join(", ")})${returningSql}`;
+            const allBinds: Record<string, unknown> = { ...binds, ...outBinds };
+            const autoId = "out_id" in outBinds;
+            let sql = `INSERT INTO ${quoteIdentifier(this.tableName)} (${cols.map(quoteIdentifier).join(", ")}) VALUES (${bindNames.join(", ")})${returningSql}`;
 
             try {
-                const result = await conn.execute(sql, allBinds, {
-                    autoCommit: !this._conn,
-                });
+                let result;
+                try {
+                    result = await conn.execute(sql, allBinds, { autoCommit: !this._conn });
+                } catch (e) {
+                    // The automatic RETURNING "ID" assumes an ID column. A table without one
+                    // refuses the whole statement (ORA-00904 "ID"), so nothing was inserted:
+                    // insert again without it, and report insertedId: null.
+                    if (!autoId || e.errorNum !== 904 || !String(e.message).includes('"ID"')) throw e;
+                    sql = sql.slice(0, sql.length - returningSql.length);
+                    delete allBinds.out_id;
+                    result = await conn.execute(sql, allBinds, { autoCommit: !this._conn });
+                }
                 const response: { acknowledged: boolean; insertedId: number | string | null; returning?: Record<string, unknown> } = { acknowledged: true, insertedId: null };
 
                 // Extract insertedId
@@ -1174,7 +1060,7 @@ class OracleCollection {
      *     { $set: { status: "premium" }, $inc: { loginCount: 1 } }
      *   );
      */
-    async updateOne(filter: Record<string, unknown>, update: Record<string, unknown>, options: UpdateOptions = {}): Promise<{ acknowledged: boolean; matchedCount: number; modifiedCount: number; returning?: Record<string, unknown>;  }> {
+    async updateOne(filter: Record<string, unknown>, update: Record<string, unknown>, options: UpdateOptions = {}): Promise<{ acknowledged: boolean; matchedCount: number; modifiedCount: number; upsertedCount?: number; returning?: Record<string, unknown>;  }> {
         return this._execute(async (conn) => {
             const { whereClause, binds: filterBinds } = parseFilter(filter);
             const { setClause, binds: updateBinds } = parseUpdate(update);
@@ -1383,12 +1269,9 @@ class OracleCollection {
             throw new Error(MSG.BULK_WRITE_EMPTY);
         }
 
-        return this.db.withTransaction(async (conn: DbConnection) => {
-            const sessionColl = new OracleCollection(
-                this.tableName,
-                this.db,
-                conn,
-            );
+        // On a session collection the operations join the session's transaction (its
+        // commit / rollback decides); standalone, they run in a transaction of their own.
+        const run = async (sessionColl: OracleCollection) => {
             const results: unknown[] = [];
 
             for (const op of operations) {
@@ -1437,7 +1320,9 @@ class OracleCollection {
             }
 
             return { acknowledged: true, results };
-        });
+        };
+        if (this._conn) return run(this);
+        return this.db.withTransaction((conn: DbConnection) => run(new OracleCollection(this.tableName, this.db, conn)));
     }
 
     // ─── Delete Operations ───────────────────────────────────────
@@ -1763,8 +1648,10 @@ class OracleCollection {
      */
     async getIndexes(): Promise<Array<{ indexName: string; columns: string[]; unique: boolean; type: string;  }>> {
         return this._execute(async (conn) => {
-            const sql = `SELECT i.INDEX_NAME, i.UNIQUENESS, i.INDEX_TYPE, ic.COLUMN_NAME, ic.COLUMN_POSITION FROM USER_INDEXES i JOIN USER_IND_COLUMNS ic ON i.INDEX_NAME = ic.INDEX_NAME WHERE i.TABLE_NAME = UPPER(:tbl) ORDER BY i.INDEX_NAME, ic.COLUMN_POSITION`;
-            const result = await conn.execute<{ INDEX_NAME: string; UNIQUENESS: string; INDEX_TYPE: string; COLUMN_NAME: string }>(
+            // A DESC column is stored as a function-based index on a hidden SYS_NC…$
+            // column; its real expression ("QUARTER") is in USER_IND_EXPRESSIONS.
+            const sql = `SELECT i.INDEX_NAME, i.UNIQUENESS, i.INDEX_TYPE, ic.COLUMN_NAME, ic.COLUMN_POSITION, e.COLUMN_EXPRESSION FROM USER_INDEXES i JOIN USER_IND_COLUMNS ic ON i.INDEX_NAME = ic.INDEX_NAME LEFT JOIN USER_IND_EXPRESSIONS e ON e.INDEX_NAME = ic.INDEX_NAME AND e.COLUMN_POSITION = ic.COLUMN_POSITION WHERE i.TABLE_NAME = UPPER(:tbl) ORDER BY i.INDEX_NAME, ic.COLUMN_POSITION`;
+            const result = await conn.execute<{ INDEX_NAME: string; UNIQUENESS: string; INDEX_TYPE: string; COLUMN_NAME: string; COLUMN_EXPRESSION: string | null }>(
                 sql,
                 { tbl: this.tableName },
                 {
@@ -1782,7 +1669,10 @@ class OracleCollection {
                         type: row.INDEX_TYPE,
                     };
                 }
-                indexMap[row.INDEX_NAME].columns.push(row.COLUMN_NAME);
+                // A plain quoted column ("QUARTER") becomes its name; a real expression (UPPER("NAME")) stays as written.
+                const expr = row.COLUMN_EXPRESSION;
+                const quoted = expr != null && /^"(?:[^"]|"")+"$/.test(expr.trim()) ? expr.trim().slice(1, -1).replace(/""/g, '"') : null;
+                indexMap[row.INDEX_NAME].columns.push(quoted ?? expr ?? row.COLUMN_NAME);
             }
             return Object.values(indexMap);
         });
@@ -2240,11 +2130,19 @@ class OracleCollection {
             const binds: Record<string, unknown> = {};
             let bindIdx = 0;
 
+            // A value is a column of the joined table only when it says so: "$joined.COL"
+            // or "<join table>.COL". Any other string (an email, "v1.2") is a literal.
+            const joinPrefix = `${String(joinSpec.table).replace(/"/g, "").toUpperCase()}.`;
+            const joinedCol = (v: unknown): string | null => {
+                if (typeof v !== "string") return null;
+                if (v.startsWith("$joined.")) return v.slice(8);
+                return v.toUpperCase().startsWith(joinPrefix) ? v.slice(joinPrefix.length) : null;
+            };
             for (const [col, val] of Object.entries(set)) {
                 const targetCol = col.includes(".") ? col.split(".")[1] : col;
-                if (typeof val === "string" && val.includes(".")) {
+                const srcCol = joinedCol(val);
+                if (srcCol !== null) {
                     // Column reference from joined table
-                    const srcCol = val.split(".")[1];
                     setParts.push(
                         `${quoteIdentifier(targetCol)} = (SELECT ${quoteIdentifier(srcCol)} FROM ${quoteIdentifier(joinSpec.table)} WHERE ${_buildJoinOn(joinSpec.on, target)} AND ROWNUM = 1)`,
                     );

@@ -160,6 +160,10 @@ const oracleMongoWrapperMessages = {
     `[${scope}] ${what} must be a non-negative integer, got ${typeof value === "number" ? value : typeof value}.`,
   PIPELINE_UNKNOWN_STAGE: (stage: unknown) =>
     `[aggregatePipeline] Unsupported stage: ${String(stage)}.`,
+  PIPELINE_UNKNOWN_EXPRESSION: (op: unknown) =>
+    `[aggregatePipeline] Unsupported expression operator "${String(op)}".`,
+  INLINE_BIND_UNSUPPORTED: (where: unknown, key: unknown, type: unknown) =>
+    `[${where}] the filter value ${String(key)} (${String(type)}) cannot be written into a view: views cannot take bind values, and only numbers, strings and null have an exact literal form. Pass the view as SQL text instead.`,
   PIPELINE_MERGE_INVALID: (reason: unknown) =>
     `[aggregatePipeline] Invalid $merge: ${reason}.`,
   PIPELINE_HAVING_WITHOUT_GROUP:

@@ -579,6 +579,16 @@ describe("unit/adapter: stats and shutdown", () => {
     await expect(C.withConnection("s_close_err", async () => 1)).rejects.toThrow(/shutting down/);
   });
 
+  it("DEFECT: isPoolHealthy reports false once closeAll has shut the pools down", async () => {
+    const H = await loadAdapter(makeDriver());
+    register("s_health_close");
+    await H.withConnection("s_health_close", async () => 1);
+    expect(H.isPoolHealthy("s_health_close")).toBe(true);
+    await H.closeAll();
+    expect(H.isPoolHealthy("s_health_close")).toBe(false);
+    expect(H.isPoolHealthy("never-seen")).toBe(false);
+  });
+
   it("a pool creation that fails during shutdown stops retrying", async () => {
     const D = await loadAdapter(makeDriver());
     let attempts = 0;

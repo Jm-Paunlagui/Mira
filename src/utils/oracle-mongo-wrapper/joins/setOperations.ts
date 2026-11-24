@@ -167,7 +167,7 @@ class SetResultBuilder {
   /**
    * Make SetResultBuilder thenable so `await union(...)` returns rows directly.
    */
-  then(resolve: any, reject: any) {
+  then<R1 = unknown[], R2 = never>(resolve?: ((rows: unknown[]) => R1 | PromiseLike<R1>) | null, reject?: ((reason: unknown) => R2 | PromiseLike<R2>) | null): Promise<R1 | R2> {
     return this.toArray().then(resolve, reject);
   }
 
