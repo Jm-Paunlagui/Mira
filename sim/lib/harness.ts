@@ -55,6 +55,28 @@ export class Sim {
     }
   }
 
+  /** Business queries Mira's API cannot express, run as hand-written SQL instead. */
+  gaps: { stage: string; label: string; reason: string }[] = [];
+  /** Queries the stages ran through Mira's API (for the coverage ratio). */
+  viaMira = 0;
+
+  /** Run a query through Mira (counted for the coverage ratio). */
+  async mira<T>(run: () => Promise<T>): Promise<T> {
+    this.viaMira++;
+    return run();
+  }
+
+  /** Record a coverage gap that is not a query of its own (e.g. a missing column in a result). */
+  gap(label: string, reason: string): void {
+    this.gaps.push({ stage: this.current, label, reason });
+  }
+
+  /** Record a coverage gap (why Mira cannot express it), then run the hand-written SQL. */
+  async viaSql<T>(label: string, reason: string, run: () => Promise<T>): Promise<T> {
+    this.gaps.push({ stage: this.current, label, reason });
+    return run();
+  }
+
   get failed() {
     return this.results.filter((r) => !r.ok);
   }

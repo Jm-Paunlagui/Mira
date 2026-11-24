@@ -54,7 +54,17 @@ Two documented behaviours are worth knowing:
 
 Fix order: the five silent wrong-data defects (6, 7, 10, 11, 16) come first. Follow the project's rule of proving each defect with a failing test before fixing it.
 
-## 1.2 Sim expansion plan
+### Found while building the expanded simulation (17–19) — all fixed
+
+| # | Area | Defect | Live result | Severity |
+|---|---|---|---|---|
+| 17 | `OracleSchema.createTable` | `notNull` or `primaryKey` together with `default` emitted `NOT NULL DEFAULT 0`; Oracle wants `DEFAULT` first | ORA-00907 | Fails loudly |
+| 18 | `find().limit(n).forUpdate("skip locked")` | The page was chosen in a `FETCH FIRST` subquery before the lock skipped busy rows, so a second worker on a queue got nothing while free rows waited. Now the cursor locks rows as it fetches them and stops after `n` (`maxRows`, prefetch sized to match so no extra row is locked) | `[]` instead of the next free row | **Silent wrong data** |
+| 19 | Standalone `forUpdate` read | Ran with `autoCommit`, and the commit ended the FOR UPDATE cursor before every row was fetched | ORA-01002 whenever rows were skipped | Fails loudly |
+
+## 1.2 Sim expansion plan (built: stages 9–14)
+
+Status: built on 2026-11-24. `bun run sim` runs 15 stages, 286 checks; 33 business queries go through Mira's API and 17 are coverage gaps (run as hand-written SQL, still checked), listed at the end of every run.
 
 The simulation keeps its current shape: one schema owned by the simulation (`MIRA_SIM`), an in-memory model as the source of truth, `DEFECT:` checks, and the API-surface tracker. It grows from a canteen into a small enterprise:
 
