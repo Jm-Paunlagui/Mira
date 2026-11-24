@@ -212,15 +212,21 @@ export async function inventoryStage(sim: Sim, ctx: Ctx, state: State) {
   sim.eq("stock-out runs ($matchRecognize): start date and length of every run", runs.map((r) => ({ sku: r.SKU, start: iso(r.START_D as Date), days: Number(r.DAYS) })), stockOutRuns());
 
   // Zero-sales days for two items in Q4, densified against a calendar.
-  const dense = await sim.viaSql("zero-sales days (calendar densification)", "partitioned outer join and a row generator (CONNECT BY LEVEL) are not exposed", () =>
-    raw<{ SKU: string; ZERO_DAYS: number }>(
-      `WITH cal AS (SELECT DATE '2026-10-01' + LEVEL - 1 AS D FROM DUAL CONNECT BY LEVEL <= 92),
-            s AS (SELECT SKU, MDATE, -QTY AS QTY FROM "${E.MOVES}" WHERE MTYPE = 'ISS' AND SKU IN ('P-ADOBO','P-CALA'))
-       SELECT SKU, COUNT(*) AS ZERO_DAYS FROM (
-         SELECT s.SKU, c.D, NVL(SUM(s.QTY), 0) AS SOLD FROM s PARTITION BY (s.SKU) RIGHT OUTER JOIN cal c ON (s.MDATE = c.D) GROUP BY s.SKU, c.D)
-        WHERE SOLD = 0 GROUP BY SKU ORDER BY SKU`,
-    ),
+  // A calendar of Q4 (series of days) joined to each item's daily sales; days with no sale have no match.
+  const q4 = () => api.series(db, { start: d(2026, 10, 1), end: d(2026, 12, 31), unit: "day", as: "D" });
+  sim.eq("series: Q4 has 92 calendar days", (await sim.mira(() => q4().toArray())).length, 92);
+  const dense = await Promise.all(
+    ["P-ADOBO", "P-CALA"].map(async (sku) => {
+      const [r] = await sim.mira(() =>
+        q4().aggregate([
+          { $lookup: { from: E.MOVES, pipeline: [{ $match: { MTYPE: "ISS", SKU: sku } }, { $group: { _id: "$MDATE", Q: { $sum: "$QTY" } } }], localField: "D", foreignField: "MDATE", as: "s", joinType: "left", select: ["Q"] } },
+          { $match: { Q: null } },
+          { $count: "n" },
+        ]),
+      );
+      return { SKU: sku, ZERO_DAYS: Number(r.N) };
+    }),
   );
   const soldDays = (sku: string) => new Set(model.moves.filter((m) => m.type === "ISS" && m.sku === sku && m.date >= d(2026, 10, 1)).map((m) => iso(m.date))).size;
-  sim.eq("zero-sales days in Q4 per item (92 days minus days with a sale)", dense.map((r) => [r.SKU, Number(r.ZERO_DAYS)]), ["P-ADOBO", "P-CALA"].map((sku) => [sku, 92 - soldDays(sku)]));
+  sim.eq("zero-sales days in Q4 per item (calendar series joined to sales)", dense.map((r) => [r.SKU, Number(r.ZERO_DAYS)]), ["P-ADOBO", "P-CALA"].map((sku) => [sku, 92 - soldDays(sku)]));
 }

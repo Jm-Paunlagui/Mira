@@ -113,7 +113,7 @@ function _createCounter(): Counter {
  *     { $group: { _id: "$region", total: { $sum: "$amount" } } },
  *   ], db);
  */
-function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<string, unknown>, aliasPrefix = "", hoist?: Array<{ alias: string; sql: string }>): { sql: string; binds: Record<string, unknown>; } {
+function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<string, unknown>, aliasPrefix = "", hoist?: Array<{ alias: string; sql: string }>, base?: Array<{ alias: string; sql: string; cols?: string[]; suffix?: string }>): { sql: string; binds: Record<string, unknown>; } {
   const counter = _createCounter();
   const ctes: Array<{ alias: string; sql: string }> = [];
   const allBinds: Record<string, unknown> = {};
@@ -408,18 +408,13 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
     return { sql: ctes.length ? ctes[ctes.length - 1].sql : `SELECT * FROM ${quoteIdentifier(tableName)}`, binds: allBinds };
   }
 
-  // Build final SQL: the SELECT the pipeline produces …
-  let sql: string;
-  if (ctes.length === 0) {
-    sql = `SELECT * FROM ${quoteIdentifier(tableName)}`;
-  } else if (ctes.length === 1) {
-    sql = ctes[0].sql;
-  } else {
-    const withParts = ctes
-      .slice(0, -1)
-      .map((c) => `${quoteIdentifier(c.alias)} AS (${c.sql})`);
-    sql = `WITH ${withParts.join(",\n     ")}\n${ctes[ctes.length - 1].sql}`;
-  }
+  // Build final SQL: the SELECT the pipeline produces, after any base CTEs (a
+  // recursive CTE or a series the pipeline runs on) and the stages before it.
+  const finalSql = ctes.length ? ctes[ctes.length - 1].sql : `SELECT * FROM ${quoteIdentifier(tableName)}`;
+  const withParts = [...(base ?? []), ...ctes.slice(0, -1)].map(
+    (c: { alias: string; sql: string; cols?: string[]; suffix?: string }) => `${quoteIdentifier(c.alias)}${c.cols ? ` (${c.cols.map(quoteIdentifier).join(", ")})` : ""} AS (${c.sql})${c.suffix ?? ""}`,
+  );
+  let sql = withParts.length ? `WITH ${withParts.join(",\n     ")}\n${finalSql}` : finalSql;
 
   // … optionally written somewhere by $merge / $out.
   if (hasMerge) return { sql: _buildMergeStatement(mergeSpec, sql), binds: allBinds };
@@ -760,6 +755,29 @@ function _buildAggExpr(expr: Record<string, DslSpec>, binds: Record<string, unkn
   return String(expr);
 }
 
+/**
+ * While set, column references ("$X") resolve through this instead of a plain quoted
+ * name. compileExpression / compileCondition set it for the duration of one
+ * synchronous build, e.g. a recursive CTE where "$prior.X" is the parent row.
+ */
+let _refResolver: ((name: string) => string) | null = null;
+
+/**
+ * Compile one pipeline expression (or a $cond-style condition) outside a pipeline,
+ * with column references resolved by `resolve`. Binds are added to `binds`, named
+ * `${prefix}agg_N` / `${prefix}cond_N`.
+ */
+function compileExpression(expr: unknown, binds: Record<string, unknown>, prefix: string, resolve: (name: string) => string, asCondition = false): string {
+  const base = _createCounter();
+  const counter: Counter = { next: (p) => `${prefix}${base.next(p)}` };
+  _refResolver = resolve;
+  try {
+    return asCondition ? _buildCondExpr(expr, binds, counter) : _fieldRefOrBind(expr, binds, counter);
+  } finally {
+    _refResolver = null;
+  }
+}
+
 /** Placeholder table name a $lookup pipeline's subquery replaces in the join builder's SQL. */
 const LOOKUP_SUB = "MIRA_LOOKUP_SUB$";
 
@@ -798,7 +816,7 @@ function _one(val: DslSpec, binds: Record<string, unknown>, counter: Counter): s
  */
 function _fieldRef(val: DslSpec) {
   if (typeof val === "string" && val.startsWith("$")) {
-    return quoteIdentifier(val.substring(1));
+    return _refResolver ? _refResolver(val.substring(1)) : quoteIdentifier(val.substring(1));
   }
   if (val === "*") return "*";
   if (typeof val === "number") return String(val);
@@ -812,7 +830,7 @@ function _fieldRef(val: DslSpec) {
  */
 function _fieldRefOrBind(val: unknown, binds: Record<string, unknown>, counter: Counter) {
   if (typeof val === "string" && val.startsWith("$")) {
-    return quoteIdentifier(val.substring(1));
+    return _refResolver ? _refResolver(val.substring(1)) : quoteIdentifier(val.substring(1));
   }
   if (_isExpr(val)) return `(${_buildAggExpr(val as Record<string, DslSpec>, binds, counter)})`;
   if (val === null) return "NULL";
@@ -1122,4 +1140,4 @@ function _buildBucket(bucket: DslSpec, source: unknown, counter: Counter) {
   };
 }
 
-export { buildAggregateSQL };
+export { compileExpression, buildAggregateSQL };

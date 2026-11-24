@@ -160,6 +160,10 @@ const oracleMongoWrapperMessages = {
     `[${scope}] ${what} must be a non-negative integer, got ${typeof value === "number" ? value : typeof value}.`,
   PIPELINE_UNKNOWN_STAGE: (stage: unknown) =>
     `[aggregatePipeline] Unsupported stage: ${String(stage)}.`,
+  CTE_SET_UNKNOWN_COLUMN: (col: unknown, table: unknown) =>
+    `[withRecursiveCTE] set.${String(col)}: ${String(table)} has no such column (set can only compute the anchor table's columns).`,
+  CTE_FREE_NEEDS_WHILE: "[withRecursiveCTE] an empty joinOn recurses on every row at each level: give a while condition so it stops.",
+  SERIES_INVALID: (why: unknown) => `[series] ${String(why)}.`,
   PIPELINE_NESTED_WRITE: "[aggregatePipeline] $merge / $out cannot be used inside a $facet or $lookup pipeline.",
   PIPELINE_LOOKUP_PIPELINE: "[aggregatePipeline] $lookup.pipeline must be an array of stages.",
   PIPELINE_MATCH_RECOGNIZE: (why: unknown) =>

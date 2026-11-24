@@ -48,6 +48,7 @@
 import type { DbConnection } from "../db";
 import type { QueryBuilder } from "../core/QueryBuilder";
 import { quoteIdentifier, renameBinds } from "../utils";
+import { buildAggregateSQL, compileExpression } from "./aggregatePipeline";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
@@ -71,7 +72,18 @@ import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 /** A join from the CTE's FROM to another CTE: `localField = <cte>.foreignField`. */
 type CteJoin = { from: string; localField: string; foreignField: string; joinType?: string };
 /** A recursive CTE: anchor query plus the self-join that walks the hierarchy. */
-type RecursiveDef = { anchor: QueryBuilder; recursive: { collection: string; joinOn: Record<string, unknown> } };
+type RecursiveDef = {
+  anchor: QueryBuilder;
+  recursive: {
+    collection: string;
+    /** child column → "$<cte>.<parent column>"; {} recurses on every row of `collection` (ON 1=1). */
+    joinOn: Record<string, unknown>;
+    /** Columns computed on each level: "$prior.X" is the parent row, "$X" the child row. */
+    set?: Record<string, unknown>;
+    /** Keep recursing only while this ($cond-style) condition holds for parent / child. */
+    while?: unknown;
+  };
+};
 
 function withCTE(db: import("../db").WrapperDb, cteDefs: Record<string, QueryBuilder>): CTEResult {
   return new CTEResult(db, cteDefs);
@@ -283,6 +295,19 @@ class RecursiveCTEResult {
         return `e.${quoteIdentifier(childCol)} = o.${quoteIdentifier(parentCol)}`;
       })
       .join(" AND ");
+    // An empty joinOn recurses on every row of the table at each level (ON 1=1). Oracle's
+    // default cycle check sees the same table row in its own ancestry and stops with
+    // ORA-32044, so such a recursion carries a CYCLE clause on LVL (which always grows)
+    // and must say when to stop with `while`. A joinOn recursion keeps Oracle's check,
+    // so real loops in the data still fail instead of running forever.
+    const free = joinParts === "";
+    if (free && recursive.while === undefined) throw new Error(MSG.CTE_FREE_NEEDS_WHILE);
+
+    // set / while: expressions over the parent ("$prior.X" → o."X") and child ("$X" → e."X") rows.
+    const resolve = (name: string) => (name.startsWith("prior.") ? `o.${quoteIdentifier(name.slice(6))}` : `e.${quoteIdentifier(name)}`);
+    const set = recursive.set ?? {};
+    for (const c of Object.keys(set)) if (!colNames.includes(c)) throw new Error(MSG.CTE_SET_UNKNOWN_COLUMN(c, this._def.anchor.tableName));
+    const whereSql = recursive.while === undefined ? "" : ` WHERE ${compileExpression(recursive.while, allBinds, "rw_", resolve, true)}`;
 
     // Use explicit column names to avoid ORA-01789 column count mismatches
     let anchorWrapped;
@@ -293,7 +318,7 @@ class RecursiveCTEResult {
       const anchorCols = colNames
         .map((c) => `t0.${quoteIdentifier(c)}`)
         .join(", ");
-      const recCols = colNames.map((c) => `e.${quoteIdentifier(c)}`).join(", ");
+      const recCols = colNames.map((c) => (c in set ? compileExpression(set[c], allBinds, `rs${colNames.indexOf(c)}_`, resolve) : `e.${quoteIdentifier(c)}`)).join(", ");
 
       // Replace SELECT clause in anchor to use explicit columns + LVL
       anchorWrapped = anchorSql.replace(
@@ -301,7 +326,7 @@ class RecursiveCTEResult {
         `SELECT ${anchorCols}, 1 AS "LVL" FROM`,
       );
 
-      recursiveSql = `SELECT ${recCols}, o."LVL" + 1 AS "LVL" FROM ${quoteIdentifier(recTable)} e JOIN ${quoteIdentifier(this._cteName)} o ON ${joinParts}`;
+      recursiveSql = `SELECT ${recCols}, o."LVL" + 1 AS "LVL" FROM ${quoteIdentifier(recTable)} e JOIN ${quoteIdentifier(this._cteName)} o ON ${joinParts || "1=1"}${whereSql}`;
     } else {
       // Fallback: use wildcard approach
       anchorWrapped = anchorSql;
@@ -320,10 +345,13 @@ class RecursiveCTEResult {
           .replace(/^SELECT\s+/i, "SELECT ")
           .replace(/FROM/i, ', 1 AS "LVL" FROM');
       }
-      recursiveSql = `SELECT e.*, o."LVL" + 1 AS "LVL" FROM ${quoteIdentifier(recTable)} e JOIN ${quoteIdentifier(this._cteName)} o ON ${joinParts}`;
+      recursiveSql = `SELECT e.*, o."LVL" + 1 AS "LVL" FROM ${quoteIdentifier(recTable)} e JOIN ${quoteIdentifier(this._cteName)} o ON ${joinParts || "1=1"}${whereSql}`;
     }
 
-    let selectSql = `SELECT * FROM ${quoteIdentifier(this._cteName)}`;
+    const cycle = free ? ` CYCLE "LVL" SET "MIRA_CYCLE$" TO 'Y' DEFAULT 'N'` : "";
+    // Only the table's columns and LVL (never the cycle mark).
+    const outCols = colNames.length && free ? [...colNames, "LVL"].map((c) => quoteIdentifier(c)).join(", ") : "*";
+    let selectSql = `SELECT ${outCols} FROM ${quoteIdentifier(this._cteName)}`;
 
     if (this._sort) {
       const orderBy = Object.entries(this._sort)
@@ -347,15 +375,16 @@ class RecursiveCTEResult {
         ? ` (${colNames.map((c) => quoteIdentifier(c)).join(", ")}, "LVL")`
         : "";
 
-    const sql = `WITH ${quoteIdentifier(this._cteName)}${cteColList} AS (\n  ${anchorWrapped}\n  UNION ALL\n  ${recursiveSql}\n)\n${selectSql}`;
+    const body = `\n  ${anchorWrapped}\n  UNION ALL\n  ${recursiveSql}\n`;
+    const sql = `WITH ${quoteIdentifier(this._cteName)}${cteColList} AS (${body})${cycle}\n${selectSql}`;
 
-    return { sql, binds: allBinds };
+    return { sql, binds: allBinds, body, cycle };
   }
 
-  async toArray() {
-    // Fetch column names from anchor table to build CTE column alias list
+  /** The anchor table's columns, in order (the recursive CTE needs an explicit column list). */
+  async _columns(): Promise<string[]> {
     const anchorTableName = this._def.anchor.tableName;
-    const colNames = await this._db.withConnection(async (conn: DbConnection) => {
+    return this._db.withConnection(async (conn: DbConnection) => {
       const result = await conn.execute<{ COLUMN_NAME: string }>(
         `SELECT COLUMN_NAME FROM USER_TAB_COLUMNS WHERE TABLE_NAME = UPPER(:t) ORDER BY COLUMN_ID`,
         { t: anchorTableName },
@@ -363,6 +392,38 @@ class RecursiveCTEResult {
       );
       return (result.rows ?? []).map((r) => r.COLUMN_NAME);
     });
+  }
+
+  /**
+   * Run an aggregation pipeline over the recursive result (group, join, filter the
+   * tree), e.g. total quantity per finished product and raw material.
+   */
+  async aggregate(pipeline: Array<Record<string, unknown>>): Promise<Array<Record<string, unknown>>> {
+    const colNames = await this._columns();
+    const built = this._buildSQL(colNames);
+    // The CTE's own binds get a prefix so the pipeline's cannot clash with them.
+    const own = renameBinds(built.body, built.binds, "rcte_");
+    // The pipeline reads a plain view of the CTE (table columns + LVL, no cycle mark).
+    const rowsAlias = `${this._cteName}_ROWS`;
+    const cols = [...colNames, "LVL"];
+    const agg = buildAggregateSQL(rowsAlias, pipeline, this._db as never, "", undefined, [
+      { alias: this._cteName, sql: own.sql, cols, suffix: built.cycle },
+      { alias: rowsAlias, sql: `SELECT ${cols.map((c) => quoteIdentifier(c)).join(", ")} FROM ${quoteIdentifier(this._cteName)}` },
+    ]);
+    const binds = { ...own.binds, ...agg.binds };
+    return this._db.withConnection(async (conn: DbConnection) => {
+      try {
+        const result = await conn.execute(agg.sql, binds, { outFormat: this._db.oracledb.OUT_FORMAT_OBJECT, autoCommit: true });
+        return (result.rows ?? []) as Array<Record<string, unknown>>;
+      } catch (err) {
+        throw new Error(MSG.wrapError("RecursiveCTEResult.aggregate", err, agg.sql));
+      }
+    });
+  }
+
+  async toArray<T = Record<string, unknown>>(): Promise<T[]> {
+    // Fetch column names from anchor table to build CTE column alias list
+    const colNames = await this._columns();
 
     const { sql, binds } = this._buildSQL(colNames);
     return this._db.withConnection(async (conn: DbConnection) => {
@@ -371,7 +432,7 @@ class RecursiveCTEResult {
           outFormat: this._db.oracledb.OUT_FORMAT_OBJECT,
           autoCommit: true,
         });
-        return result.rows || [];
+        return (result.rows || []) as T[];
       } catch (err) {
         throw new Error(MSG.wrapError("RecursiveCTEResult.toArray", err, sql));
       }

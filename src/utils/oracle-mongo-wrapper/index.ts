@@ -48,6 +48,7 @@ import { SetResultBuilder } from "./joins/setOperations"; // UNION, INTERSECT, M
 
 // ─── CTE (Common Table Expressions) ─────────────────────────────
 import { withCTE, withRecursiveCTE } from "./pipeline/cteBuilder"; // Named subquery builders
+import { series } from "./pipeline/seriesBuilder"; // Row generator: numbers or a calendar
 
 // ─── Subquery helpers ────────────────────────────────────────────
 import { buildScalarSubquery, buildExistsSubquery, buildNotExistsSubquery, buildCorrelatedSubquery, buildInSelectSubquery, buildAnyAllSubquery } from "./pipeline/subqueryBuilder";
@@ -61,4 +62,4 @@ import { createPerformance } from "./advanced/performanceUtils"; // EXPLAIN PLAN
 // ─── Shared utility functions ────────────────────────────────────
 import { quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection } from "./utils";
 
-export { createDb, OracleCollection, OracleSchema, OracleDCL, QueryBuilder, Transaction, parseFilter, parseUpdate, buildAggregateSQL, buildWindowExpr, buildJoinSQL, SetResultBuilder, withCTE, withRecursiveCTE, buildScalarSubquery, buildExistsSubquery, buildNotExistsSubquery, buildCorrelatedSubquery, buildInSelectSubquery, buildAnyAllSubquery, buildConnectBy, buildPivot, buildUnpivot, createPerformance, quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection };
+export { createDb, OracleCollection, OracleSchema, OracleDCL, QueryBuilder, Transaction, parseFilter, parseUpdate, buildAggregateSQL, buildWindowExpr, buildJoinSQL, SetResultBuilder, withCTE, withRecursiveCTE, series, buildScalarSubquery, buildExistsSubquery, buildNotExistsSubquery, buildCorrelatedSubquery, buildInSelectSubquery, buildAnyAllSubquery, buildConnectBy, buildPivot, buildUnpivot, createPerformance, quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection };

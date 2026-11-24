@@ -61,6 +61,7 @@ export async function buildContext(): Promise<Ctx> {
   // The two CTE result classes are not exported; reach them through an instance.
   const probe = new mod.OracleCollection("DUAL", rawDb);
   const CTEResult = Object.getPrototypeOf(mod.withCTE(rawDb, { X: probe.find({}) })).constructor;
+  const SeriesResult = Object.getPrototypeOf(mod.series(rawDb, { start: 1, end: 1 })).constructor;
   const RecursiveCTEResult = Object.getPrototypeOf(mod.withRecursiveCTE(rawDb, "X", { anchor: probe.find({}), recursive: { collection: "DUAL", joinOn: {} } })).constructor;
 
   for (const [label, cls] of [
@@ -73,6 +74,7 @@ export async function buildContext(): Promise<Ctx> {
     ["SetResultBuilder", mod.SetResultBuilder],
     ["CTEResult", CTEResult],
     ["RecursiveCTEResult", RecursiveCTEResult],
+    ["SeriesResult", SeriesResult],
   ] as const)
     tracker.trackClass(label, cls as { prototype: object });
 
