@@ -9,7 +9,7 @@
  * so the shift showed in Thick mode whatever TZ said.
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { db, schema, coll, dropIfExists, rawExec } from "../helpers/db";
+import { schema, coll, dropIfExists, rawExec } from "../helpers/db";
 
 const T = "MIRA_TZ_DATES";
 const at = new Date("2026-05-06T07:08:09.123Z");

@@ -9,7 +9,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createMigrator, defineTable, t, type Migration } from "../../src/utils/oracle-mongo-wrapper";
-import { db, schema, coll, dropIfExists, rawExec } from "../helpers/db";
+import { db, coll, dropIfExists, rawExec } from "../helpers/db";
 
 const H = "MIRA_IT_MIG_HIST";
 const A = "MIRA_IT_MIG_A";

@@ -36,7 +36,7 @@
 
 import type { DbConnection } from "../db";
 import type { QueryBuilder } from "../core/QueryBuilder";
-import { quoteIdentifier, sortTerm } from "../utils";
+import { sortTerm } from "../utils";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**

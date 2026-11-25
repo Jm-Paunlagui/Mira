@@ -111,12 +111,15 @@ describe("for await: streaming", () => {
   });
 });
 
+// Calls the tag the way a template literal does, for values a literal would convert (null, undefined).
+const tagged = (strings: string[], ...values: unknown[]) => sql(Object.assign([...strings], { raw: [...strings] }) as unknown as TemplateStringsArray, ...values);
+
 describe("sql`…`", () => {
   it("every value is a bind: scalars, null, dates, buffers, arrays (IN), identifiers and nested fragments", async () => {
     const ids = [3, 5, 8];
     const when = new Date("2026-01-02T03:04:05Z");
     const filter = sql`${sql.ident("P", "SCORE")} >= ${2}`; // the unquoted alias p is P to Oracle
-    const q = sql`SELECT p.ID, ${null} AS N, ${when} AS W, ${Buffer.from("ab")} AS B, ${"it's"} AS S
+    const q = sql`SELECT p.ID, ${tagged(["", ""], null)} AS N, ${when} AS W, ${Buffer.from("ab")} AS B, ${"it's"} AS S
                     FROM ${sql.ident(P)} p WHERE p.ID IN (${ids}) AND ${filter} AND p.GRP <> ${"x"} ORDER BY p.ID`;
     expect(q.sql.replace(/\s+/g, " ")).toBe(`SELECT p.ID, :p0 AS N, :p1 AS W, :p2 AS B, :p3 AS S FROM "${P}" p WHERE p.ID IN (:p4, :p5, :p6) AND "P"."SCORE" >= :p7 AND p.GRP <> :p8 ORDER BY p.ID`);
     expect(Object.keys(q.binds)).toHaveLength(9);
@@ -148,7 +151,7 @@ describe("sql`…`", () => {
 
   it("refuses values that are almost always mistakes, and odd identifiers", () => {
     expect(() => sql`IN (${[]})`).toThrow("[sql] an empty array has no SQL form (IN () is not valid); check for it before the query.");
-    expect(() => sql`= ${undefined}`).toThrow("[sql] a value is undefined; pass null for SQL NULL.");
+    expect(() => tagged(["= ", ""], undefined)).toThrow("[sql] a value is undefined; pass null for SQL NULL.");
     expect(() => sql`= ${() => 1}`).toThrow("[sql] a function cannot be bound.");
     expect(() => sql`= ${Symbol("s")}`).toThrow("[sql] a symbol cannot be bound.");
     expect(() => sql`= ${{ a: 1 }}`).toThrow("[sql] a plain object cannot be bound; pass its fields, or JSON.stringify() it for a JSON column.");

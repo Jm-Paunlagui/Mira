@@ -20,6 +20,7 @@ async function usage() {
 
   for await (const row of orders.find().project({ ID: 1 })) {
     assert<Equal<typeof row, { ID: number }>>();
+    void row.ID;
   }
 
   const q: SqlStatement = sql`SELECT * FROM ${sql.ident("ORDERS")} WHERE ID IN (${[1, 2]})`;
