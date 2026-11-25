@@ -29,6 +29,8 @@ const oracleMessages = {
   POOL_CREATING: (name: unknown) => `Creating pool "${name}"…`,
   POOL_READY: (name: unknown, pool: { poolMin: number; poolMax: number }) =>
     `Pool "${name}" ready (min=${pool.poolMin}, max=${pool.poolMax}).`,
+  THREADPOOL_TOO_SMALL: (name: unknown, poolMax: unknown, threads: unknown, fromEnv: boolean) =>
+    `Pool "${name}" can open ${poolMax} connections, but Thick mode runs each call on one of ${threads} worker threads (UV_THREADPOOL_SIZE${fromEnv ? "" : " not set; Node's default is 4"}). Calls waiting on row locks can hold every thread and hang the process: set UV_THREADPOOL_SIZE=${poolMax} or more before the process starts.`,
   POOL_FAILED: (name: unknown, attempt: unknown, max: unknown, err: unknown) =>
     `Pool "${name}" failed (attempt ${attempt}/${max}): ${err}`,
   POOL_RETRYING: (name: unknown, delay: unknown) => `Retrying pool "${name}" in ${delay}ms…`,
