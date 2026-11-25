@@ -277,7 +277,7 @@ class QueryBuilder {
      *
      * @returns {{ sql: string, binds: Object }} The SQL string and bind variables
      */
-    _buildSQL(): { sql: string; binds: Record<string, unknown>; maxRows?: number } {
+    _buildSQL(opts: { pageByRowid?: boolean } = {}): { sql: string; binds: Record<string, unknown>; maxRows?: number } {
         const { whereClause, binds } = parseFilter(this.filter, "t0");
 
         // Projection
@@ -377,6 +377,16 @@ class QueryBuilder {
         if (this._skip != null) paging += ` OFFSET ${Number(this._skip)} ROWS`;
         if (this._limit != null) paging += ` FETCH FIRST ${Number(this._limit)} ROWS ONLY`;
         const where = whereClause ? ` ${whereClause}` : "";
+
+        // pageByRowid ($lateralJoin): Oracle returns wrong rows for a LATERAL /
+        // APPLY subquery that carries a row limit (FETCH FIRST or ROWNUM) once it
+        // decorrelates it — seen on 23.26: 1 outer row kept out of 6. Picking the
+        // page's ROWIDs in an IN subquery is not decorrelated that way. SAMPLE is
+        // left alone: repeating it would draw two different samples.
+        if (!this._forUpdate && opts.pageByRowid && paging && !this._sample) {
+            const page = `SELECT t0.ROWID FROM ${tableRef}${where}${orderBy}${paging}`;
+            return { sql: `SELECT ${selectCols} FROM ${tableRef} WHERE t0.ROWID IN (${page})${orderBy}`, binds };
+        }
 
         if (!this._forUpdate) {
             return { sql: `SELECT ${selectCols} FROM ${tableRef}${where}${orderBy}${paging}`, binds };

@@ -102,6 +102,21 @@ describe("integration: defects that returned wrong data with no error", () => {
     expect(rows.map((r) => Number(r.ID)).sort((a, b) => a - b)).toEqual(expected);
   });
 
+  it("DEFECT: $lateralJoin with sort + limit keeps every outer row and picks each one's top row (Oracle LATERAL row-limit bug)", async () => {
+    const rows = await users.aggregate([
+      { $match: { STATUS: "active" } },
+      { $lateralJoin: { subquery: orders.find({ STATUS: "completed", USER_ID: "$outer.ID" }).project({ AMOUNT: 1 }).sort({ AMOUNT: -1 }).limit(1), as: "C" } },
+    ]);
+    const activeIds = new Set(USERS.map((u, i) => (u.STATUS === "active" ? userIds[i] : -1)));
+    const top = new Map<number, number>();
+    for (const o of orderRows) {
+      const id = Number(o.USER_ID);
+      if (o.STATUS === "completed" && activeIds.has(id)) top.set(id, Math.max(top.get(id) ?? -Infinity, Number(o.AMOUNT)));
+    }
+    const got = rows.map((r) => [Number(r.ID), Number(r.AMOUNT)]).sort((a, b) => a[0] - b[0]);
+    expect(got).toEqual([...top.entries()].sort((a, b) => a[0] - b[0]));
+  });
+
   it("DEFECT: findOneAndUpdate changes exactly one row when several match", async () => {
     const before = await users.findOneAndUpdate<{ ID: number }>({ STATUS: "inactive" }, { $set: { LOGIN_COUNT: 7 } });
     expect(await users.countDocuments({ LOGIN_COUNT: 7 })).toBe(1);
