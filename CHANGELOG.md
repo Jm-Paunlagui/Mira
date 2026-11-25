@@ -259,6 +259,32 @@ CI runs Oracle 23ai, so these were found by running the suite on the 19c contain
 - `test/types/model.types.ts`: `t.version()` read and insert types.
 - Simulation, stage 15: two desk clerks edit the same member. The stale save is refused, then re-read and applied on top. Result: 337 checks, 151 of 151 public functions.
 
+### Added — keyset paging, streaming, raw SQL and query events (roadmap step 4)
+
+- **`find().sort(…).after(cursor)`:** keyset pagination. It continues after the previous page's last row in the sort order, with one bound comparison per sort key (`(a < :a) OR (a = :a AND b > :b)`, direction by key). It refuses: no sort, a null or missing key, a cursor that is not an object. Typed: the cursor takes the row's types.
+- **`for await (const row of find())`:** a query is an async iterable. Rows are streamed on one held connection, released when the loop ends, breaks or throws. Inside a transaction the session's connection is used. Typed rows.
+- **``sql`…` ``:** raw SQL whose interpolated values are always binds.
+  - Arrays become bind lists. `sql.ident()` splices checked, quoted identifiers.
+  - Nested fragments are rendered from their parts (never re-parsed). `undefined`, functions, symbols, plain objects and empty arrays are refused.
+  - `.rows(target)` and `.execute(target)` run on the db handle, a session or a hook context.
+- **`onQuery(listener)`:** an event after every `execute` / `executeMany` (SQL, bind count, batch size, duration, rows, error; never bind values). It uses node-oracledb's trace handler, chains to one already installed (e.g. OpenTelemetry) and restores it on unsubscribe. A throwing listener is ignored.
+- New exports: `sql`, `SqlStatement`, `onQuery`, and the types `SqlTarget`, `QueryEvent`, `QueryListener`.
+
+### Tests and simulation (query tools)
+
+- `test/integration/queryTools.test.ts` (15 tests):
+  - full keyset paging equal to the sorted table; mixed directions and the `{ order }` form; refusals
+  - streaming with JSON decoding and exclusion projection; `break` / `throw` / query errors / a failing pool releasing the connection; reading inside a transaction
+  - `sql` binds of every kind, fragments with a `':p0'` literal, DML commit and rollback, refusals
+  - query events for find / insertMany / delete / errors; listeners that throw; chaining to a stand-in OpenTelemetry handler, a disabled one, and one replaced meanwhile
+- `test/types/queryTools.types.ts`: typed cursors, typed rows in `for await`, `sql` and `onQuery` types.
+- Simulation, new stage 16 "exports":
+  - the sales export keyset-paged in pages of 7, every sale once, biggest first
+  - a streamed pass over every sale, and an early stop at the first big ticket
+  - a store report in raw SQL with an `IN` list
+  - `onQuery` counting the export's statements without leaking bind values
+  - all checked against the model. Result: 345 checks, 96 queries, 154 of 154 public functions.
+
 ## [2.0.1] — 2026-11-25
 
 Patch release: Mira now behaves the same in node-oracledb Thin and Thick mode. 2.0.0 was only tested in Thin mode. On a machine with an Oracle Client on the system PATH, the adapter loads Thick mode even when `ORACLE_INSTANT_CLIENT` is blank, and two things broke.
