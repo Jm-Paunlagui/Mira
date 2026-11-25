@@ -269,7 +269,7 @@ class JsonUpdates {
         const added = (a.push ?? []).map((v, i) => ` UNION ALL SELECT TO_CLOB(${bind(JSON.stringify(v instanceof Date ? v.toISOString() : v))}), ${1e15 + i} FROM DUAL`).join("");
         const rebuilt = `NVL((SELECT JSON_ARRAYAGG(x."V" FORMAT JSON ORDER BY x."O" RETURNING CLOB) FROM (SELECT SUBSTR(j."W", 2, LENGTH(j."W") - 2) "V", j."O" FROM ${elements}${keep}${added}) x), TO_CLOB('[]'))`;
         // Wrap it in objects up to the column: {"a":{"tags":[…]}} as a merge patch.
-        const patch = a.segments.reduceRight((inner, s, i) => `JSON_OBJECT('${s}' VALUE ${inner} FORMAT JSON RETURNING CLOB)`, rebuilt);
+        const patch = a.segments.reduceRight((inner, s) => `JSON_OBJECT('${s}' VALUE ${inner} FORMAT JSON RETURNING CLOB)`, rebuilt);
         expr = a.segments.length === 0 ? rebuilt : `JSON_MERGEPATCH(${expr}, ${patch} RETURNING CLOB)`;
       }
       items.push(`${col} = ${expr}`);
