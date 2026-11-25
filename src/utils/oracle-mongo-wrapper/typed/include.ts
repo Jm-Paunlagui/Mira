@@ -83,12 +83,14 @@ function buildIncludeSQL(spec: RelationSpec, as: string, options: IncludeOptions
 
   const table = quoteIdentifier(spec.target.name);
   const join = `i.${quoteIdentifier(spec.kind === "belongsTo" ? spec.key : spec.foreignKey)} = ${parentAlias}.${quoteIdentifier(spec.kind === "belongsTo" ? spec.foreignKey : spec.key)}`;
-  let whereSql = "";
+  // A soft-deleting related table (t.deletedAt()): its deleted rows are not included.
+  const deletedAt = Object.entries(spec.target.columns).find(([, c]) => c.meta.role === "deletedAt")?.[0];
+  let whereSql = deletedAt ? ` AND i.${quoteIdentifier(deletedAt)} IS NULL` : "";
   let binds: Record<string, unknown> = {};
   if (where && Object.keys(where).length > 0) {
     const parsed = parseFilter(where, "i");
     const renamed = renameBinds(parsed.whereClause, parsed.binds, bindPrefix);
-    whereSql = ` AND (${renamed.sql.replace(/^\s*WHERE\s+/i, "")})`;
+    whereSql += ` AND (${renamed.sql.replace(/^\s*WHERE\s+/i, "")})`;
     binds = renamed.binds;
   }
   const orderBy = sort && Object.keys(sort).length > 0 ? Object.entries(sort).map(([c, d]) => `i.${sortTerm(c, d)}`).join(", ") : "";

@@ -32,6 +32,8 @@ export interface ColumnMeta {
   references?: { table: string; column: string };
   /** A JSON column: "text" = CLOB with an IS JSON check (19c+), "native" = the JSON type (23ai). */
   json?: "text" | "native";
+  /** A column Mira maintains: set on insert (createdAt), on every update (updatedAt), or by a soft delete (deletedAt). */
+  role?: "createdAt" | "updatedAt" | "deletedAt";
 }
 
 /**
@@ -144,12 +146,31 @@ export const t = {
   json: <T = unknown>(options: { native?: boolean } = {}): Column<NoInfer<T>> =>
     new Column<T>({ type: options.native ? "JSON" : "CLOB", nullable: false, identity: false, primaryKey: false, json: options.native ? "native" : "text" }),
   /**
+   * When the row was created: TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP, so Oracle
+   * stamps it on insert (an insert may still give a value, e.g. when importing).
+   */
+  createdAt: () => new Column<Date, Date, false, true>({ type: "TIMESTAMP(6) WITH TIME ZONE", nullable: false, identity: false, primaryKey: false, default: "SYSTIMESTAMP", role: "createdAt" }),
+  /**
+   * When the row last changed: like createdAt, and every update through the table's
+   * collection sets it to SYSTIMESTAMP unless the update sets it itself.
+   */
+  updatedAt: () => new Column<Date, Date, false, true>({ type: "TIMESTAMP(6) WITH TIME ZONE", nullable: false, identity: false, primaryKey: false, default: "SYSTIMESTAMP", role: "updatedAt" }),
+  /**
+   * Soft delete: deleteOne / deleteMany set this to SYSTIMESTAMP instead of deleting, and
+   * reads, updates and deletes skip rows where it is set. withDeleted() sees them,
+   * restore() clears it, { force: true } really deletes. One per table.
+   */
+  deletedAt: () => new Column<Date, Date, true>({ type: "TIMESTAMP(6) WITH TIME ZONE", nullable: true, identity: false, primaryKey: false, role: "deletedAt" }) as DeletedAtColumn,
+  /**
    * Any other Oracle type, with the value type you name:
    * `t.raw<number>("BINARY_DOUBLE")`, `t.raw<Buffer>("RAW(16)")`.
    * The type text goes into DDL as is: trusted code only.
    */
   raw: <R, W = R>(oracleType: string) => col<R, W>(oracleType),
 };
+
+/** A t.deletedAt() column: its type marks the table as soft-deleting (withDeleted(), restore()). */
+export type DeletedAtColumn = Column<Date, Date, true> & { readonly $softDelete: true };
 
 /** Any column, whatever its types. */
 export type AnyColumn = Column<any, any, boolean, boolean, boolean>;

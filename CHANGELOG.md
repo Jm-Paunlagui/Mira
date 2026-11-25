@@ -211,6 +211,35 @@ CI runs Oracle 23ai, so these were found by running the suite on the 19c contain
 - `test/unit/typedTables.test.ts`: the generator maps CLOB + `IS JSON` and the JSON type.
 - Simulation, reports stage: the loyalty table gets a `PREFS` document per VIP. The stage checks a path filter, `$elemMatch`, `$push` + `$set` on paths for every VIP, `$pull`, and `$jsonTable` + `$group` of the resulting drinks menu, all against the model. Result: 313 checks, 66 queries, 134 of 134 public functions.
 
+### Added — timestamps, soft delete, hooks and validation (roadmap step 4)
+
+- **`t.createdAt()` / `t.updatedAt()`:** `TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL`. Oracle stamps both on insert; every update through the table's collection sets the `updatedAt` column (`$currentDate`), unless the update sets it itself. A zoned type, so the value is an exact instant whatever the server's time zone.
+- **`t.deletedAt()`: soft delete.**
+  - `deleteOne` / `deleteMany` / `findOneAndDelete` mark rows instead of deleting them.
+  - Reads (`find`, `findOne`, `countDocuments`, `distinct`, `aggregate`), updates and deletes skip marked rows, and so does `include()` of a soft-deleting related table.
+  - `withDeleted()` sees marked rows; `restore(filter)` clears the mark; `{ force: true }` deletes for real.
+  - Typed: `withDeleted()` and `restore()` exist only on a table with a `t.deletedAt()` column.
+- **Hooks:** `defineTable(name, columns, { hooks })` with `beforeInsert`, `afterInsert`, `beforeUpdate`, `afterUpdate`, `beforeDelete`, `afterDelete`. A before-hook may return a changed document or update, or throw to stop the write. The hook context works like a session (`Table.on(ctx)`), so a hook's own writes join the transaction.
+- **Validation:** `{ validate: true }` checks inserts and updates against the columns before any SQL: unknown, generated, required and not-nullable columns; number, money, text, date and binary values; the size of numbers and of `VARCHAR2` / `CHAR` text (UTF-8 bytes or characters). Every problem is listed in one `MiraValidationError` (`issues: { column, message }[]`).
+- `replaceOne` / `findOneAndReplace` on such a table become a `$set` of every given column except the primary key, so the above apply.
+- New exports: `MiraValidationError`, `ModelCollection`, and the types `TableOptions`, `TableHooks`, `HookContext`, `SoftDeleteMethods`, `CollectionOf`, `ValidationIssue`.
+
+### Behaviour notes (model tables)
+
+- `on()` returns a `ModelCollection` (a subclass of `OracleCollection`) only for a table that uses one of these features; every other typed table keeps the plain collection.
+- `merge`, `mergeFrom`, `bulkUpdateByKeys`, `updateFromJoin`, `insertFromQuery`, `connectBy`, `pivot` and raw SQL are 2.0's and do none of this.
+
+### Fixed — bulkWrite lost a typed table's settings
+
+- Outside a transaction, `bulkWrite` ran its operations on a new plain `OracleCollection`, so a typed table's JSON columns were not encoded there. It now runs them on the same kind of collection (`_onConnection`), which keeps JSON columns, relations and model behaviour.
+
+### Tests and simulation (model tables)
+
+- `test/integration/model.test.ts` (19 tests): timestamps; soft delete through every wrapped method, `withDeleted()`, `restore()`, `{ force: true }`, upsert, `include()`; every hook, a hook that throws, hooks inside a rolled-back transaction, `bulkWrite`; validation before any SQL and hooks filling a column.
+- `test/unit/validate.test.ts` (7 tests): every column kind, size rule and update operator.
+- `test/types/model.types.ts`: row and insert types, typed hooks, `withDeleted()` / `restore()` only on soft-deleting tables, and misuses that must not compile.
+- Simulation, new stage 15 "members": a loyalty-member register on a model table. Sign-ups through hooks, validation refusing a bad web-form row, points and tier changes, soft removal, a protected founding member, a mistaken removal restored, an erasure with `{ force: true }`, the audit trail the hooks wrote, and a rolled-back sign-up. Result: 333 checks, 86 queries, 151 of 151 public functions.
+
 ## [2.0.1] — 2026-11-25
 
 Patch release: Mira now behaves the same in node-oracledb Thin and Thick mode. 2.0.0 was only tested in Thin mode. On a machine with an Oracle Client on the system PATH, the adapter loads Thick mode even when `ORACLE_INSTANT_CLIENT` is blank, and two things broke.
