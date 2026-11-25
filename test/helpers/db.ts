@@ -166,9 +166,19 @@ export async function timeIt<T>(fn: () => Promise<T>): Promise<[T, number]> {
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Connections currently checked out of appDb. */
+/**
+ * Connections checked out of appDb once the pool settles. The pool health monitor
+ * borrows one connection for a ping every 30 s, so a single reading can catch that
+ * probe in flight (seen on CI). A leaked connection never comes back, so the count
+ * is re-read for up to 2 s and the lowest value is returned: a leak still shows.
+ */
 export async function appDbInUse(): Promise<number> {
-  const stats = await db.getPoolStats();
-  const p = stats.pools.appDb as { connectionsInUse?: number } | undefined;
-  return p?.connectionsInUse ?? 0;
+  let lowest = Infinity;
+  for (const deadline = Date.now() + 2000; ; ) {
+    const stats = await db.getPoolStats();
+    const p = stats.pools.appDb as { connectionsInUse?: number } | undefined;
+    lowest = Math.min(lowest, p?.connectionsInUse ?? 0);
+    if (lowest === 0 || Date.now() >= deadline) return lowest;
+    await sleep(50);
+  }
 }

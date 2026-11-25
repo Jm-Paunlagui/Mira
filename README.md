@@ -33,9 +33,24 @@ Oracle Database
 
 ## Setup
 
+Mira runs on **Node.js 20+** and on **Bun 1.4+**. Install it from npm (it brings `oracledb`):
+
 ```bash
-bun add oracledb  # peer dependency — should already be in parent project
+npm install @jm-paunlagui/mira    # or: bun add @jm-paunlagui/mira
 ```
+
+```js
+const { createDb, OracleCollection } = require("@jm-paunlagui/mira"); // CommonJS
+// import { createDb, OracleCollection } from "@jm-paunlagui/mira";   // TypeScript / ESM
+```
+
+The package ships compiled JavaScript with `.d.ts` types, so editors and `tsc` type-check your calls.
+
+**Loading `.env`.** Bun reads `.env` by itself. Node does not: start it with `node --env-file=.env app.js` (Node 20.6+), or call `require("dotenv").config()` before you first use Mira. Mira reads `DB_*` / `APP_DB_*` from `process.env` when a pool is first created.
+
+**Thin or Thick mode.** Mira tries node-oracledb Thick mode first, from `ORACLE_INSTANT_CLIENT` or any Oracle Client on the system library path, and falls back to Thin mode. The startup log says which loaded. Both modes are tested in CI.
+
+Working from a clone of this repository instead, `bun run build` writes the same package to `dist/`.
 
 ### Prerequisites — Database Configuration
 
@@ -173,7 +188,7 @@ const {
     withCTE,
     withRecursiveCTE,
     createPerformance,
-} = require("./oracle-mongo-wrapper");
+} = require("@jm-paunlagui/mira");
 
 // Connect to your database pool (configured in src/config/database.ts)
 const db = createDb("appDb");
@@ -824,7 +839,7 @@ await orders.aggregate([
 Name a query, then reference it — like SQL variables.
 
 ```js
-const { withCTE } = require("./oracle-mongo-wrapper");
+const { withCTE } = require("@jm-paunlagui/mira");
 
 const result = await withCTE(db, {
     activeUsers: users.find({ status: "active" }).project({ id: 1, name: 1 }),
@@ -847,7 +862,7 @@ const result = await withCTE(db, {
 For parent-child hierarchical data (org charts, categories, file trees):
 
 ```js
-const { withRecursiveCTE } = require("./oracle-mongo-wrapper");
+const { withRecursiveCTE } = require("@jm-paunlagui/mira");
 
 const orgChart = await withRecursiveCTE(db, "org", {
     anchor: employees.find({ managerId: null }), // Start: employees with no manager (root nodes)
@@ -892,7 +907,7 @@ await withRecursiveCTE(db, "a", {
 `series(db, { start, end, step?, unit?, as? })` gives one row per value from `start` to `end` inclusive: numbers, or dates by `day` / `week` / `month` / `quarter` / `year`. Use `.toArray()` or `.aggregate(pipeline)`:
 
 ```js
-const { series } = require("./oracle-mongo-wrapper");
+const { series } = require("@jm-paunlagui/mira");
 
 // Month-ends of 2026 (a depreciation schedule)
 await series(db, { start: new Date(2026, 0, 1), end: new Date(2026, 11, 1), unit: "month", as: "m" })
@@ -1343,6 +1358,13 @@ bun run test:unit       # or :integration / :performance / :chaos / :security / 
 **Database prerequisites.** The schema user needs `CREATE TABLE`, `CREATE VIEW`, `CREATE SEQUENCE`, `CREATE SYNONYM`, `CREATE MATERIALIZED VIEW` and a tablespace quota (`ALTER USER <user> QUOTA UNLIMITED ON USERS;`). Every suite creates its own `MIRA_<suite>_*` tables and drops them afterwards.
 
 **Results.** The runner prints a scorecard per category. Tests named `DEFECT:` / `SECURITY:` assert the *fixed* behaviour of a known open issue and are reported separately from unexpected failures. Each run is stored under one `RUN_ID` in two tables that are kept between runs: `MIRA_TEST_RESULTS` (one row per test) and `MIRA_TEST_METRICS` (latencies, throughput, counts). Set `MIRA_SKIP_PERSIST=1` to skip writing them; performance budgets can be tightened with `MIRA_PERF_*` env vars (see `test/performance/perf.test.ts`).
+
+**Continuous integration.** `.github/workflows/ci.yml` runs on every push and pull request:
+- **Build:** type-check, `bun run build`, and `npm pack --dry-run`.
+- **Live tests:** against an Oracle Database Free 23ai container (`gvenzl/oracle-free`), once in **Thin** mode and once in **Thick** mode (Instant Client installed on the runner). Each run does the full suite with coverage, the simulation, and `test/node/smoke.cjs`, which loads the built package under plain Node.
+- **Setup:** the job creates the `MIRA` and `MIRA_SIM` schemas with `.github/oracle/setup-users.sql`.
+
+To run the Node smoke test yourself: `bun run build && node --env-file=.env test/node/smoke.cjs`.
 
 ## Simulation
 
