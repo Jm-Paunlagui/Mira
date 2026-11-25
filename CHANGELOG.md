@@ -59,6 +59,18 @@ Two tests failed only on the CI database:
 - **What changed:**
   - CI sets `UV_THREADPOOL_SIZE=32`.
   - The README warns Thick-mode users to set it to at least their largest `poolMax` before the process starts.
+  - When Thick mode creates a pool whose `poolMax` is above `UV_THREADPOOL_SIZE` (Node's default 4 when it is not set), Mira logs a warning naming the pool, both numbers and the setting to use.
+
+### Fixed — Thick mode moved `TIMESTAMP WITH (LOCAL) TIME ZONE` values by the client's UTC offset
+
+- **The defect:** Thin mode opens every session at UTC, but Thick mode opened it in the operating system's zone. A JS `Date` written to a `TIMESTAMP WITH TIME ZONE` or `TIMESTAMP WITH LOCAL TIME ZONE` column was stored that zone's offset off: −8 h on a UTC+8 machine, through `insertOne`, `insertMany` and raw SQL alike. Filters compared consistently, so reads in Mira looked right. `TIMESTAMP` and `DATE` columns were not affected.
+- **Why it went unseen:** `bun test` runs with `TZ=UTC`, but on Windows the Oracle client takes its zone from the system, not from `TZ`.
+- **The fix:** the adapter sets `ORA_SDTZ=+00:00` before the Oracle client loads, unless `ORA_SDTZ` is already set. Thick mode now behaves as Thin mode does.
+  - It uses a numeric offset because the region name `UTC` makes a 19.x client on a 23ai server fail with `ORA-01805` (time-zone file mismatch).
+- **Behaviour change (Thick mode only):** `SESSIONTIMEZONE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP` and `CURRENT_DATE` in your own SQL are now UTC, as they already were in Thin mode. `SYSTIMESTAMP` and `SYSDATE` are unchanged, and so is `$now`, which uses database time. To keep another zone, set `ORA_SDTZ` yourself.
+- **Tests:**
+  - `test/integration/timeZones.test.ts`: every date column type keeps a Date's instant, written by `insertOne`, `insertMany` or raw SQL, and the session zone is `+00:00`. Before the fix these failed in Thick mode, with `TZ=UTC` and with `TZ=Asia/Manila`.
+  - Adapter unit tests: `ORA_SDTZ` is set when missing or blank and kept when given; the thread-pool warning is checked with no setting, a small setting, a large enough setting, an invalid setting, and in Thin mode.
 
 ## [2.0.1] — 2026-11-25
 
