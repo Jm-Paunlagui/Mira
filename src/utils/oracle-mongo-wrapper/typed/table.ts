@@ -22,8 +22,8 @@
  * returns the ordinary OracleCollection (its QueryBuilders are ordinary too),
  * so every behaviour, check and error is exactly 2.0's; only the TypeScript
  * signatures are narrowed. Anything the typed signatures do not cover is one
- * `.untyped` away. The exception: a table with t.updatedAt() / t.deletedAt()
- * columns, hooks or { validate: true } gets a ModelCollection (see model.ts).
+ * `.untyped` away. The exception: a table with t.updatedAt() / t.deletedAt() /
+ * t.version() columns, hooks or { validate: true } gets a ModelCollection (see model.ts).
  * ============================================================================
  */
 
@@ -265,7 +265,7 @@ export class TypedTable<C extends Columns, Rel extends Record<string, AnyRelatio
     this.relations = Object.freeze({ ...relationSpecs });
     this.options = Object.freeze({ ...options });
     const roles = (role: NonNullable<ColumnMeta["role"]>) => entries.filter(([, c]) => c.meta.role === role).map(([k]) => k);
-    for (const role of ["createdAt", "updatedAt", "deletedAt"] as const) {
+    for (const role of ["createdAt", "updatedAt", "deletedAt", "version"] as const) {
       if (roles(role).length > 1) throw new TypeError(`[defineTable] ${name}: one t.${role}() column per table, got ${roles(role).join(", ")}.`);
     }
     const hooks = (options.hooks ?? {}) as ModelHooks;
@@ -275,12 +275,14 @@ export class TypedTable<C extends Columns, Rel extends Record<string, AnyRelatio
     }
     const [updatedAt] = roles("updatedAt");
     const [deletedAt] = roles("deletedAt");
-    if (options.validate || Object.keys(hooks).length > 0 || updatedAt || deletedAt) {
+    const [version] = roles("version");
+    if (options.validate || Object.keys(hooks).length > 0 || updatedAt || deletedAt || version) {
       this.model = Object.freeze({
         columns: this.columns,
         primaryKey: Object.freeze(entries.filter(([, c]) => c.meta.primaryKey).map(([k]) => k)),
         updatedAt,
         deletedAt,
+        version,
         validate: options.validate === true,
         hooks: Object.freeze({ ...hooks }),
       });

@@ -240,6 +240,25 @@ CI runs Oracle 23ai, so these were found by running the suite on the 19c contain
 - `test/types/model.types.ts`: row and insert types, typed hooks, `withDeleted()` / `restore()` only on soft-deleting tables, and misuses that must not compile.
 - Simulation, new stage 15 "members": a loyalty-member register on a model table. Sign-ups through hooks, validation refusing a bad web-form row, points and tier changes, soft removal, a protected founding member, a mistaken removal restored, an erasure with `{ force: true }`, the audit trail the hooks wrote, and a rolled-back sign-up. Result: 333 checks, 86 queries, 151 of 151 public functions.
 
+### Added — optimistic locking (roadmap step 4)
+
+- **`t.version()`:** `NUMBER(10) DEFAULT 1 NOT NULL`, raised by 1 on every update through the table's collection (unless the update sets it; a replacement never does).
+- **`MiraConcurrencyError`:** `updateOne`, `findOneAndUpdate`, `replaceOne`, `findOneAndReplace`, `deleteOne` and `findOneAndDelete` whose filter pins the version (`{ ID: 1, VERSION: 3 }`) and match nothing while the row is still there now throw, instead of silently returning 0. `expectedVersion` and `currentVersion` say what happened. A gone row still returns 0; `updateMany` / `deleteMany` are not checked; `upsert` with a pinned version is refused.
+
+### Fixed — Mira's own errors lost their class inside a transaction
+
+- The adapter wraps every error thrown inside `withTransaction` as a generic `DB op failed` error, unless it is `isOperational`. `MiraValidationError` (422) and `MiraConcurrencyError` (409) are now operational, so `instanceof` works inside transactions and they aren't logged as critical database failures. Found by the optimistic-locking transaction test.
+
+### Tests and simulation (optimistic locking)
+
+- `test/integration/optimisticLocking.test.ts` (9 tests):
+  - the version bump; two editors where the second is refused, then re-reads and succeeds
+  - no conflict for a gone row, a version-only filter, `updateMany` or a non-pinned version
+  - every checked method, soft and forced deletes, refused upserts
+  - inside a transaction; both error classes surviving `withTransaction`
+- `test/types/model.types.ts`: `t.version()` read and insert types.
+- Simulation, stage 15: two desk clerks edit the same member. The stale save is refused, then re-read and applied on top. Result: 337 checks, 151 of 151 public functions.
+
 ## [2.0.1] — 2026-11-25
 
 Patch release: Mira now behaves the same in node-oracledb Thin and Thick mode. 2.0.0 was only tested in Thin mode. On a machine with an Oracle Client on the system PATH, the adapter loads Thick mode even when `ORACLE_INSTANT_CLIENT` is blank, and two things broke.

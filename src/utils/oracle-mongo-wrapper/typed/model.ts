@@ -72,8 +72,32 @@ export interface ModelSpec {
   primaryKey: readonly string[];
   updatedAt?: string;
   deletedAt?: string;
+  version?: string;
   validate: boolean;
   hooks: ModelHooks;
+}
+
+/**
+ * A write that gave the version it read (optimistic locking) found the row changed since:
+ * someone else updated it in between. Re-read the row and try again.
+ */
+export class MiraConcurrencyError extends Error {
+  /**
+   * An expected outcome, not a database failure: the adapter passes it through a
+   * transaction unwrapped (and does not log it as critical). HTTP: 409 Conflict.
+   */
+  readonly isOperational = true;
+  readonly statusCode = 409;
+  readonly table: string;
+  readonly expectedVersion: unknown;
+  readonly currentVersion: unknown;
+  constructor(table: string, operation: string, expected: unknown, current: unknown) {
+    super(`[${table}] ${operation}: the row changed since it was read (version ${String(expected)} expected, now ${String(current)}); re-read it and try again.`);
+    this.name = "MiraConcurrencyError";
+    this.table = table;
+    this.expectedVersion = expected;
+    this.currentVersion = current;
+  }
 }
 
 const isEmpty = (o: unknown) => !o || (typeof o === "object" && Object.keys(o).length === 0);
@@ -134,14 +158,37 @@ class ModelCollection extends OracleCollection {
     return { ...f, [col]: null };
   }
 
-  /** The update with updatedAt stamped (unless it already sets that column). */
+  /** The update with updatedAt stamped and the version raised (unless the update sets those columns itself). */
   _stamp(update: Doc): Doc {
+    let out = update;
+    const touches = (col: string) => Object.values(out).some((fields) => !!fields && typeof fields === "object" && col in (fields as Doc));
     const col = this._model.updatedAt;
-    if (!col) return update;
-    const set = update.$set as Doc | undefined;
-    const now = update.$currentDate as Doc | undefined;
-    if ((set && col in set) || (now && col in now)) return update;
-    return { ...update, $currentDate: { ...(now ?? {}), [col]: { $type: "timestamp" } } };
+    if (col && !touches(col)) out = { ...out, $currentDate: { ...((out.$currentDate as Doc | undefined) ?? {}), [col]: { $type: "timestamp" } } };
+    const ver = this._model.version;
+    if (ver && !touches(ver)) out = { ...out, $inc: { ...((out.$inc as Doc | undefined) ?? {}), [ver]: 1 } };
+    return out;
+  }
+
+  /** The version value a filter pins (`{ ID: 1, VERSION: 3 }`), or undefined. */
+  _pinnedVersion(filter: Doc): number | undefined {
+    const ver = this._model.version;
+    const v = ver ? filter[ver] : undefined;
+    return typeof v === "number" ? v : undefined;
+  }
+
+  /**
+   * A single-row write that pinned a version matched nothing: if the row (the filter without
+   * the version) is still there, it changed in between, so throw MiraConcurrencyError.
+   * A filter of nothing but the version is not a row to check.
+   */
+  async _checkConflict(filter: Doc, matched: number, operation: string): Promise<void> {
+    const expected = this._pinnedVersion(filter);
+    if (matched > 0 || expected === undefined) return;
+    const ver = this._model.version as string;
+    const { [ver]: _pinned, ...row } = filter;
+    if (isEmpty(row)) return;
+    const current = await super.findOne<Doc>(this._scope(row));
+    if (current) throw new MiraConcurrencyError(this.tableName, operation, expected, current[ver]);
   }
 
   async _beforeInsert(doc: Doc): Promise<Doc> {
@@ -170,10 +217,10 @@ class ModelCollection extends OracleCollection {
     await this._model.hooks.afterDelete?.(result, filter, this._ctx);
   }
 
-  /** A replacement as a $set: every given column except the primary key. */
+  /** A replacement as a $set: every given column except the primary key and the version (Mira raises it). */
   _replacementAsSet(replacement: Doc): Doc {
     const set: Doc = {};
-    for (const [k, v] of Object.entries(replacement)) if (!this._model.primaryKey.includes(k)) set[k] = v;
+    for (const [k, v] of Object.entries(replacement)) if (!this._model.primaryKey.includes(k) && k !== this._model.version) set[k] = v;
     if (isEmpty(set)) fail(this.tableName, "a replacement needs at least one column besides the primary key.");
     return { $set: set };
   }
@@ -228,8 +275,10 @@ class ModelCollection extends OracleCollection {
   // ─── Updates ──────────────────────────────────────────────────
 
   override async updateOne(filter: Doc, update: Doc, options: Parameters<OracleCollection["updateOne"]>[2] = {}) {
+    if (options.upsert && this._pinnedVersion(filter) !== undefined) fail(this.tableName, "upsert with a version in the filter would insert a second row when the version is stale; update without upsert.");
     const u = await this._beforeUpdate(update, filter);
     const result = await super.updateOne(this._scope(filter), u, options);
+    await this._checkConflict(filter, result.matchedCount, "updateOne");
     await this._afterUpdate(result, filter, u);
     return result;
   }
@@ -249,7 +298,9 @@ class ModelCollection extends OracleCollection {
 
   override async findOneAndUpdate<T = Doc>(filter: Doc, update: Doc, options: Doc = {}): Promise<T | null> {
     const u = await this._beforeUpdate(update, filter);
+    if (options.upsert && this._pinnedVersion(filter) !== undefined) fail(this.tableName, "upsert with a version in the filter would insert a second row when the version is stale; update without upsert.");
     const doc = await super.findOneAndUpdate<T>(this._scope(filter), u, options);
+    await this._checkConflict(filter, doc ? 1 : 0, "findOneAndUpdate");
     const n = doc ? 1 : 0;
     await this._afterUpdate({ matchedCount: n, modifiedCount: n }, filter, u);
     return doc;
@@ -272,6 +323,7 @@ class ModelCollection extends OracleCollection {
     } else {
       result = await super.deleteOne(this._scope(filter), rest);
     }
+    await this._checkConflict(filter, result.deletedCount, "deleteOne");
     await this._afterDelete({ deletedCount: result.deletedCount, soft }, filter);
     return result;
   }
@@ -298,6 +350,7 @@ class ModelCollection extends OracleCollection {
     const doc = soft
       ? await super.findOneAndUpdate<T>(this._scope(filter), this._softDeleteUpdate, { returnDocument: "before" })
       : await super.findOneAndDelete<T>(this._scope(filter));
+    await this._checkConflict(filter, doc ? 1 : 0, "findOneAndDelete");
     await this._afterDelete({ deletedCount: doc ? 1 : 0, soft }, filter);
     return doc;
   }

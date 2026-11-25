@@ -34,6 +34,12 @@ assert<Equal<typeof Posts.$insert, { TITLE: string; CREATED_AT?: Date; UPDATED_A
 
 const Plain = defineTable("PLAIN", { ID: t.id(), NAME: t.text(10), CREATED_AT: t.createdAt() });
 
+// t.version(): a number on read, optional on insert, accepted in filters.
+const Versioned = defineTable("VERSIONED", { ID: t.id(), REV: t.version() });
+assert<Equal<typeof Versioned.$row, { ID: number; REV: number }>>();
+assert<Equal<typeof Versioned.$insert, { REV?: number }>>();
+void Versioned.on(createDb("appDb")).updateOne({ ID: 1, REV: 3 }, { $inc: { REV: 1 } });
+
 const db = createDb("appDb");
 const posts = Posts.on(db);
 const plain = Plain.on(db);
