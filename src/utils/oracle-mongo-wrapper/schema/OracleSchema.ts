@@ -109,6 +109,12 @@ class OracleSchema {
       const colDefs: string[] = [];
       const constraints: unknown[] = [];
 
+      // The JSON column type arrived in 21c; 19c answers ORA-00902 "invalid datatype".
+      const jsonTyped = Object.entries(columns).filter(([, spec]) => /^\s*JSON\s*$/i.test(spec.type)).map(([name]) => name);
+      if (jsonTyped.length > 0 && conn.oracleServerVersion && conn.oracleServerVersion < 2100000000) {
+        throw new Error(MSG.JSON_TYPE_NEEDS_21C(tableName, jsonTyped.join(", "), conn.oracleServerVersionString));
+      }
+
       for (const [colName, spec] of Object.entries(columns)) {
         const parts = [quoteIdentifier(colName), spec.type];
 

@@ -166,6 +166,7 @@ describe("unit: generateTableTypes (stub catalogue)", () => {
       col({ COLUMN_NAME: "TL", DATA_TYPE: "TIMESTAMP(6) WITH LOCAL TIME ZONE" }),
       col({ COLUMN_NAME: "F", DATA_TYPE: "BINARY_DOUBLE" }),
       col({ COLUMN_NAME: "J", DATA_TYPE: "JSON", NULLABLE: "Y" }),
+      col({ COLUMN_NAME: "JT", DATA_TYPE: "CLOB", IS_JSON: 1 }),
       col({ COLUMN_NAME: "SEQ", DATA_TYPE: "NUMBER", IDENTITY_COLUMN: "YES", GENERATION_TYPE: "BY DEFAULT" }),
       col({ COLUMN_NAME: "SEQ2", DATA_TYPE: "NUMBER", DATA_PRECISION: 10, IDENTITY_COLUMN: "YES", GENERATION_TYPE: "ALWAYS" }),
       col({ COLUMN_NAME: "FK", DATA_TYPE: "NUMBER", NULLABLE: "Y", REF_TABLE: "PARENT", REF_COLUMN: "ID" }),
@@ -201,7 +202,8 @@ describe("unit: generateTableTypes (stub catalogue)", () => {
     expect(at("TZ0")).toBe("TZ0: t.timestampTz(0),");
     expect(at("TL")).toBe('TL: t.raw<Date>("TIMESTAMP(6) WITH LOCAL TIME ZONE"),');
     expect(at("F")).toBe('F: t.raw<number>("BINARY_DOUBLE"),');
-    expect(at("J")).toBe('J: t.raw<unknown>("JSON").nullable(),');
+    expect(at("J")).toBe("J: t.json({ native: true }).nullable(),");
+    expect(at("JT")).toBe("JT: t.json(),");
     expect(at("SEQ")).toBe("SEQ: t.number().identityByDefault(),");
     expect(at("SEQ2")).toBe("SEQ2: t.number(10).identity(),");
     expect(at("FK")).toBe('FK: t.number().nullable().references("PARENT", "ID"),');

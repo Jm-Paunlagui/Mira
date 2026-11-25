@@ -23,6 +23,7 @@ Oracle Database
     - [Imports & Connection](#imports--connection)
     - [Typed Tables (2.1)](#typed-tables-21)
     - [Relations and include (2.1)](#relations-and-include-21)
+    - [JSON Columns (2.1)](#json-columns-21)
     - [Migrations (2.1)](#migrations-21)
 - [Basic — Your First Queries](#-basic--your-first-queries)
 - [Medium — Filtering, Updating & Chaining](#-medium--filtering-updating--chaining)
@@ -307,6 +308,66 @@ const o = await OrdersR.on(db).find({ ID: 7 }).project({ ID: 1 }).include("custo
 - **It combines** with filters, `sort`, `skip`, `limit`, `project` (on the parent's columns), `forEach`, `next`, `await`, and `on(session)` in transactions.
 - `relations()` returns the same table with relations attached: `name`, `columns`, `ddl()`, `create()` and `on()` are unchanged. Declaring relations apart from the tables lets two tables point at each other, and keeps generated table files as they are.
 - Only one level of nesting is supported: an included row cannot include further relations yet.
+
+### JSON Columns (2.1)
+
+Store documents in Oracle and query them the MongoDB way: dotted paths, `$elemMatch`, `$push` / `$pull`.
+
+```ts
+type Prefs = { lounge: boolean; drinks: string[]; addr?: { city: string } };
+export const Members = defineTable("MEMBERS", {
+    ID: t.id(),
+    NAME: t.text(60),
+    PREFS: t.json<Prefs>(),                       // CLOB with an IS JSON check (Oracle 19c+)
+    // or t.json<Prefs>({ native: true })          // the JSON type (Oracle 23ai; Thin mode or Oracle Client 21c+)
+});
+const members = Members.on(db);
+
+await members.insertOne({ NAME: "Ana", PREFS: { lounge: true, drinks: ["tea"] } }); // written as JSON
+const vips = await members.find({ "PREFS.lounge": true, "PREFS.addr.city": { $in: ["Cebu", "Davao"] } }).toArray();
+vips[0].PREFS.drinks;                                                                 // read back as a document: string[]
+
+await members.find({ "PREFS.drinks": { $elemMatch: { $eq: "tea" } } });             // an element that matches
+await members.updateOne({ ID: 1 }, {
+    $set: { "PREFS.addr.city": "Cebu" },                                              // missing objects are created
+    $unset: { "PREFS.lounge": 1 },
+    $push: { "PREFS.drinks": { $each: ["water", "coffee"] } },
+});
+await members.updateOne({ ID: 1 }, { $pull: { "PREFS.drinks": { $in: ["coffee"] } } });
+
+// One row per array element, joined to its row
+await members.aggregate([
+    { $jsonTable: { column: "PREFS", path: "drinks", ordinality: "POS", columns: { DRINK: "$" } } },
+    { $group: { _id: "$DRINK", N: { $count: "*" } } },
+]);
+```
+
+**Filters on a path** (`"COL.a.b"`, `"COL.items.0.sku"`): `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$in` `$nin` `$between` `$exists`, `null` (missing or null), and `$elemMatch`.
+- A path compares as a number, a date or text depending on the value you give: `JSON_VALUE(… RETURNING NUMBER | TIMESTAMP WITH TIME ZONE | VARCHAR2)`.
+- `$elemMatch` takes element fields (`{ sku: "X", qty: { $gt: 2 } }`) or, for arrays of plain values, operators on the element itself (`{ $eq: "tea" }`). It becomes `JSON_EXISTS` with every value bound.
+
+**Updates on a path:**
+- `$set` and `$unset` on paths become one `JSON_MERGEPATCH` per column, and missing objects are created.
+- `$push` (a value, or `{ $each: [...] }`) and `$pull` (a value, or `{ $in: [...] }`) rebuild the array with `JSON_TABLE`; pulling every element leaves `[]`.
+- A key without a dot (`{ $push: { TAGS: "x" } }`) works on a column that holds an array.
+- `$set` of `null` on a path is refused: under merge-patch rules it would delete the key, so use `$unset`. Paths through an array index (`"COL.items.0.qty"`) can't be updated; replace the array, or `$push` / `$pull` it.
+
+**`$jsonTable`** `{ column, path, columns: { NAME: "path" | { path, type } }, ordinality?, outer? }`: one row per element of the array at `path`, joined to its source row.
+- `"$"` as a column's path is the element itself.
+- `type` is `NUMBER[(p[,s])]`, `VARCHAR2(n)` (the default is `VARCHAR2(4000)`), `DATE`, `TIMESTAMP[(n)] [WITH TIME ZONE]`, `CLOB` or `JSON`.
+- `outer: true` keeps rows whose array is empty or missing.
+
+**Typed tables:**
+- A `t.json<T>()` column is read and written as `T`: `find`, `findOne`, `next`, `forEach`, `await`, and inside `include()`.
+- Dotted paths must start with a known column (the rest of the path isn't checked), and `$elemMatch` is only accepted on JSON columns.
+- `mira generate types` writes `t.json()` for a CLOB with an `IS JSON` check, and `t.json({ native: true })` for the JSON type.
+
+**Notes:**
+- Filters and updates on paths also work through the untyped API.
+- The untyped API keeps returning JSON columns as the **stored text**, as in 2.0, so code written for 2.0 is unaffected.
+- All the SQL uses functions Oracle 19c has (no `JSON_TRANSFORM`), so it runs on 19c and 23ai, for JSON text and for the JSON type.
+- **The native JSON type needs Thin mode or Oracle Client 21c+.** A 19c client can't read it (`ORA-40569`), and a write can break the session (`ORA-03106`). `Table.on(db)` refuses a native column on a 19.x Thick client, and says so. The JSON type itself needs Oracle Database 21c+: on 19c, `create()` refuses it before Oracle answers `ORA-00902`.
+- A filter key containing a dot is now always a JSON path. A column whose name itself contains a dot can't be filtered by name.
 
 ### Migrations (2.1)
 

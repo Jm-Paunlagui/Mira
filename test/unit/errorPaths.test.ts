@@ -266,6 +266,17 @@ describe("unit/errors: remaining edges", () => {
     expect(conn.calls[0].sql).toBe('ALTER TABLE "T" DROP COLUMN "A"');
   });
 
+  it("createTable refuses a JSON-type column on a database older than 21c (19c answers ORA-00902)", async () => {
+    const old = Object.assign(stubConn(() => ({})), { oracleServerVersion: 1919000000, oracleServerVersionString: "19.19.0.0.0" });
+    await expect(new OracleSchema(stubDb(old) as never).createTable("T", { ID: { type: "NUMBER" }, DOC: { type: "JSON" }, D2: { type: " json " } })).rejects.toThrow(
+      "[OracleSchema.createTable] T: DOC, D2 use the JSON type, which needs Oracle Database 21c or later (this is 19.19.0.0.0). Use t.json() without { native: true } (JSON text with an IS JSON check) on 19c.",
+    );
+    expect(old.calls).toHaveLength(0);
+    const recent = Object.assign(stubConn(() => ({})), { oracleServerVersion: 2304000000, oracleServerVersionString: "23.4.0.0.0" });
+    await new OracleSchema(stubDb(recent) as never).createTable("T", { DOC: { type: "JSON" } });
+    expect(recent.calls[0].sql).toBe('CREATE TABLE "T" ("DOC" JSON)');
+  });
+
   it("updateFromJoin: plain (non-dotted) where columns", async () => {
     const conn = stubConn(() => ({ rowsAffected: 2 }));
     const c = new OracleCollection("T", stubDb(conn) as never, conn as never);

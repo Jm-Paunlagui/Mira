@@ -201,6 +201,8 @@ class OracleCollection {
     declare _conn: import("../db").DbConnection | null;
     /** Set by a typed table with relations (relations().on()): what find().include() can fetch. */
     declare _relations?: Readonly<Record<string, import("../typed/include").RelationSpec>>;
+    /** Set by a typed table with t.json() columns: which values to write as JSON text, which to parse. */
+    declare _json?: { encode: readonly string[]; decode: readonly string[] };
     declare db: WrapperDb;
     declare tableName: string;
     /**
@@ -229,6 +231,28 @@ class OracleCollection {
      */
     get untyped(): OracleCollection {
         return this;
+    }
+
+    /** A document's t.json() values as JSON text, ready to bind (typed tables only). */
+    _encodeJson<T extends Record<string, unknown>>(doc: T): T {
+        if (!this._json || !doc || typeof doc !== "object") return doc;
+        const out: Record<string, unknown> = { ...doc };
+        for (const c of this._json.encode) if (out[c] != null) out[c] = JSON.stringify(out[c]);
+        return out as T;
+    }
+
+    /** $set of whole t.json() columns as JSON text (paths like "DOC.a" are merge patches already). */
+    _encodeJsonUpdate(update: Record<string, unknown>): Record<string, unknown> {
+        if (!this._json || !update || typeof update !== "object" || !update.$set) return update;
+        return { ...update, $set: this._encodeJson(update.$set as Record<string, unknown>) };
+    }
+
+    /** A row's JSON text in t.json() columns back to JS values, in place. */
+    _decodeJson<T>(row: T): T {
+        if (!this._json || !row || typeof row !== "object") return row;
+        const r = row as Record<string, unknown>;
+        for (const c of this._json.decode) if (typeof r[c] === "string") r[c] = JSON.parse(r[c] as string);
+        return row;
     }
 
     /**
@@ -287,6 +311,7 @@ class OracleCollection {
         if (options.projection) qb.project(options.projection);
         if (options.forUpdate) qb.forUpdate(options.forUpdate);
         if (this._relations) qb._relations = this._relations;
+        if (this._json) qb._json = this._json;
         return qb;
     }
 
@@ -313,7 +338,7 @@ class OracleCollection {
                     outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
                     autoCommit: !this._conn,
                 });
-                return (result.rows ?? [])[0] ?? null;
+                return this._decodeJson((result.rows ?? [])[0] ?? null);
             } catch (err) {
                 throw new Error(
                     MSG.wrapError("OracleCollection.findOne", err, sql, binds),
@@ -651,6 +676,7 @@ class OracleCollection {
      *   console.log(result2.returning.CREATED_AT); // → 2024-01-15T...
      */
     async insertOne(document: Record<string, unknown>, options: ReturningOption = {}): Promise<{ acknowledged: boolean; insertedId: number | string | null; returning?: Record<string, unknown>; }> {
+        document = this._encodeJson(document);
         return this._execute(async (conn) => {
             const cols = Object.keys(document);
             const bindNames = cols.map((_, i) => `:v${i}`);
@@ -813,6 +839,7 @@ class OracleCollection {
         if (!Array.isArray(documents) || documents.length === 0) {
             throw new Error(MSG.INSERT_MANY_EMPTY);
         }
+        documents = documents.map((d) => this._encodeJson(d));
 
         const returningCols = options.returning ?? ["ID"];
         const batchErrors = options.batchErrors === true;
@@ -1139,6 +1166,7 @@ class OracleCollection {
      *   );
      */
     async updateOne(filter: Record<string, unknown>, update: Record<string, unknown>, options: UpdateOptions = {}): Promise<{ acknowledged: boolean; matchedCount: number; modifiedCount: number; upsertedCount?: number; returning?: Record<string, unknown>;  }> {
+        update = this._encodeJsonUpdate(update);
         return this._execute(async (conn) => {
             const { whereClause, binds: filterBinds } = parseFilter(filter);
             const { setClause, binds: updateBinds } = parseUpdate(update);
@@ -1241,6 +1269,7 @@ class OracleCollection {
      *   console.log(`Updated ${result.modifiedCount} users`);
      */
     async updateMany(filter: Record<string, unknown>, update: Record<string, unknown>, options: ReturningOption = {}): Promise<{ acknowledged: boolean; matchedCount: number; modifiedCount: number; returning?: Array<Record<string, unknown>> }> {
+        update = this._encodeJsonUpdate(update);
         return this._execute(async (conn) => {
             const { whereClause, binds: filterBinds } = parseFilter(filter);
             const { setClause, binds: updateBinds } = parseUpdate(update);
@@ -1290,6 +1319,7 @@ class OracleCollection {
      *   );
      */
     async replaceOne(filter: Record<string, unknown>, replacement: Record<string, unknown>, _options: Record<string, unknown> = {}): Promise<{ acknowledged: boolean; matchedCount: number; modifiedCount: number;  }> {
+        replacement = this._encodeJson(replacement);
         return this._execute(async (conn) => {
             const { whereClause, binds: filterBinds } = parseFilter(filter);
             const cols = Object.keys(replacement).filter((c) => c !== "ID");

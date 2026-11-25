@@ -139,6 +139,8 @@ class QueryBuilder {
     /** The relations include() can fetch (from a typed table with relations). */
     declare _relations?: Readonly<Record<string, RelationSpec>>;
     declare _includes: Array<{ name: string; spec: RelationSpec; options: IncludeOptions }>;
+    /** t.json() columns of a typed table (see OracleCollection._json). */
+    declare _json?: { encode: readonly string[]; decode: readonly string[] };
     declare db: import("../db").WrapperDb;
     declare filter: Record<string, unknown>;
     declare tableName: string;
@@ -546,7 +548,7 @@ class QueryBuilder {
                         return doc;
                     });
                 }
-                if (this._includes.length > 0) rows = rows.map((row: Record<string, unknown>) => this._decodeIncludes(row));
+                if (this._includes.length > 0 || this._json) rows = rows.map((row: Record<string, unknown>) => this._decodeRow(row));
 
                 return rows;
             } catch (err) {
@@ -562,9 +564,10 @@ class QueryBuilder {
         return this.db.withConnection(fn);
     }
 
-    /** Included relations' JSON text into arrays / objects, in place. */
-    _decodeIncludes(row: Record<string, unknown>): Record<string, unknown> {
+    /** Included relations and t.json() columns from JSON text into JS values, in place. */
+    _decodeRow(row: Record<string, unknown>): Record<string, unknown> {
         for (const inc of this._includes) row[inc.name] = decodeIncluded(inc.spec, row[inc.name]);
+        for (const c of this._json?.decode ?? []) if (typeof row[c] === "string") row[c] = JSON.parse(row[c] as string);
         return row;
     }
 
@@ -633,7 +636,7 @@ class QueryBuilder {
                     let out: unknown;
                     try {
                         // Included relations are decoded first; a failure there stops the stream like a callback error.
-                        out = fn(this._includes.length > 0 ? this._decodeIncludes(row) : row);
+                        out = fn(this._includes.length > 0 || this._json ? this._decodeRow(row) : row);
                     } catch (err) {
                         fail(err);
                         return;

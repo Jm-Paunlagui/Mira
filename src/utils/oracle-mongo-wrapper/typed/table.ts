@@ -30,6 +30,7 @@ import type { QueryBuilder } from "../core/QueryBuilder";
 import { OracleSchema } from "../schema/OracleSchema";
 import type { WrapperDb } from "../db";
 import type { AnyColumn, ColumnMeta } from "./columns";
+import { quoteIdentifier } from "../utils";
 import type { RelationSpec } from "./include";
 import type { AnyRelation, Relation } from "./relations";
 
@@ -81,7 +82,12 @@ export type FieldOperators<V, IsString extends boolean> = {
   // Subquery forms build their own SQL; their arguments are not typed here.
   $inSelect?: unknown;
   $subquery?: unknown;
-} & (IsString extends true ? { $like?: string; $regex?: string; $options?: string } : {});
+} & (IsString extends true ? { $like?: string; $regex?: string; $options?: string } : {})
+  // A JSON column holding an array: an element matching every condition (JSON_EXISTS).
+  & (Scalar<V> extends object ? (Scalar<V> extends Date | Buffer ? {} : { $elemMatch?: Record<string, unknown> }) : {});
+
+/** "COL.a.b": a path into a JSON column. Known column first; the rest of the path is not checked. */
+export type JsonPath<W> = `${string & keyof W}.${string}`;
 
 /** A filter on a typed table: known columns only, each with its own value type. */
 export type Filter<W> = {
@@ -94,18 +100,25 @@ export type Filter<W> = {
   // EXISTS / NOT EXISTS subqueries take another table's spec: not typed here.
   $exists?: unknown;
   $notExists?: unknown;
+} & {
+  // Paths into JSON columns ("DOC.address.city"): values and operators as for a column.
+  [P in JsonPath<W>]?: unknown;
 };
 
 /** Update operators on a typed table. */
 export type Update<W, R> = {
-  $set?: Partial<W>;
-  $unset?: { [K in keyof W]?: 1 | true | "" };
+  $set?: Partial<W> & { [P in JsonPath<W>]?: unknown };
+  $unset?: { [K in keyof W]?: 1 | true | "" } & { [P in JsonPath<W>]?: 1 | true | "" };
   $inc?: { [K in NumericKeys<W>]?: number };
   $mul?: { [K in NumericKeys<W>]?: number };
   $min?: Partial<W>;
   $max?: Partial<W>;
   $currentDate?: { [K in DateKeys<R>]?: true | { $type: "date" | "timestamp" } };
   $rename?: { [K in keyof W]?: string };
+  /** Append to an array in a JSON column: a value, or { $each: [...] }. */
+  $push?: { [P in JsonPath<W>]?: unknown };
+  /** Remove values from an array in a JSON column: a value, or { $in: [...] }. */
+  $pull?: { [P in JsonPath<W>]?: unknown };
 };
 
 export type SortDirection = 1 | -1 | { order?: 1 | -1; nulls?: "first" | "last" };
@@ -212,13 +225,23 @@ export class TypedTable<C extends Columns, Rel extends Record<string, AnyRelatio
     const coll = typeof t.collection === "function" ? (t as { collection(n: string): OracleCollection }).collection(this.name) : new OracleCollection(this.name, target as WrapperDb);
     // The collection hands the relations to every find(), where include() reads them.
     if (Object.keys(this.relations).length > 0) coll._relations = this.relations;
+    // JSON columns: values written as JSON text, JSON text read back as JS values.
+    const json = Object.entries(this.columns).filter(([, c]) => c.meta.json);
+    if (json.length > 0) {
+      const client = coll.db.oracledb.oracleClientVersion;
+      const native = json.filter(([, c]) => c.meta.json === "native").map(([k]) => k);
+      // A 19c Oracle Client cannot read the 23ai JSON type (ORA-40569) and a write can break the
+      // session (ORA-03106): refuse it up front. Thin mode and 21c+ clients handle it.
+      if (native.length > 0 && client && client < 2100000000) throw new Error(`[defineTable] ${this.name}: ${native.join(", ")} use the native JSON type, which needs Thin mode or Oracle Client 21c+ (this is ${coll.db.oracledb.oracleClientVersionString}). Use t.json() without { native: true } for JSON text.`);
+      coll._json = { encode: json.map(([k]) => k), decode: json.filter(([, c]) => c.meta.json === "text").map(([k]) => k) };
+    }
     return coll as unknown as TypedCollection<RowOf<C>, InsertOf<C>, WriteRowOf<C>, Rel>;
   }
 
   /** The column specs createTable() takes (also what migrations compare). */
   ddl(): Record<string, ColumnSpec> {
     const out: Record<string, ColumnSpec> = {};
-    for (const [k, c] of Object.entries(this.columns)) out[k] = toColumnSpec(c.meta);
+    for (const [k, c] of Object.entries(this.columns)) out[k] = toColumnSpec(k, c.meta);
     return out;
   }
 
@@ -228,13 +251,16 @@ export class TypedTable<C extends Columns, Rel extends Record<string, AnyRelatio
   }
 }
 
-function toColumnSpec(m: Readonly<ColumnMeta>): ColumnSpec {
+function toColumnSpec(name: string, m: Readonly<ColumnMeta>): ColumnSpec {
   const spec: ColumnSpec = { type: m.type };
   if (m.identity) spec.autoIncrement = true;
   if (m.primaryKey) spec.primaryKey = true;
   else if (!m.nullable) spec.notNull = true;
   if (m.default !== undefined) spec.default = m.default;
-  if (m.check !== undefined) spec.check = m.check;
+  // JSON text: an IS JSON check, so Oracle refuses anything that is not a JSON document.
+  const isJson = m.json === "text" ? `${quoteIdentifier(name)} IS JSON` : undefined;
+  if (isJson && m.check !== undefined) spec.check = `(${isJson}) AND (${m.check})`;
+  else if (isJson ?? m.check) spec.check = isJson ?? m.check;
   if (m.references) spec.references = { ...m.references };
   return spec;
 }

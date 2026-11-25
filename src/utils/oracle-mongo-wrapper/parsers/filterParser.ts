@@ -62,6 +62,7 @@
 
 import { quoteIdentifier, bindSafe, renameBinds } from "../utils";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
+import { jsonFieldCondition } from "./jsonPath";
 
 /**
  * Oracle's hard cap on expressions inside a single IN (...) list (ORA-01795).
@@ -235,6 +236,11 @@ function _nowExpr(field: string, spec: unknown, binds: Record<string, unknown>, 
  *   // → '("age" >= :where_age_0 AND "age" < :where_age_1)'
  */
 function _parseFieldExpr(field: string, expr: any, binds: Record<string, unknown>, outerAlias: string | null | undefined, counter: Record<string, any>): string {
+  // A dotted key is a path into a JSON column ("DOC.address.city"); $elemMatch
+  // matches an element of a JSON array. Both are JSON_VALUE / JSON_EXISTS (jsonPath.ts).
+  if (field.includes(".") || (expr !== null && typeof expr === "object" && !Array.isArray(expr) && !(expr instanceof Date) && "$elemMatch" in expr)) {
+    return jsonFieldCondition(field, expr, binds, counter as { next: (p: string) => string });
+  }
   const qField = quoteIdentifier(field);
 
   // Simple equality: { field: value }
