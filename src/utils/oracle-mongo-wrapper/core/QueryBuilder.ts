@@ -135,6 +135,8 @@ class QueryBuilder {
     declare _limit: unknown;
     declare _withTies: boolean;
     declare _sort: Record<string, unknown> | null;
+    /** after(): the sort-key values of the last row of the previous page (keyset pagination). */
+    declare _after: Record<string, unknown> | null;
     declare _conn: import("../db").DbConnection | null;
     /** The relations include() can fetch (from a typed table with relations). */
     declare _relations?: Readonly<Record<string, RelationSpec>>;
@@ -167,6 +169,7 @@ class QueryBuilder {
         this._asOf = options.asOf || null;
         this._terminated = false; // Prevents chaining after a terminal method
         this._includes = [];
+        this._after = null;
     }
 
     /**
@@ -214,6 +217,46 @@ class QueryBuilder {
         this._checkTerminated();
         this._sort = sortSpec;
         return this;
+    }
+
+    /**
+     * Keyset pagination: continue after the row whose sort-key values are given,
+     * in the order of sort(). Give the last row of the previous page (or just its
+     * sort keys). Unlike skip(), the database seeks straight to the next page, and
+     * rows inserted or deleted meanwhile do not shift it.
+     *
+     *   const page1 = await orders.find().sort({ TOTAL: -1, ID: 1 }).limit(20).toArray();
+     *   const page2 = await orders.find().sort({ TOTAL: -1, ID: 1 }).after(page1.at(-1)).limit(20).toArray();
+     *
+     * End the sort with a unique column (the primary key) so no two rows tie.
+     * The sort keys must not be NULL in the cursor.
+     * @param {Object} cursor - The previous page's last row, or its sort-key values
+     * @returns {QueryBuilder} this (for chaining)
+     */
+    after(cursor: Record<string, unknown>): QueryBuilder {
+        this._checkTerminated();
+        if (!cursor || typeof cursor !== "object" || Array.isArray(cursor)) throw new Error(MSG.AFTER_INVALID_CURSOR(JSON.stringify(cursor)));
+        this._after = cursor;
+        return this;
+    }
+
+    /** The keyset predicate for after(): (a > :a) OR (a = :a AND b > :b) …, in sort order. */
+    _afterClause(binds: Record<string, unknown>): string {
+        const cursor = this._after as Record<string, unknown>;
+        if (!this._sort || Object.keys(this._sort).length === 0) throw new Error(MSG.AFTER_NEEDS_SORT(this.tableName));
+        const keys = Object.keys(this._sort);
+        // The cursor may be a whole row: only the sort keys are used, and each must be there.
+        for (const k of keys) if (cursor[k] === null || cursor[k] === undefined) throw new Error(MSG.AFTER_NULL_VALUE(k));
+        const terms = keys.map((k, i) => {
+            const spec = (this._sort as Record<string, unknown>)[k];
+            const order = spec && typeof spec === "object" ? ((spec as { order?: unknown }).order ?? 1) : spec;
+            const name = `after_${i}`;
+            binds[name] = cursor[k];
+            const op = Number(order) === -1 ? "<" : ">";
+            const equal = keys.slice(0, i).map((p, j) => `t0.${quoteIdentifier(p)} = :after_${j}`);
+            return `(${[...equal, `t0.${quoteIdentifier(k)} ${op} :${name}`].join(" AND ")})`;
+        });
+        return `(${terms.join(" OR ")})`;
     }
 
     /**
@@ -312,7 +355,13 @@ class QueryBuilder {
      * @returns {{ sql: string, binds: Object }} The SQL string and bind variables
      */
     _buildSQL(opts: { pageByRowid?: boolean } = {}): { sql: string; binds: Record<string, unknown>; maxRows?: number } {
-        const { whereClause, binds } = parseFilter(this.filter, "t0");
+        const parsed = parseFilter(this.filter, "t0");
+        const binds = parsed.binds;
+        let whereClause = parsed.whereClause;
+        if (this._after) {
+            const keyset = this._afterClause(binds);
+            whereClause = whereClause ? `${whereClause} AND ${keyset}` : `WHERE ${keyset}`;
+        }
 
         // Projection
         const proj = buildProjection(this._projection);
@@ -662,6 +711,61 @@ class QueryBuilder {
             return run(this._conn);
         }
         return this.db.withConnection(run);
+    }
+
+    /**
+     * TERMINAL: iterate the rows with `for await`, streamed (O(1) memory) like forEach().
+     * One connection is held while iterating and released when the loop ends, breaks
+     * or throws; inside a transaction the session's connection is used.
+     *
+     * @example
+     *   for await (const order of orders.find({ STATUS: "open" }).sort({ ID: 1 })) {
+     *     if (await ship(order)) break;
+     *   }
+     */
+    async *[Symbol.asyncIterator](): AsyncGenerator<Record<string, unknown>, void, undefined> {
+        this._terminated = true;
+        await this._resolveFilterPromises();
+        const { sql, binds } = this._buildSQL();
+        const proj = buildProjection(this._projection);
+        const decode = this._includes.length > 0 || !!this._json;
+        const rows = async function* (this: QueryBuilder, conn: DbConnection) {
+            const stream = conn.queryStream(sql, binds, { outFormat: this.db.oracledb.OUT_FORMAT_OBJECT });
+            try {
+                for await (const row of stream as AsyncIterable<Record<string, unknown>>) {
+                    if (proj.isExclusion) for (const col of proj.excludedCols) delete row[col];
+                    yield decode ? this._decodeRow(row) : row;
+                }
+            } catch (err) {
+                throw new Error(MSG.wrapError("QueryBuilder[Symbol.asyncIterator]", err, sql, binds));
+            } finally {
+                stream.destroy();
+            }
+        }.bind(this);
+
+        if (this._conn) {
+            yield* rows(this._conn);
+            return;
+        }
+        // Hold a pooled connection for the loop's lifetime: withConnection's callback
+        // waits until the loop is done, then the connection goes back as usual.
+        let release: (() => void) | undefined;
+        let borrowed!: Promise<unknown>;
+        const conn = await new Promise<DbConnection>((resolve, reject) => {
+            borrowed = this.db.withConnection((c: DbConnection) => {
+                resolve(c);
+                return new Promise<void>((done) => {
+                    release = done;
+                });
+            });
+            borrowed.catch(reject);
+        });
+        try {
+            yield* rows(conn);
+        } finally {
+            release?.();
+            await borrowed;
+        }
     }
 
     /**

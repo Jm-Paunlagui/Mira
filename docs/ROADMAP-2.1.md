@@ -1,6 +1,6 @@
 # Mira 2.1 Roadmap
 
-**Status:** draft · **Base:** v2.0.0 (2026-11-24) · **Branch:** `feature/2.1.0`
+**Status:** all nine items built on `feature/2.1.0` (PRs #21 onward, 2026-11-25); the 2.1.0 release is next · **Base:** v2.0.0 (2026-11-24) · **Branch:** `feature/2.1.0`
 
 This roadmap compares Mira 2.0 with the Node / TypeScript ORMs and query builders that support Oracle, and with Oracle's own MongoDB-style APIs. It lists what Mira lacks, then drafts 2.1.
 

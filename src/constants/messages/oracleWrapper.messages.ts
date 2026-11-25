@@ -188,6 +188,14 @@ const oracleMongoWrapperMessages = {
     `[QueryBuilder.include] ${String(table)} has no relation named ${String(name).slice(0, 40)}${known.length ? ` (it has: ${known.join(", ")})` : ""}. Declare relations with relations() on a defineTable() table, and bind that table with .on(db).`,
   INCLUDE_TWICE: (name: unknown) =>
     `[QueryBuilder.include] ${String(name)} is already included.`,
+  SQL_TAG_INVALID: (why: unknown) =>
+    `[sql] ${String(why)}.`,
+  AFTER_NEEDS_SORT: (table: unknown) =>
+    `[QueryBuilder.after] ${String(table)}: keyset pagination needs a sort(); after() continues from a row in that order.`,
+  AFTER_INVALID_CURSOR: (value: unknown) =>
+    `[QueryBuilder.after] the cursor must be an object of sort-key values (or the previous page's last row), got ${String(value)}.`,
+  AFTER_NULL_VALUE: (column: unknown) =>
+    `[QueryBuilder.after] ${String(column)} is null or missing in the cursor: keyset pagination needs non-null sort keys.`,
   JSON_PATH_INVALID: (why: unknown) =>
     `[JSON path] ${String(why)}.`,
   JSON_TYPE_NEEDS_21C: (table: unknown, columns: unknown, version: unknown) =>

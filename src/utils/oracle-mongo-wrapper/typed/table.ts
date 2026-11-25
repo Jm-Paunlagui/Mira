@@ -155,6 +155,10 @@ export interface TypedQuery<B, Rel = {}, Inc = {}> extends PromiseLike<Array<Sim
   /** Fetch a declared relation in the same statement (see relations()). */
   include<K extends keyof Rel & string>(name: K, options?: IncludeOptionsOf<Rel[K]>): TypedQuery<B, Rel, Inc & { [P in K]: Rel[K] extends { $out: infer O } ? O : never }>;
   forUpdate(mode: ForUpdateMode): TypedQuery<B, Rel, Inc>;
+  /** Keyset pagination: continue after this row (the previous page's last row, or its sort keys). */
+  after(cursor: Partial<B>): TypedQuery<B, Rel, Inc>;
+  /** `for await (const row of query)`: rows streamed one at a time on one connection. */
+  [Symbol.asyncIterator](): AsyncIterator<Simplify<B & Inc>>;
   toArray(): Promise<Array<Simplify<B & Inc>>>;
   next(): Promise<Simplify<B & Inc> | null>;
   hasNext(): Promise<boolean>;

@@ -26,6 +26,7 @@ Oracle Database
     - [JSON Columns (2.1)](#json-columns-21)
     - [Timestamps, Soft Delete, Hooks and Validation (2.1)](#timestamps-soft-delete-hooks-and-validation-21)
     - [Optimistic Locking (2.1)](#optimistic-locking-21)
+    - [Keyset Paging, Streaming, Raw SQL and Query Events (2.1)](#keyset-paging-streaming-raw-sql-and-query-events-21)
     - [Migrations (2.1)](#migrations-21)
 - [Basic — Your First Queries](#-basic--your-first-queries)
 - [Medium — Filtering, Updating & Chaining](#-medium--filtering-updating--chaining)
@@ -460,6 +461,61 @@ try {
 - `upsert` with a version in the filter is refused, since a stale version would insert a second row.
 
 **Errors in transactions:** `MiraConcurrencyError` and `MiraValidationError` are *operational* (`isOperational: true`, `statusCode` 409 and 422). Inside `withTransaction` they reach your code with their own class instead of being wrapped as a database failure, and they aren't logged as critical.
+
+### Keyset Paging, Streaming, Raw SQL and Query Events (2.1)
+
+**Keyset pagination: `after()`.** Continue after the previous page's last row, in the order of `sort()`. Unlike `skip()`, Oracle seeks straight to the page, and rows added or removed meanwhile don't shift it.
+
+```ts
+const page1 = await orders.find().sort({ TOTAL: -1, ID: 1 }).limit(20).toArray();
+const page2 = await orders.find().sort({ TOTAL: -1, ID: 1 }).after(page1.at(-1)).limit(20).toArray();
+// … WHERE ((t0."TOTAL" < :after_0) OR (t0."TOTAL" = :after_0 AND t0."ID" > :after_1)) ORDER BY … FETCH FIRST 20 ROWS ONLY
+```
+- The cursor is the last row, or just its sort-key values. Every sort key must be present and not null.
+- End the sort with a unique column (the primary key) so no two rows tie.
+- Without a `sort()` it throws, since there is no order to continue in.
+
+**Streaming: `for await`.** A query can be iterated directly. Rows are streamed (constant memory, like `forEach`) on one connection, which goes back to the pool when the loop ends, `break`s or throws. Inside a transaction, the session's connection is used.
+
+```ts
+for await (const order of orders.find({ STATUS: "open" }).sort({ ID: 1 })) {
+  if (!(await ship(order))) break;
+}
+```
+
+**Raw SQL: the ``sql`…` `` tag.** For the statement the API doesn't cover. Every interpolated value becomes a bind, so a value can never change the statement:
+
+```ts
+import { sql } from "@jm-paunlagui/mira";
+
+const rows = await sql`
+  SELECT STORE_ID, SUM(TOTAL) AS TOTAL FROM ${sql.ident("ORDERS")}
+   WHERE STORE_ID IN (${storeIds}) AND TOTAL >= ${min}
+   GROUP BY STORE_ID`.rows<{ STORE_ID: number; TOTAL: string }>(db);
+// … WHERE STORE_ID IN (:p0, :p1) AND TOTAL >= :p2 …
+
+const { rowsAffected } = await sql`UPDATE ORDERS SET STATUS = ${"closed"} WHERE ID = ${id}`.execute(session);
+```
+- An array becomes a list of binds (for `IN`). An empty array is refused, because `IN ()` is not SQL.
+- `sql.ident("T")` / `sql.ident("t", "COL")` splices a quoted identifier, after checking it is a plain name.
+- A nested ``sql`…` `` fragment is spliced from its parts and its binds join the statement. Its text is never re-parsed.
+- `undefined`, functions and plain objects are refused (pass `null` for SQL NULL).
+- `.rows(target)` returns the rows. `.execute(target)` returns `{ rows, rowsAffected }` and commits outside a transaction. `target` is the db handle, a transaction session, or a hook's `ctx`.
+
+**Query events: `onQuery()`.** A callback after every statement, for slow-query logs or metrics:
+
+```ts
+import { onQuery } from "@jm-paunlagui/mira";
+
+const stop = onQuery((e) => {
+  if (e.durationMs > 500) logger.warning(`slow ${e.operation} (${e.durationMs} ms, ${e.bindCount} binds): ${e.sql}`);
+});
+stop(); // unsubscribe
+```
+- It is built on node-oracledb's trace handler, so it sees every `execute` / `executeMany`: Mira's own statements, ``sql`…` ``, and your own `conn.execute()` calls.
+- Each event has `operation`, `sql`, `bindCount`, `batchSize` (executeMany), `durationMs`, `rowCount`, `rowsAffected` and `error`. **Bind values are never included**, since they may hold passwords or personal data.
+- oracledb allows one trace handler per process. If one is already installed (for example OpenTelemetry's oracledb instrumentation), Mira's handler passes every hook on to it, so spans keep working. When the last listener unsubscribes, the earlier handler is put back.
+- A listener that throws is ignored, so an event never breaks a query.
 
 ### Migrations (2.1)
 

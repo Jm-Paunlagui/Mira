@@ -87,6 +87,7 @@ export async function buildContext(): Promise<Ctx> {
     else if (name === "createPerformance") api[name] = tracker.trackFn(name, v as never, (p) => tracker.trackObject("performance", p as object));
     else if (name === "createMigrator") api[name] = tracker.trackFn(name, v as never, (m) => tracker.trackObject("migrator", m as object));
     else api[name] = tracker.trackFn(name, v as never);
+    Object.assign(api[name] as object, v); // keep a function's own properties (sql.ident)
   }
   // Register the db-handle and performance methods up front, so an unused one is reported.
   tracker.trackObject("db", rawDb);
