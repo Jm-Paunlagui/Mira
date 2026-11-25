@@ -30,6 +30,8 @@ export interface ColumnMeta {
   /** Raw SQL CHECK condition (trusted code). */
   check?: string;
   references?: { table: string; column: string };
+  /** A JSON column: "text" = CLOB with an IS JSON check (19c+), "native" = the JSON type (23ai). */
+  json?: "text" | "native";
 }
 
 /**
@@ -133,6 +135,14 @@ export const t = {
   timestamp: (precision?: number) => col<Date>(precision === undefined ? "TIMESTAMP" : `TIMESTAMP(${precision === 0 ? 0 : size("timestamp", precision)})`),
   /** TIMESTAMP(precision) WITH TIME ZONE. */
   timestampTz: (precision?: number) => col<Date>(precision === undefined ? "TIMESTAMP WITH TIME ZONE" : `TIMESTAMP(${precision === 0 ? 0 : size("timestampTz", precision)}) WITH TIME ZONE`),
+  /**
+   * A JSON document column, read and written as a JS value of type T.
+   * Default: CLOB with an IS JSON check (Oracle 19c and later).
+   * { native: true }: the JSON type (Oracle 23ai; needs Thin mode or Oracle Client 21c+).
+   */
+  // NoInfer: inside defineTable({ … }) the expected type would otherwise make T any, not unknown.
+  json: <T = unknown>(options: { native?: boolean } = {}): Column<NoInfer<T>> =>
+    new Column<T>({ type: options.native ? "JSON" : "CLOB", nullable: false, identity: false, primaryKey: false, json: options.native ? "native" : "text" }),
   /**
    * Any other Oracle type, with the value type you name:
    * `t.raw<number>("BINARY_DOUBLE")`, `t.raw<Buffer>("RAW(16)")`.

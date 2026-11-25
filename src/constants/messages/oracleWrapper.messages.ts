@@ -188,6 +188,8 @@ const oracleMongoWrapperMessages = {
     `[QueryBuilder.include] ${String(table)} has no relation named ${String(name).slice(0, 40)}${known.length ? ` (it has: ${known.join(", ")})` : ""}. Declare relations with relations() on a defineTable() table, and bind that table with .on(db).`,
   INCLUDE_TWICE: (name: unknown) =>
     `[QueryBuilder.include] ${String(name)} is already included.`,
+  JSON_PATH_INVALID: (why: unknown) =>
+    `[JSON path] ${String(why)}.`,
   WINDOW_INVALID_OPTION: (why: unknown) =>
     `[windowFunctions] ${String(why)}.`,
   SORT_INVALID: (col: unknown, why: unknown) =>

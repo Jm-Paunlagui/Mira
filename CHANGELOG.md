@@ -164,6 +164,44 @@ Two tests failed only on the CI database:
   - each customer's first receipt (`hasOne`)
   - Result: 310 checks, 61 queries, 134 of 134 public functions.
 
+### Added — JSON columns (roadmap step 3)
+
+- **`t.json<T>()`** declares a JSON document column. It is a CLOB with an `IS JSON` check (Oracle 19c+), added by `ddl()` / `create()`. **`t.json<T>({ native: true })`** uses the 23ai JSON type.
+- **A typed table reads and writes JSON columns as `T`:** in `insertOne`, `insertMany`, `replaceOne`, whole-column `$set`, `find`, `findOne`, `next`, `forEach`, `await`, and in `include()`, where a related row's JSON column is embedded as a document.
+- **Paths in filters:** `"COL.a.b"` and `"COL.items.0.sku"`.
+  - Operators: `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$in` `$nin` `$between` `$exists` and `null`, via `JSON_VALUE(… RETURNING NUMBER | TIMESTAMP WITH TIME ZONE | VARCHAR2)` chosen from the value's type, and `JSON_EXISTS`.
+  - **`$elemMatch`**, on element fields or on plain values, becomes `JSON_EXISTS(… '$.items[*]?(…)' PASSING …)` with every value bound.
+- **Paths in updates:**
+  - `$set` / `$unset` on paths become one `JSON_MERGEPATCH` per column.
+  - **`$push`** (a value, or `$each`) and **`$pull`** (a value, or `$in`) rebuild the array with `JSON_TABLE` + `JSON_ARRAYAGG`. They also work on a column that holds an array.
+  - Refused with a clear error: `$set` of null on a path (merge patch would delete the key; use `$unset`), paths through an array index, two updates of one path, overlapping paths, and a column set both whole and by path.
+- **`$jsonTable`** pipeline stage: one row per array element, with typed columns (`NUMBER`, `VARCHAR2`, `DATE`, `TIMESTAMP`, `CLOB`, `JSON`; checked), `"$"` for the element itself, `ordinality`, and `outer`.
+- **`mira generate types`** writes `t.json()` for a CLOB with `IS JSON` (from `USER_JSON_COLUMNS`), and `t.json({ native: true })` for the JSON type.
+- **Typed:**
+  - dotted paths must start with a known column
+  - `$elemMatch` is only accepted on JSON columns
+  - `$push` / `$pull` are typed
+  - `t.json()` with no type argument is `unknown`, never `any` (`NoInfer`)
+- **Same SQL on 19c and 23ai.** Only functions 19c has are used (no `JSON_TRANSFORM`). Path updates merge into `JSON_SERIALIZE(col RETURNING CLOB)`: merging into the 23ai JSON type directly made 23.26 store binary OSON version 2, which node-oracledb 7 can't read (`NJS-126`).
+
+### Behaviour notes (JSON)
+
+- **The untyped API is unchanged:** a JSON column is returned as its stored text, as in 2.0. Only typed tables decode it.
+- **A filter key with a dot is now a JSON path.** Before, it was quoted as one column name; no Mira code used that.
+- **The native JSON type needs Thin mode or Oracle Client 21c+.** With the 19.6 client against 23ai, reading it fails with `ORA-40569` and a write broke the session (`ORA-03106`). `Table.on(db)` refuses a native column on a 19.x Thick client with a clear message.
+
+### Tests and simulation (JSON)
+
+- `test/integration/jsonColumns.test.ts` (18 tests, Thick and Thin):
+  - the `IS JSON` check; typed reads in every path; the untyped API returning text; `include()`
+  - every path operator, `$elemMatch` form and update form, and each refusal
+  - `$jsonTable` (inner, outer, ordinality, `"$"`, JSON / VARCHAR2 columns, with `$group`)
+  - the generator round trip
+  - native JSON: works in Thin; refused up front on a 19.x Thick client
+- `test/types/jsonColumns.types.ts`: exact row and insert types, plus 4 misuses that must not compile.
+- `test/unit/typedTables.test.ts`: the generator maps CLOB + `IS JSON` and the JSON type.
+- Simulation, reports stage: the loyalty table gets a `PREFS` document per VIP. The stage checks a path filter, `$elemMatch`, `$push` + `$set` on paths for every VIP, `$pull`, and `$jsonTable` + `$group` of the resulting drinks menu, all against the model. Result: 313 checks, 66 queries, 134 of 134 public functions.
+
 ## [2.0.1] — 2026-11-25
 
 Patch release: Mira now behaves the same in node-oracledb Thin and Thick mode. 2.0.0 was only tested in Thin mode. On a machine with an Oracle Client on the system PATH, the adapter loads Thick mode even when `ORACLE_INSTANT_CLIENT` is blank, and two things broke.

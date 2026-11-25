@@ -60,6 +60,7 @@ function jsonObject(spec: RelationSpec): string {
     .filter(([, c]) => !BINARY.test(c.meta.type))
     .map(([col, c]) => {
       const ref = `i.${quoteIdentifier(col)}`;
+      if (c.meta.json === "text") return `KEY ${quoteLiteral(col)} VALUE ${ref} FORMAT JSON`; // the document itself, not its text
       return `KEY ${quoteLiteral(col)} VALUE ${SCALED_NUMBER.test(c.meta.type) ? `TO_CHAR(${ref})` : ref}`;
     });
   return `JSON_OBJECT(${pairs.join(", ")} NULL ON NULL RETURNING CLOB)`;

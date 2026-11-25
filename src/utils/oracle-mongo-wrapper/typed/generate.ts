@@ -39,6 +39,7 @@ interface CatalogColumn {
   IS_PK: number;
   REF_TABLE: string | null;
   REF_COLUMN: string | null;
+  IS_JSON: number;
 }
 
 // One row per column with its identity generation, primary-key membership and
@@ -47,10 +48,11 @@ const CATALOG_SQL = `
 SELECT c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, c.DATA_LENGTH, c.CHAR_LENGTH, c.CHAR_USED,
        c.DATA_PRECISION, c.DATA_SCALE, c.NULLABLE, c.DATA_DEFAULT, c.IDENTITY_COLUMN, i.GENERATION_TYPE,
        CASE WHEN pk.COLUMN_NAME IS NULL THEN 0 ELSE 1 END AS IS_PK,
-       fk.REF_TABLE, fk.REF_COLUMN
+       fk.REF_TABLE, fk.REF_COLUMN, CASE WHEN jc.COLUMN_NAME IS NULL THEN 0 ELSE 1 END AS IS_JSON
   FROM USER_TAB_COLUMNS c
   JOIN USER_TABLES ut ON ut.TABLE_NAME = c.TABLE_NAME
   LEFT JOIN USER_TAB_IDENTITY_COLS i ON i.TABLE_NAME = c.TABLE_NAME AND i.COLUMN_NAME = c.COLUMN_NAME
+  LEFT JOIN USER_JSON_COLUMNS jc ON jc.TABLE_NAME = c.TABLE_NAME AND jc.COLUMN_NAME = c.COLUMN_NAME
   LEFT JOIN (SELECT cc.TABLE_NAME, cc.COLUMN_NAME
                FROM USER_CONSTRAINTS k JOIN USER_CONS_COLUMNS cc ON cc.CONSTRAINT_NAME = k.CONSTRAINT_NAME
               WHERE k.CONSTRAINT_TYPE = 'P') pk ON pk.TABLE_NAME = c.TABLE_NAME AND pk.COLUMN_NAME = c.COLUMN_NAME
@@ -92,7 +94,9 @@ function builder(c: CatalogColumn): string {
   }
   if (type === "VARCHAR2") return c.CHAR_USED === "C" ? `t.text(${c.CHAR_LENGTH}, "char")` : `t.text(${c.DATA_LENGTH})`;
   if (type === "CHAR" && c.CHAR_USED !== "C") return `t.char(${c.DATA_LENGTH})`;
-  if (type === "CLOB") return "t.clob()";
+  // JSON: the 23ai JSON type, or a CLOB with an IS JSON check (t.json() adds that check itself).
+  if (type === "JSON") return "t.json({ native: true })";
+  if (type === "CLOB") return Number(c.IS_JSON) === 1 ? "t.json()" : "t.clob()";
   if (type === "BLOB") return "t.blob()";
   if (type === "DATE") return "t.date()";
   if (/^TIMESTAMP\(\d\)$/.test(type)) return tsPrecision === "6" ? "t.timestamp()" : `t.timestamp(${tsPrecision})`;

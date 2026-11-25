@@ -46,6 +46,7 @@
 
 import { quoteIdentifier, bindSafe } from "../utils";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
+import { JsonUpdates } from "./jsonPath";
 
 // ─── _createCounter ─────────────────────────────────────────────
 /**
@@ -118,16 +119,29 @@ function parseUpdate(update: Record<string, any>): { setClause: string; binds: R
   const counter = _createCounter();
   const parts: string[] = [];
   const binds: Record<string, unknown> = {};
+  // Dotted keys ("DOC.a.b") and $push / $pull change JSON documents (jsonPath.ts).
+  const json = new JsonUpdates();
+  const plainColumns = new Set<string>();
 
   for (const [op, fields] of Object.entries(update)) {
     if (op === "$set") {
       for (const [field, val] of Object.entries(fields)) {
+        if (field.includes(".")) {
+          json.set(field, val);
+          continue;
+        }
+        plainColumns.add(field);
         const bname = counter.next(field);
         binds[bname] = val;
         parts.push(`${quoteIdentifier(field)} = :${bname}`);
       }
     } else if (op === "$unset") {
       for (const field of Object.keys(fields)) {
+        if (field.includes(".")) {
+          json.unset(field);
+          continue;
+        }
+        plainColumns.add(field);
         parts.push(`${quoteIdentifier(field)} = NULL`);
       }
     } else if (op === "$inc") {
@@ -178,12 +192,19 @@ function parseUpdate(update: Record<string, any>): { setClause: string; binds: R
         else if (type === "timestamp") parts.push(`${quoteIdentifier(field)} = SYSTIMESTAMP`);
         else throw new Error(MSG.UPDATE_CURRENT_DATE_INVALID(field));
       }
+    } else if (op === "$push" || op === "$pull") {
+      for (const [field, val] of Object.entries(fields)) json[op === "$push" ? "push" : "pull"](field, val);
     } else if (op === "$rename") {
       throw new Error(MSG.UPDATE_RENAME_NOT_SUPPORTED);
     } else {
       throw new Error(MSG.UPDATE_UNSUPPORTED_OPERATOR(op));
     }
   }
+
+  for (const col of plainColumns) {
+    if (json.has(col)) throw new Error(MSG.JSON_PATH_INVALID(`${col} is set as a whole and by path in the same update`));
+  }
+  parts.push(...json.setItems(binds, counter));
 
   return {
     setClause: `SET ${parts.join(", ")}`,

@@ -348,20 +348,48 @@ export async function reportsStage(sim: Sim, ctx: Ctx, state: State) {
     POINTS: t.number(),
     LEVEL_NAME: t.text(10).default("'bronze'"),
     NOTE: t.text(60).nullable(),
+    // VIP preferences as a JSON document (CLOB IS JSON).
+    PREFS: t.json<{ lounge: boolean; drinks: string[]; reviewed?: boolean }>().nullable(),
   });
   await Loyalty.create(db);
   sim.eq("TypedTable.ddl(): the identity key and the defaulted column as createTable takes them", [Loyalty.ddl().ID, Loyalty.ddl().LEVEL_NAME], [{ type: "NUMBER", autoIncrement: true, primaryKey: true }, { type: "VARCHAR2(10)", notNull: true, default: "'bronze'" }]);
   const spent = new Map<number, number>();
   for (const o of model.orders) spent.set(o.customerId, (spent.get(o.customerId) ?? 0) + o.total);
+  const drinksOf = (id: number) => (id % 2 === 0 ? ["coffee", "calamansi"] : ["tea"]);
   const members = [...spent].sort((a, b) => a[0] - b[0]).map(([id, c]) => ({ id, points: Math.floor(c / 1000), vip: byId.get(id)?.TIER === "vip" })); // 1 point per 10.00
   await new api.Transaction(db).withTransaction(async (session) => {
-    await Loyalty.on(session).insertMany(members.map((m) => (m.vip ? { CUSTOMER_ID: m.id, POINTS: m.points, NOTE: "vip lounge" } : { CUSTOMER_ID: m.id, POINTS: m.points })));
+    await Loyalty.on(session).insertMany(members.map((m) => (m.vip ? { CUSTOMER_ID: m.id, POINTS: m.points, NOTE: "vip lounge", PREFS: { lounge: true, drinks: drinksOf(m.id) } } : { CUSTOMER_ID: m.id, POINTS: m.points })));
   });
   const board = await sim.mira(() => Loyalty.on(db).find({ POINTS: { $gt: 0 } }).sort({ POINTS: -1, CUSTOMER_ID: 1 }).toArray());
   sim.eq(
     "typed table from create(): points per customer, default level filled in, notes only for VIPs",
     board.map((r) => [r.CUSTOMER_ID, r.POINTS, r.LEVEL_NAME, r.NOTE]),
     members.filter((m) => m.points > 0).sort((a, b) => b.points - a.points || a.id - b.id).map((m) => [m.id, m.points, "bronze", m.vip ? "vip lounge" : null]),
+  );
+  // JSON column: path filters, $elemMatch, $push / $pull / $set on paths, $jsonTable.
+  const loyalty = Loyalty.on(db);
+  const loungeIds = members.filter((m) => m.vip).map((m) => m.id);
+  const lounge = await sim.mira(() => loyalty.find({ "PREFS.lounge": true }).sort({ CUSTOMER_ID: 1 }).project({ CUSTOMER_ID: 1, PREFS: 1 }).toArray());
+  sim.eq("JSON path filter: VIPs with lounge access, preferences read back as documents", lounge.map((r) => [r.CUSTOMER_ID, r.PREFS?.drinks]), loungeIds.map((id) => [id, drinksOf(id)]));
+  const teaDrinkers = await sim.mira(() => loyalty.find({ "PREFS.drinks": { $elemMatch: { $eq: "tea" } } }).sort({ CUSTOMER_ID: 1 }).project({ CUSTOMER_ID: 1 }).toArray());
+  sim.eq("$elemMatch: members whose drinks include tea", teaDrinkers.map((r) => r.CUSTOMER_ID), loungeIds.filter((id) => drinksOf(id).includes("tea")));
+  // Water is added for every VIP and calamansi leaves the menu; each reviewed member is marked.
+  await sim.mira(() => loyalty.updateMany({ "PREFS.lounge": true }, { $push: { "PREFS.drinks": "water" }, $set: { "PREFS.reviewed": true } }));
+  await sim.mira(() => loyalty.updateMany({ "PREFS.drinks": { $elemMatch: { $eq: "calamansi" } } }, { $pull: { "PREFS.drinks": "calamansi" } }));
+  const menu = await sim.mira(() =>
+    loyalty.aggregate<{ DRINK: string; N: number }>([
+      { $match: { "PREFS.reviewed": true } },
+      { $jsonTable: { column: "PREFS", path: "drinks", columns: { DRINK: { path: "$", type: "VARCHAR2(20)" } } } },
+      { $group: { _id: "$DRINK", N: { $count: "*" } } },
+      { $sort: { DRINK: 1 } },
+    ]),
+  );
+  const wantMenu = new Map<string, number>();
+  for (const id of loungeIds) for (const d of [...drinksOf(id).filter((x) => x !== "calamansi"), "water"]) wantMenu.set(d, (wantMenu.get(d) ?? 0) + 1);
+  sim.eq(
+    "$jsonTable + $group: drinks across reviewed VIPs after $push water / $pull calamansi",
+    menu.map((r) => [r.DRINK, Number(r.N)]),
+    [...wantMenu].sort((a, b) => (a[0] < b[0] ? -1 : 1)),
   );
 
   // ── Set operations ───────────────────────────────────────────────────────

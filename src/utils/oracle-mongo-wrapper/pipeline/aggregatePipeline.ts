@@ -74,7 +74,11 @@
 
 import { quoteIdentifier, renameBinds, sortTerm } from "../utils";
 import { parseFilter } from "../parsers/filterParser";
+import { splitPath, pathText } from "../parsers/jsonPath";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
+
+/** Column types a $jsonTable column may declare (written into the SQL, so checked). */
+const JSON_TABLE_TYPE = /^(NUMBER(\(\d+(\s*,\s*\d+)?\))?|VARCHAR2\(\d+( CHAR)?\)|DATE|TIMESTAMP(\(\d\))?( WITH TIME ZONE)?|CLOB|JSON)$/i;
 
 /**
  * Create a per-call counter for unique bind variable names.
@@ -314,6 +318,43 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
         ctes.push({ alias: stageAlias, sql: addStageBinds(built.sql, built.binds, `cb${stageIdx}_`) });
         if (spec?.includeLevel) aliases.add("LEVEL");
         for (const c of spec?.root == null ? [] : Array.isArray(spec.root) ? spec.root : [spec.root]) aliases.add(`ROOT_${String(c).toUpperCase()}`);
+        break;
+      }
+
+      case "$jsonTable": {
+        // One row per element of a JSON array, joined to its source row:
+        // { $jsonTable: { column: "DOC", path: "items", columns: { SKU: "sku", QTY: { path: "qty", type: "NUMBER" } },
+        //                 ordinality: "N", outer: true } }
+        const jt = stage.$jsonTable ?? {};
+        const bad = (why: string): never => {
+          throw new Error(MSG.JSON_PATH_INVALID(`$jsonTable: ${why}`));
+        };
+        if (typeof jt.column !== "string" || jt.column === "") bad("column names the JSON column");
+        if (!jt.columns || typeof jt.columns !== "object" || Object.keys(jt.columns).length === 0) bad("columns maps each output column to a path in the element");
+        const arrayPath = jt.path === undefined || jt.path === "" ? "$" : pathText(splitPath(`x.${jt.path}`).segments);
+        const cols = Object.entries(jt.columns as Record<string, DslSpec>).map(([name, spec]) => {
+          const s = typeof spec === "string" ? { path: spec } : spec ?? {};
+          if (typeof s.path !== "string" || s.path === "") bad(`${name}: give the path of the value in the element`);
+          const type = s.type ?? "VARCHAR2(4000)";
+          if (typeof type !== "string" || !JSON_TABLE_TYPE.test(type.trim())) bad(`${name}: type must be NUMBER[(p[,s])], VARCHAR2(n), DATE, TIMESTAMP[(n)] [WITH TIME ZONE], CLOB or JSON`);
+          // "$" is the element itself (an array of plain values: ["tea", "water"]).
+          const colPath = s.path === "$" ? "$" : pathText(splitPath(`x.${s.path}`).segments);
+          const sqlType = type.trim().toUpperCase() === "JSON" ? "CLOB FORMAT JSON" : type.trim().toUpperCase();
+          return `${quoteIdentifier(name)} ${sqlType} PATH '${colPath}'`;
+        });
+        if (jt.ordinality !== undefined) {
+          if (typeof jt.ordinality !== "string" || jt.ordinality === "") bad("ordinality names the column numbering the elements");
+          cols.unshift(`${quoteIdentifier(jt.ordinality)} FOR ORDINALITY`);
+        }
+        const table = `JSON_TABLE(${prevSource}.${quoteIdentifier(jt.column)}, '${arrayPath}[*]' COLUMNS (${cols.join(", ")})) "MIRA_JT"`;
+        ctes.push({
+          alias: stageAlias,
+          // outer: true keeps source rows whose array is empty or missing (one row of NULLs).
+          sql: jt.outer === true
+            ? `SELECT ${prevSource}.*, "MIRA_JT".* FROM ${prevSource} LEFT OUTER JOIN ${table} ON 1 = 1`
+            : `SELECT ${prevSource}.*, "MIRA_JT".* FROM ${prevSource}, ${table}`,
+        });
+        for (const name of Object.keys(jt.columns)) aliases.add(name.toUpperCase());
         break;
       }
 
