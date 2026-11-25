@@ -960,7 +960,8 @@ function _buildAddFieldsCols(addFields: Record<string, DslSpec>, counter: Counte
  */
 function _buildLateralSub(lj: DslSpec, prevSource: unknown) {
   if (lj.subquery && typeof lj.subquery._buildSQL === "function") {
-    const { sql: builtSql, binds } = lj.subquery._buildSQL();
+    // pageByRowid: a row limit inside LATERAL is mis-decorrelated by Oracle (see QueryBuilder._buildSQL).
+    const { sql: builtSql, binds } = lj.subquery._buildSQL({ pageByRowid: true });
     let sql = builtSql;
     // Post-process: replace bind variables whose values start with "$outer."
     // with direct column references to the outer table (prevSource)

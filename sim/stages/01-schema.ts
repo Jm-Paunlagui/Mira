@@ -118,7 +118,8 @@ export async function schemaStage(sim: Sim, ctx: Ctx, state: State) {
   await sim.rejects("dropTable of a referenced table without cascade: ORA-02449", schema.dropTable(T.STORES), /ORA-02449/);
 
   // DCL: grant read access on the menu to another schema, then take it back.
-  const grantee = (process.env.MIRA_SIM_GRANTEE ?? process.env.APP_DB_USERNAME ?? "PUBLIC").toUpperCase();
+  // `||`, not `??`: a blank `MIRA_SIM_GRANTEE=` line in .env is "" and must fall through.
+  const grantee = (process.env.MIRA_SIM_GRANTEE?.trim() || process.env.APP_DB_USERNAME?.trim() || "PUBLIC").toUpperCase();
   const dcl = new api.OracleDCL(db as never);
   const grants = async () =>
     (await raw<{ P: string }>("SELECT PRIVILEGE AS P FROM USER_TAB_PRIVS_MADE WHERE TABLE_NAME = :t AND GRANTEE = :g ORDER BY 1", { t: T.PRODUCTS, g: grantee })).map((r) => r.P);

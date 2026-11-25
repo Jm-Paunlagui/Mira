@@ -105,7 +105,11 @@ function createPerformance(db: Record<string, any>): Record<string, unknown> {
         // EXPLAIN PLAN FOR ...
         const explainSql = `EXPLAIN PLAN FOR ${sql}`;
         try {
-          await conn.execute(explainSql, binds, { autoCommit: true });
+          // EXPLAIN PLAN never evaluates bind values, and the two driver modes
+          // disagree about them: Thin refuses unbound placeholders (NJS-098),
+          // Thick (OCI) refuses bound values (ORA-01036). Bind only in Thin.
+          const isThick = Boolean(db.oracledb?.oracleClientVersion);
+          await conn.execute(explainSql, isThick ? {} : binds, { autoCommit: true });
 
           // Retrieve the plan
           const planResult = await conn.execute(

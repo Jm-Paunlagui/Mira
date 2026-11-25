@@ -87,7 +87,12 @@ describe("chaos: pool exhaustion and slow calls", () => {
     const timedOut = res.filter((r) => r.status === "rejected" && /NJS-040/.test(String((r as PromiseRejectedResult).reason)));
     const slowest = Math.max(...res.map((r) => (r.status === "fulfilled" ? r.value : (r.reason as { at: number }).at)));
     m("queued caller worst wait (queueTimeout=1500ms)", slowest, "ms");
-    expect(timedOut.length).toBe(2);
+    // The bound itself, not an exact count: how many callers queue depends on how many of the
+    // two pooled connections are ready at that instant (Thick mode may be replacing one).
+    // Every outcome is a served call or an NJS-040; each NJS-040 lands near queueTimeout, never ~3x.
+    expect(timedOut.length).toBeGreaterThanOrEqual(2);
+    expect(res.filter((r) => r.status === "fulfilled").length + timedOut.length).toBe(4);
+    for (const r of timedOut) expect(((r as PromiseRejectedResult).reason as { at: number }).at).toBeLessThan(1500 + 1000);
   }, 30000);
 
   it("pool recovers after saturation", async () => {
@@ -218,7 +223,8 @@ describe("chaos: transactional integrity under failure", () => {
       expect((err as Error).message).toMatch(/ORA-00054/);
       expect(ms).toBeLessThan(1000);
       const [err2, ms2] = await timeIt(() => coll(A).find({ ID: 3 }).forUpdate({ wait: 1 }).toArray().catch((e: Error) => e));
-      expect((err2 as Error).message).toMatch(/ORA-30006/);
+      // 19c: ORA-30006 (resource busy; WAIT timeout expired). 23ai: ORA-00054 + ORA-40097.
+      expect((err2 as Error).message).toMatch(/ORA-30006|ORA-00054/);
       expect(ms2).toBeGreaterThanOrEqual(900);
     });
   }, 30000);

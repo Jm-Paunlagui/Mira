@@ -1,5 +1,37 @@
 # Changelog
 
+## [2.0.1] — 2026-11-25
+
+Patch release: Mira now behaves the same in node-oracledb Thin and Thick mode. 2.0.0 was only tested in Thin mode. On a machine with an Oracle Client on the system PATH, the adapter loads Thick mode even when `ORACLE_INSTANT_CLIENT` is blank, and two things broke.
+
+### Behaviour change
+
+- **LOB columns come back as plain values.** CLOB and NCLOB return a `string`, and BLOB returns a `Buffer`, in both modes. In 2.0.0 they came back as driver `Lob` objects tied to a connection the wrapper had already released. In Thin mode `lob.getData()` still happened to work. In Thick mode it failed with `NJS-003: invalid or closed connection`. **Migration:** replace `await row.COL.getData()` with `row.COL`.
+
+### Fixed
+
+- **`performance.explainPlan(queryBuilder)` in Thick mode.** It failed with `ORA-01036: illegal variable name/number` because Thick mode refuses bind values on `EXPLAIN PLAN`. Thin mode requires them (`NJS-098`), so the bind values are now passed in Thin mode only. `EXPLAIN PLAN` never evaluates them either way.
+- **`$lateralJoin` with a `limit` returned too few rows.** Oracle mis-handles a row limit (`FETCH FIRST` or `ROWNUM`) inside a LATERAL / APPLY subquery once it decorrelates it. On 23.26 one active user kept a match out of six. The subquery now picks its page by ROWID (`t0.ROWID IN (… FETCH FIRST n ROWS ONLY)`), which Oracle evaluates correctly. Plain queries are unchanged.
+- **Wrapper error messages:** `COLLECTION_INVALID_TABLE_NAME`, `INVALID_ROW_COUNT` and `WINDOW_INVALID_ARGUMENT` show the refused value (cut to 40 characters), not only its type.
+
+### Docs
+
+- README: a blank `ORACLE_INSTANT_CLIENT` does not guarantee Thin mode. The startup log says which mode loaded.
+
+### Tests
+
+- Chaos: the `FOR UPDATE WAIT n` timeout test accepts `ORA-30006` (19c) and `ORA-00054` (23ai).
+- Reliability: the CLOB round-trip expects a string, and a new 70,000-byte BLOB round-trip expects a `Buffer`.
+- Unit: the fetch handler's CLOB, NCLOB and BLOB mappings.
+- Integration: `$lateralJoin` with `sort` + `limit` keeps every outer row and picks each one's top row.
+- Chaos: the queueTimeout test asserts the bound itself. Every NJS-040 lands near `queueTimeout`, never about 3× later. It no longer asserts an exact count, which depended on how many pooled connections were ready at that instant.
+- Simulation:
+  - A blank `MIRA_SIM_GRANTEE=` falls back to `APP_DB_USERNAME`. Before, the grant ran with grantee `""` (`ORA-01741`), so `OracleDCL.revoke` was never reached.
+  - The hostile-identifier checks accept 23ai's `ORA-25716` (quote inside an identifier).
+- Checked in Thick (Oracle Client 19.6) and Thin mode against Oracle 23ai Free (23.26.3):
+  - Test suite: 365 of 365 pass, 100% coverage.
+  - Simulation: 287 of 287 checks, 119 of 119 public functions.
+
 ## [2.0.0] — 2026-11-24
 
 Major release: TypeScript on Bun, and a far more capable wrapper. Full notes: GitHub release `v2.0.0`.

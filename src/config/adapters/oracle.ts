@@ -243,9 +243,22 @@ const POOL_DEFAULTS = Object.freeze({
 // It also means the legacy `convertTypes`/`rowToDoc` helpers in
 // `utils/oracle-mongo-wrapper/utils.js` must NOT re-coerce these strings back to
 // numbers — they are fenced off there (they would undo this protection).
+//
+// LOBS ARE FETCHED AS PLAIN VALUES (2.0.1).
+//   - CLOB / NCLOB → string, BLOB → Buffer
+// A driver Lob is a locator tied to the connection that fetched it, and every
+// wrapper call releases its connection before returning. Thin mode happened to
+// keep such a Lob readable; Thick mode (OCI) refuses with NJS-003. Materialising
+// the value at fetch time behaves the same in both modes.
 function moneySafeFetchTypeHandler(metaData: import("oracledb").Metadata<unknown>) {
     if (metaData.dbType === oracledb.DB_TYPE_NUMBER && (metaData.scale ?? 0) > 0) {
         return { type: oracledb.STRING };
+    }
+    if (metaData.dbType === oracledb.DB_TYPE_CLOB || metaData.dbType === oracledb.DB_TYPE_NCLOB) {
+        return { type: oracledb.STRING };
+    }
+    if (metaData.dbType === oracledb.DB_TYPE_BLOB) {
+        return { type: oracledb.BUFFER };
     }
     return undefined; // default handling for everything else
 }

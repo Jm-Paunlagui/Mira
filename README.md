@@ -76,7 +76,9 @@ DB_APP_SERVICE_NAME=ORCL
 APP_DB_USERNAME=your_schema_user
 APP_DB_PASSWORD=your_schema_password
 
-# Optional: Instant Client directory enables Thick mode; blank = Thin mode
+# Optional: Instant Client directory for Thick mode. Blank = Mira still tries
+# an Oracle Client found on the system PATH, and uses Thin mode only if none loads.
+# The startup log line "oracledb driver loaded (Thick|Thin mode)" shows which one ran.
 ORACLE_INSTANT_CLIENT=
 ```
 
