@@ -22,6 +22,9 @@
   "type": "commonjs",
   "main": "dist/utils/oracle-mongo-wrapper/index.js",
   "types": "dist/utils/oracle-mongo-wrapper/index.d.ts",
+  "bin": {
+    "mira": "dist/cli/mira.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/utils/oracle-mongo-wrapper/index.d.ts",
@@ -51,7 +54,8 @@
     "test:chaos": "bun test/run.ts test/chaos",
     "test:security": "bun test/run.ts test/security",
     "test:reliability": "bun test/run.ts test/reliability",
-    "sim": "bun sim/run.ts"
+    "sim": "bun sim/run.ts",
+    "mira": "bun src/cli/mira.ts"
   },
   "dependencies": {
     "@types/oracledb": "^26.0.1",

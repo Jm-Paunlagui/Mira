@@ -269,6 +269,64 @@ export async function reportsStage(sim: Sim, ctx: Ctx, state: State) {
     [...visits].filter(([, n]) => n === most).map(([id]) => id).sort((a, b) => a - b),
   );
 
+  // ── 2.1 typed tables: generated from the catalogue, hand-written, created ───
+  const { t } = api;
+  const generated = await sim.mira(() => api.generateTableTypes(db, { tables: [T.CUSTOMERS, T.ORDERS] }));
+  const wanted = [
+    `export const SimCustomers = defineTable("${T.CUSTOMERS}", {`,
+    "  ID: t.id(),",
+    "  NAME: t.text(60),",
+    `  TIER: t.text(10).default("'regular'").nullable(),`,
+    `  CREDIT: t.decimal(12, 2).default("0").nullable(),`,
+    "  UPDATED_AT: t.timestamp().nullable(),",
+    `export const SimOrders = defineTable("${T.ORDERS}", {`,
+    `  CUSTOMER_ID: t.number().nullable().references("${T.CUSTOMERS}", "ID"),`,
+    "export type SimOrdersRow = typeof SimOrders.$row;",
+  ];
+  sim.eq("generateTableTypes: a typed definition per table, each column as 01-schema created it", wanted.filter((l) => !generated.split("\n").includes(l)), []);
+
+  // SIM_ORDERS as a typed table, written by hand to match 01-schema.
+  const TypedOrders = api.defineTable(T.ORDERS, {
+    ID: t.id(),
+    RECEIPT_NO: t.number(),
+    CUSTOMER_ID: t.number().nullable(),
+    STORE_ID: t.number().nullable(),
+    QUARTER: t.text(2).nullable(),
+    STATUS: t.text(10).default("'open'").nullable(),
+    TOTAL: t.decimal(12, 2).default(0).nullable(),
+    CREATED_AT: t.timestamp().nullable(),
+  });
+  const typedBig = await sim.mira(() => TypedOrders.on(db).find({ ...sold, TOTAL: { $gte: 300 } }).sort({ RECEIPT_NO: 1 }).project({ RECEIPT_NO: 1, TOTAL: 1 }).toArray());
+  sim.eq(
+    "typed find: tickets of 300.00 or more, projected to receipt and total",
+    typedBig.map((r) => [r.RECEIPT_NO, cents(r.TOTAL)]),
+    model.orders.filter((o) => o.total >= 30000).sort((a, b) => a.receipt - b.receipt).map((o) => [o.receipt, o.total]),
+  );
+
+  // A loyalty table created from its definition, filled in one transaction. VIP
+  // members get a note, others do not: documents of two shapes in one insertMany.
+  const Loyalty = api.defineTable(T.LOYALTY, {
+    ID: t.id(),
+    CUSTOMER_ID: t.number().references(T.CUSTOMERS, "ID"),
+    POINTS: t.number(),
+    LEVEL_NAME: t.text(10).default("'bronze'"),
+    NOTE: t.text(60).nullable(),
+  });
+  await Loyalty.create(db);
+  sim.eq("TypedTable.ddl(): the identity key and the defaulted column as createTable takes them", [Loyalty.ddl().ID, Loyalty.ddl().LEVEL_NAME], [{ type: "NUMBER", autoIncrement: true, primaryKey: true }, { type: "VARCHAR2(10)", notNull: true, default: "'bronze'" }]);
+  const spent = new Map<number, number>();
+  for (const o of model.orders) spent.set(o.customerId, (spent.get(o.customerId) ?? 0) + o.total);
+  const members = [...spent].sort((a, b) => a[0] - b[0]).map(([id, c]) => ({ id, points: Math.floor(c / 1000), vip: byId.get(id)?.TIER === "vip" })); // 1 point per 10.00
+  await new api.Transaction(db).withTransaction(async (session) => {
+    await Loyalty.on(session).insertMany(members.map((m) => (m.vip ? { CUSTOMER_ID: m.id, POINTS: m.points, NOTE: "vip lounge" } : { CUSTOMER_ID: m.id, POINTS: m.points })));
+  });
+  const board = await sim.mira(() => Loyalty.on(db).find({ POINTS: { $gt: 0 } }).sort({ POINTS: -1, CUSTOMER_ID: 1 }).toArray());
+  sim.eq(
+    "typed table from create(): points per customer, default level filled in, notes only for VIPs",
+    board.map((r) => [r.CUSTOMER_ID, r.POINTS, r.LEVEL_NAME, r.NOTE]),
+    members.filter((m) => m.points > 0).sort((a, b) => b.points - a.points || a.id - b.id).map((m) => [m.id, m.points, "bronze", m.vip ? "vip lounge" : null]),
+  );
+
   // ── Set operations ───────────────────────────────────────────────────────
   const vip = () => customers.find({ TIER: "vip" }).project({ NAME: 1 });
   const cebu = () => customers.find({ CITY: "Cebu" }).project({ NAME: 1 });

@@ -21,6 +21,7 @@ Oracle Database
 - [Setup](#setup)
     - [Prerequisites — Database Configuration](#prerequisites--database-configuration)
     - [Imports & Connection](#imports--connection)
+    - [Typed Tables (2.1)](#typed-tables-21)
 - [Basic — Your First Queries](#-basic--your-first-queries)
 - [Medium — Filtering, Updating & Chaining](#-medium--filtering-updating--chaining)
 - [Hard — Aggregation, Transactions & Joins](#-hard--aggregation-transactions--joins)
@@ -197,6 +198,69 @@ const db = createDb("appDb");
 ```
 
 That's it. `db` is your gateway to everything.
+
+### Typed Tables (2.1)
+
+Describe a table once and TypeScript checks every query on it: filter keys and values, inserts, updates, sorts and projections. The row types follow what Mira really returns.
+
+```ts
+import { defineTable, t, createDb, Transaction } from "@jm-paunlagui/mira";
+
+export const Orders = defineTable("ORDERS", {
+    ID: t.id(),                                   // NUMBER identity PK: Oracle assigns it
+    CUSTOMER_ID: t.number().references("CUSTOMERS", "ID"),
+    TOTAL: t.money(),                             // NUMBER(19,4): read as an exact string
+    NOTE: t.text(400).nullable(),
+    STATUS: t.text(10).default("'open'"),
+    CREATED_AT: t.timestamp().default("SYSTIMESTAMP"),
+});
+export type Order = typeof Orders.$row;          // { ID: number; TOTAL: string; NOTE: string | null; … }
+
+const db = createDb("appDb");
+const orders = Orders.on(db);                    // a typed collection (the same OracleCollection underneath)
+
+await orders.insertOne({ CUSTOMER_ID: 7, TOTAL: 9.5 });      // ID, NOTE, STATUS, CREATED_AT may be left out
+const big = await orders.find({ TOTAL: { $gt: 100 }, NOTE: null })
+    .sort({ CREATED_AT: -1 })
+    .project({ ID: 1, TOTAL: 1 })                // → { ID: number; TOTAL: string }[]
+    .toArray();
+await orders.updateOne({ ID: 1 }, { $set: { STATUS: "paid" } });
+
+// orders.find({ TOTL: 1 })                      ✗ compile error: no column TOTL
+// orders.insertOne({ ID: 5, … })                ✗ compile error: ID is an identity column
+
+await new Transaction(db).withTransaction(async (session) => {
+    await Orders.on(session).insertOne({ CUSTOMER_ID: 7, TOTAL: "12.00" }); // typed inside a transaction too
+});
+
+await Orders.create(db);                         // CREATE TABLE from the definition (Orders.ddl() is the column spec)
+```
+
+**Column builders (`t`):**
+
+| Builder | Oracle type | Read as | Write takes |
+| --- | --- | --- | --- |
+| `t.id()` | `NUMBER` identity primary key | `number` | — (Oracle assigns it) |
+| `t.number()`, `t.number(p)` | `NUMBER`, `NUMBER(p)` | `number` | `number` |
+| `t.money()`, `t.decimal(p, s)`, `t.number(p, s)` with `s > 0` | `NUMBER(19,4)`, `NUMBER(p,s)` | exact `string` | `string \| number` |
+| `t.text(n)`, `t.text(n, "char")`, `t.char(n)` | `VARCHAR2(n [CHAR])`, `CHAR(n)` | `string` | `string` |
+| `t.clob()`, `t.blob()` | `CLOB`, `BLOB` | `string`, `Buffer` | same |
+| `t.date()`, `t.timestamp(p?)`, `t.timestampTz(p?)` | `DATE`, `TIMESTAMP`, `TIMESTAMP WITH TIME ZONE` | `Date` | `Date` |
+| `t.raw<T>("BINARY_DOUBLE")` | any type text | `T` | `T` |
+
+Modifiers: `.nullable()` (reads may be `null`, inserts may leave it out), `.default(sql)` (inserts may leave it out), `.primaryKey()`, `.check(sql)`, `.references(table, column)`, `.identity()` / `.identityByDefault()`. `default`, `check` and `raw` take SQL text: trusted code only, as with `createTable`. Oracle allows one identity column per table, and `defineTable` checks it.
+
+**The typed layer is compile-time only.** `on()` returns the ordinary `OracleCollection`, so every behaviour and error is exactly the untyped API's. Pipelines (`aggregate`) have their own output shape: name it, `orders.aggregate<{ STATUS: string; N: number }>([…])`. For anything the typed signatures do not cover, `.untyped` gives the 2.0 signatures: `orders.untyped.find({ … })`, `orders.find().untyped.project({ X: { $subquery: … } })`.
+
+**Generate definitions for existing tables** from Oracle's catalogue (column types, NOT NULL, defaults, identity columns, primary keys, single-column foreign keys):
+
+```bash
+npx mira generate types --out src/db/tables.ts                 # every table in the schema
+npx mira generate types --tables ORDERS,CUSTOMERS,SIM_%         # names, or LIKE patterns with %
+bun run mira generate types --import ../my-mira-path            # in this repository
+```
+
+The command reads `DB_*` / `APP_DB_*` from the environment or from `.env` (`--env <file>` to pick another), and writes one `defineTable()` and one `…Row` type per table. In code: `await generateTableTypes(db, { tables, importFrom })` returns the same source text. CHECK constraints and multi-column keys are not written; they do not change the row types.
 
 ---
 

@@ -26,6 +26,7 @@ export const T = {
   RECEIPT_SEQ: "SIM_RECEIPT_SEQ",
   VIEW_MENU: "SIM_V_MENU",
   MV_SALES: "SIM_MV_SALES",
+  LOYALTY: "SIM_LOYALTY",
 } as const;
 
 export const STORES = [

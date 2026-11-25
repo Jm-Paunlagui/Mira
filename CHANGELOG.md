@@ -60,6 +60,41 @@ Two tests failed only on the CI database:
   - CI sets `UV_THREADPOOL_SIZE=32`.
   - The README warns Thick-mode users to set it to at least their largest `poolMax` before the process starts.
 
+### Added — typed tables (roadmap step 2)
+
+- **`defineTable(name, columns)` with column builders `t.*`.** A definition needs no database: `Table.on(db)` or `Table.on(session)` binds it.
+  - Builders: `t.id()`, `t.number(p?, s?)`, `t.money()`, `t.decimal(p, s)`, `t.text(n, "char"?)`, `t.char(n)`, `t.clob()`, `t.blob()`, `t.date()`, `t.timestamp(p?)`, `t.timestampTz(p?)`, `t.raw<T>(type)`.
+  - Modifiers: `.nullable()`, `.default()`, `.primaryKey()`, `.check()`, `.references()`, `.identity()`, `.identityByDefault()`.
+  - Each column's type matches what Mira returns: scaled NUMBER is a `string`, CLOB a `string`, BLOB a `Buffer`, dates a `Date`, and nullable columns add `null`.
+- **Type checking.** Filters (known columns, value types, operators by column type), inserts (identity columns refused; nullable, defaulted and BY DEFAULT identity columns optional), `$set` / `$inc` / `$currentDate` updates, sorts, and projections (the result type narrows) are all checked. `typeof Table.$row` and `typeof Table.$insert` name the types.
+- **Compile-time only.** `on()` returns the plain `OracleCollection`, so behaviour is unchanged. New `.untyped` getters on `OracleCollection` and `QueryBuilder` return the object itself with the 2.0 signatures.
+- `Table.ddl()` returns the `createTable()` column spec; `Table.create(db)` runs it. `defineTable` refuses a second identity column, because Oracle allows one (ORA-30669).
+- **`mira generate types`** (package `bin`) and **`generateTableTypes(db, { tables, importFrom })`**: read `USER_TAB_COLUMNS`, identity columns, primary keys and single-column foreign keys, and write one `defineTable()` and one `…Row` type per table.
+  - `--tables` takes exact names or `%` patterns; `--out`, `--import`, `--env` and `--verbose` are also available.
+  - Log lines stay off stdout unless `--verbose`.
+- Exported types: `RowOf`, `InsertOf`, `Filter`, `Update`, `Sort`, `Projection`, `Projected`, `TypedCollection`, `TypedQuery`, `TableTarget`, `Column`, `ColumnMeta`, `GenerateOptions`.
+
+### Fixed — insertMany (found while testing typed tables)
+
+- **Columns only later documents had were silently dropped.** `insertMany` took its column list from the first document, so with `[{ A }, { A, B }]` every `B` was lost with no error.
+  - Documents are now split into consecutive runs with the same column set, with one `executeMany` per run in the same transaction.
+  - Rows are still inserted in the caller's order (identity values follow it), and an omitted column keeps its DEFAULT.
+  - `insertedIds`, `returning` and `batchErrors` offsets refer to the caller's positions.
+- **A `Buffer` value failed with `NJS-011`.** Buffers are now bound as binary, and as a BLOB past 32 KB. Text past 32 KB is bound as a CLOB.
+
+### Tests and simulation (typed tables)
+
+- `test/types/typedTables.types.ts`, checked by `bun run typecheck`: exact inferred row and insert types, plus 16 misuses that must not compile (`@ts-expect-error`).
+- `test/unit/typedTables.test.ts`: builders, `ddl()`, validation, `on()`, and the generator against a stub catalogue covering every Oracle type branch.
+- `test/integration/typedTables.test.ts`: typed CRUD on a live table, `on(session)` rollback, the foreign key from `references()`, and the CLI.
+  - Also a round trip: definition → `create()` → catalogue → generated code → imported → the same `ddl()`.
+- `test/integration/defects.test.ts`: the two `insertMany` defects, batch-error offsets across groups, and CLOB text past 32 KB.
+- Simulation, reports stage:
+  - generates definitions for `SIM_CUSTOMERS` / `SIM_ORDERS` and checks them against 01-schema,
+  - queries `SIM_ORDERS` through a hand-written typed definition,
+  - creates `SIM_LOYALTY` from a definition and fills it in one transaction with documents of two shapes.
+  - Result: 58 queries, 0 gaps, 124 of 124 public functions.
+
 ## [2.0.1] — 2026-11-25
 
 Patch release: Mira now behaves the same in node-oracledb Thin and Thick mode. 2.0.0 was only tested in Thin mode. On a machine with an Oracle Client on the system PATH, the adapter loads Thick mode even when `ORACLE_INSTANT_CLIENT` is blank, and two things broke.
