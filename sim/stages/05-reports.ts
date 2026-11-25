@@ -303,6 +303,43 @@ export async function reportsStage(sim: Sim, ctx: Ctx, state: State) {
     model.orders.filter((o) => o.total >= 30000).sort((a, b) => a.receipt - b.receipt).map((o) => [o.receipt, o.total]),
   );
 
+  // Relations between the typed tables: nested rows in one statement per query.
+  const TypedCustomers = api.defineTable(T.CUSTOMERS, {
+    ID: t.id(),
+    NAME: t.text(60),
+    EMAIL: t.text(80),
+    TIER: t.text(10).default("'regular'").nullable(),
+    CITY: t.text(30).nullable(),
+    CREDIT: t.decimal(12, 2).default(0).nullable(),
+    UPDATED_AT: t.timestamp().nullable(),
+  });
+  const CustomersR = api.relations(TypedCustomers, {
+    orders: api.hasMany(TypedOrders, { foreignKey: "CUSTOMER_ID" }),
+    firstOrder: api.hasOne(TypedOrders, { foreignKey: "CUSTOMER_ID" }),
+  });
+  const OrdersR = api.relations(TypedOrders, { customer: api.belongsTo(TypedCustomers, { foreignKey: "CUSTOMER_ID" }) });
+  const soldOf = (id: number) => model.orders.filter((o) => o.customerId === id);
+  const vips = await sim.mira(() =>
+    CustomersR.on(db).find({ TIER: "vip" }).sort({ ID: 1 }).project({ ID: 1, NAME: 1 }).include("orders", { where: sold, sort: { TOTAL: -1, RECEIPT_NO: 1 }, limit: 3 }).toArray(),
+  );
+  sim.eq(
+    "include hasMany: each VIP's three biggest tickets, nested, in one statement",
+    vips.map((c) => [c.NAME, c.orders.map((o) => [o.RECEIPT_NO, cents(o.TOTAL)])]),
+    custRows.filter((c) => c.TIER === "vip").map((c) => [c.NAME, soldOf(c.ID).sort((a, b) => b.total - a.total || a.receipt - b.receipt).slice(0, 3).map((o) => [o.receipt, o.total])]),
+  );
+  const bigTickets = await sim.mira(() => OrdersR.on(db).find({ ...sold, TOTAL: { $gte: 300 } }).sort({ RECEIPT_NO: 1 }).project({ RECEIPT_NO: 1 }).include("customer").toArray());
+  sim.eq(
+    "include belongsTo: the customer behind every ticket of 300.00 or more",
+    bigTickets.map((o) => [o.RECEIPT_NO, o.customer?.NAME ?? null]),
+    model.orders.filter((o) => o.total >= 30000).sort((a, b) => a.receipt - b.receipt).map((o) => [o.receipt, byId.get(o.customerId)?.NAME ?? null]),
+  );
+  const firsts = await sim.mira(() => CustomersR.on(db).find().sort({ ID: 1 }).project({ ID: 1 }).include("firstOrder", { where: sold, sort: { RECEIPT_NO: 1 } }).toArray());
+  sim.eq(
+    "include hasOne: each customer's first receipt, null for a customer who never bought",
+    firsts.map((c) => [c.ID, c.firstOrder?.RECEIPT_NO ?? null]),
+    custRows.map((c) => [c.ID, soldOf(c.ID).map((o) => o.receipt).sort((a, b) => a - b)[0] ?? null]),
+  );
+
   // A loyalty table created from its definition, filled in one transaction. VIP
   // members get a note, others do not: documents of two shapes in one insertMany.
   const Loyalty = api.defineTable(T.LOYALTY, {

@@ -184,6 +184,10 @@ const oracleMongoWrapperMessages = {
     `[windowFunctions] Unsupported window function: ${String(fn)}.`,
   WINDOW_INVALID_ARGUMENT: (name: unknown, value: unknown) =>
     `[windowFunctions] ${name} must be a positive integer, got ${typeof value === "number" ? value : (JSON.stringify(value)?.slice(0, 40) ?? typeof value)}.`,
+  INCLUDE_UNKNOWN_RELATION: (table: unknown, name: unknown, known: string[]) =>
+    `[QueryBuilder.include] ${String(table)} has no relation named ${String(name).slice(0, 40)}${known.length ? ` (it has: ${known.join(", ")})` : ""}. Declare relations with relations() on a defineTable() table, and bind that table with .on(db).`,
+  INCLUDE_TWICE: (name: unknown) =>
+    `[QueryBuilder.include] ${String(name)} is already included.`,
   WINDOW_INVALID_OPTION: (why: unknown) =>
     `[windowFunctions] ${String(why)}.`,
   SORT_INVALID: (col: unknown, why: unknown) =>

@@ -199,6 +199,8 @@ type BulkWriteOp = {
 
 class OracleCollection {
     declare _conn: import("../db").DbConnection | null;
+    /** Set by a typed table with relations (relations().on()): what find().include() can fetch. */
+    declare _relations?: Readonly<Record<string, import("../typed/include").RelationSpec>>;
     declare db: WrapperDb;
     declare tableName: string;
     /**
@@ -284,6 +286,7 @@ class OracleCollection {
         if (options.skip != null) qb.skip(options.skip);
         if (options.projection) qb.project(options.projection);
         if (options.forUpdate) qb.forUpdate(options.forUpdate);
+        if (this._relations) qb._relations = this._relations;
         return qb;
     }
 
@@ -838,6 +841,7 @@ class OracleCollection {
 
             // Build bind arrays for executeMany
             const bindDefs: Record<string, import("oracledb").BindDefinition> = {};
+            const textColumns = new Set<string>(); // columns mixing numbers and strings (sent as text)
             cols.forEach((c, i) => {
                 // Scan all documents for a non-null sample to determine the type
                 let sampleVal: unknown = null;
@@ -860,7 +864,15 @@ class OracleCollection {
                     1,
                 );
                 const name = `v${i}`;
-                if (typeof sampleVal === "number") {
+                // A column given as numbers in some documents and strings in others
+                // (a typed money column takes both): one text bind, the numbers sent as
+                // their decimal text, which Oracle converts to NUMBER exactly as it does
+                // a money string in insertOne. One bind type per column otherwise.
+                const kinds = new Set(docs.map((d) => typeof d[c]).filter((k) => k === "number" || k === "string"));
+                if (kinds.size === 2) {
+                    textColumns.add(c);
+                    bindDefs[name] = { type: this.db.oracledb.STRING, maxSize: Math.max(maxBytes, 100) };
+                } else if (typeof sampleVal === "number") {
                     bindDefs[name] = { type: this.db.oracledb.NUMBER };
                 } else if (sampleVal instanceof Date) {
                     bindDefs[name] = { type: this.db.oracledb.DATE };
@@ -889,7 +901,8 @@ class OracleCollection {
             const bindRows = docs.map((doc) => {
                 const row: Record<string, unknown> = {};
                 cols.forEach((c, i) => {
-                    row[`v${i}`] = doc[c] ?? null;
+                    const v = doc[c] ?? null;
+                    row[`v${i}`] = textColumns.has(c) && typeof v === "number" ? String(v) : v;
                 });
                 return row;
             });

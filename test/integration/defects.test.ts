@@ -323,6 +323,22 @@ describe("integration: insertMany with documents that differ", () => {
     }
   });
 
+  it("DEFECT: insertMany takes a column given as a number in one document and a numeric string in another", async () => {
+    // Typed money columns accept string | number; one bind type per column came from the
+    // first value, so ["10.5", 99] failed with NJS-011.
+    const N = "MIRA_SD_NUMS";
+    await dropIfExists(N);
+    await schema.createTable(N, { K: { type: "NUMBER" }, AMT: { type: "NUMBER(19,4)" } });
+    try {
+      await coll(N).insertMany([{ K: 1, AMT: "10.5" }, { K: 2, AMT: 99 }, { K: 3, AMT: null }, { K: 4, AMT: "0.0001" }], { returning: [] });
+      await coll(N).insertMany([{ K: 5, AMT: 7 }, { K: 6, AMT: "8.25" }], { returning: [] });
+      const rows = await coll(N).find({}).sort({ K: 1 }).toArray<{ AMT: string | null }>();
+      expect(rows.map((r) => r.AMT)).toEqual(["10.5", "99", null, ".0001", "7", "8.25"]);
+    } finally {
+      await dropIfExists(N);
+    }
+  });
+
   it("insertMany keeps a Date's milliseconds, as insertOne does", async () => {
     await rawExec(`DELETE FROM "${M}"`);
     const at = new Date("2026-05-06T07:08:09.123Z");
