@@ -174,6 +174,11 @@ class QueryBuilder {
         }
     }
 
+    /** This query itself, with 2.0's untyped signatures (see OracleCollection.untyped). */
+    get untyped(): QueryBuilder {
+        return this;
+    }
+
     // ─── Chain Methods (return the same QueryBuilder for chaining) ───
 
     /**

@@ -75,6 +75,7 @@ export async function buildContext(): Promise<Ctx> {
     ["CTEResult", CTEResult],
     ["RecursiveCTEResult", RecursiveCTEResult],
     ["SeriesResult", SeriesResult],
+    ["TypedTable", mod.TypedTable],
   ] as const)
     tracker.trackClass(label, cls as { prototype: object });
 

@@ -221,6 +221,15 @@ class OracleCollection {
     }
 
     /**
+     * This collection itself. A typed table's collection (defineTable().on(db))
+     * is this same object with narrowed TypeScript signatures; `.untyped` gives
+     * back the 2.0 signatures for calls the typed layer does not cover.
+     */
+    get untyped(): OracleCollection {
+        return this;
+    }
+
+    /**
      * Internal: execute a callback with a database connection.
      *
      * This is THE pattern that makes every method work in both standalone
@@ -808,8 +817,13 @@ class OracleCollection {
             throw new Error(MSG.INSERT_MANY_RETURNING_WITH_BATCH_ERRORS);
         }
 
-        const run = async (conn: DbConnection) => {
-            const cols = Object.keys(documents[0]);
+        // Documents may set different columns (optional ones left out). Using the first
+        // document's keys for all of them silently dropped every column only a later
+        // document had, so documents are grouped by their column set: one INSERT per
+        // group, each omitted column keeps its DEFAULT, and results come back in the
+        // caller's order. Every group runs on the same connection (one transaction).
+        const insertGroup = async (conn: DbConnection, docs: Array<Record<string, unknown>>) => {
+            const cols = Object.keys(docs[0]);
             const placeholders = cols.map((_, i) => `:v${i}`).join(", ");
 
             let returningSql = "";
@@ -827,31 +841,39 @@ class OracleCollection {
             cols.forEach((c, i) => {
                 // Scan all documents for a non-null sample to determine the type
                 let sampleVal: unknown = null;
-                for (const doc of documents) {
+                for (const doc of docs) {
                     if (doc[c] != null) {
                         sampleVal = doc[c];
                         break;
                     }
                 }
+                // maxSize is in BYTES, not characters. Multi-byte UTF-8
+                // (e.g. Filipino/Spanish names with ñ, é) would be
+                // truncated/ORA-06502 if sized by char length, so measure
+                // true byte length over every row's value for this column.
+                const maxBytes = Math.max(
+                    ...docs.map((d) => {
+                        const v = d[c];
+                        if (v == null) return 1;
+                        return Buffer.isBuffer(v) ? v.length : Buffer.byteLength(String(v), "utf8");
+                    }),
+                    1,
+                );
+                const name = `v${i}`;
                 if (typeof sampleVal === "number") {
-                    bindDefs[`v${i}`] = { type: this.db.oracledb.NUMBER };
+                    bindDefs[name] = { type: this.db.oracledb.NUMBER };
                 } else if (sampleVal instanceof Date) {
-                    bindDefs[`v${i}`] = { type: this.db.oracledb.DATE };
+                    bindDefs[name] = { type: this.db.oracledb.DATE };
+                } else if (Buffer.isBuffer(sampleVal)) {
+                    // Binary: a RAW-sized bind, or a BLOB bind past 32 KB (the RAW bind limit).
+                    bindDefs[name] = maxBytes > 32767
+                        ? { type: this.db.oracledb.DB_TYPE_BLOB }
+                        : { type: this.db.oracledb.BUFFER, maxSize: Math.max(maxBytes, 100) };
+                } else if (maxBytes > 32767) {
+                    // Text past 32 KB (the VARCHAR2 bind limit) can only go to a CLOB: bind it as one.
+                    bindDefs[name] = { type: this.db.oracledb.DB_TYPE_CLOB };
                 } else {
-                    // maxSize is in BYTES, not characters. Multi-byte UTF-8
-                    // (e.g. Filipino/Spanish names with ñ, é) would be
-                    // truncated/ORA-06502 if sized by char length, so measure
-                    // true byte length over every row's value for this column.
-                    const maxBytes = Math.max(
-                        ...documents.map((d) => {
-                            const v = d[c];
-                            return v != null
-                                ? Buffer.byteLength(String(v), "utf8")
-                                : 1;
-                        }),
-                        1,
-                    );
-                    bindDefs[`v${i}`] = {
+                    bindDefs[name] = {
                         type: this.db.oracledb.STRING,
                         maxSize: Math.max(maxBytes, 100),
                     };
@@ -864,7 +886,7 @@ class OracleCollection {
                 };
             }
 
-            const bindRows = documents.map((doc) => {
+            const bindRows = docs.map((doc) => {
                 const row: Record<string, unknown> = {};
                 cols.forEach((c, i) => {
                     row[`v${i}`] = doc[c] ?? null;
@@ -873,50 +895,71 @@ class OracleCollection {
             });
 
             try {
-                const result = await conn.executeMany(sql, bindRows, {
+                return await conn.executeMany(sql, bindRows, {
                     autoCommit: false,
                     bindDefs,
                     ...(batchErrors ? { batchErrors: true } : {}),
                 });
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError("OracleCollection.insertMany", err, sql),
+                );
+            }
+        };
 
-                const response: { acknowledged: boolean; insertedCount: number; insertedIds: unknown[]; returning?: Record<string, number | null>[]; batchErrors?: Array<{ offset: number; message: string }> } = {
-                    acknowledged: true,
-                    insertedCount: result.rowsAffected ?? 0,
-                    insertedIds: [],
-                };
+        const run = async (conn: DbConnection) => {
+            // Consecutive documents with the same column set (key order does not matter)
+            // form one group, so rows are still inserted in the caller's order (identity
+            // values and sequences follow it): one round trip per change of shape.
+            const groups: number[][] = [];
+            let lastKey = "";
+            documents.forEach((doc, i) => {
+                const key = JSON.stringify(Object.keys(doc).sort());
+                if (groups.length > 0 && key === lastKey) groups[groups.length - 1].push(i);
+                else groups.push([i]);
+                lastKey = key;
+            });
 
+            const response: { acknowledged: boolean; insertedCount: number; insertedIds: unknown[]; returning?: Record<string, number | null>[]; batchErrors?: Array<{ offset: number; message: string }> } = {
+                acknowledged: true,
+                insertedCount: 0,
+                insertedIds: [],
+            };
+            const returning: Array<Record<string, number | null>> = [];
+            const errors: Array<{ offset: number; message: string }> = [];
+
+            for (const positions of groups) {
+                const result = await insertGroup(conn, positions.map((i) => documents[i]));
+                response.insertedCount += result.rowsAffected ?? 0;
                 if (returningCols.length > 0 && result.outBinds) {
-                    const returning: Record<string, number | null>[] = result.outBinds.map((ob: Record<string, unknown>) => {
+                    result.outBinds.forEach((ob: Record<string, unknown>, j: number) => {
                         const rowOut: Record<string, number | null> = {};
                         for (const c of returningCols) {
                             const val = ob[`out_${bindSafe(c)}`];
                             const v = Array.isArray(val) ? val[0] : val;
                             rowOut[c] = typeof v === "number" ? v : null; // NUMBER out-bind: a number, or null for a NULL column
                         }
-                        return rowOut;
+                        returning[positions[j]] = rowOut;
                     });
-                    response.returning = returning;
-                    if (returningCols.includes("ID")) {
-                        response.insertedIds = returning.map(
-                            (r) => r.ID ?? null,
-                        );
-                    }
                 }
                 if (batchErrors) {
-                    response.batchErrors = (result.batchErrors ?? []).map(
-                        (e: { offset?: unknown; message?: string }) => ({
-                            offset: Number(e.offset),
-                            message: e.message ?? String(e),
-                        }),
-                    );
+                    for (const e of (result.batchErrors ?? []) as Array<{ offset?: unknown; message?: string }>) {
+                        // The offset is within the group: report the document's own position.
+                        errors.push({ offset: positions[Number(e.offset)], message: e.message ?? String(e) });
+                    }
                 }
-
-                return response;
-            } catch (err) {
-                throw new Error(
-                    MSG.wrapError("OracleCollection.insertMany", err, sql),
-                );
             }
+
+            if (returningCols.length > 0 && returning.length > 0) {
+                response.returning = returning;
+                if (returningCols.includes("ID")) {
+                    response.insertedIds = returning.map((r) => r.ID ?? null);
+                }
+            }
+            if (batchErrors) {
+                response.batchErrors = errors.sort((a, b) => a.offset - b.offset);
+            }
+            return response;
         };
 
         // Session-bound collections join the surrounding transaction;
