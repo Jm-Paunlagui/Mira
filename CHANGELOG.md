@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 2.1.0
+## [2.1.0] — 2026-11-26
 
 Theme: Oracle-first, MongoDB-shaped, typed. Everything adds to 2.0; nothing breaks. Built step by step on `feature/2.1.0` (see `docs/ROADMAP-2.1.md`).
 

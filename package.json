@@ -1,6 +1,6 @@
 {
   "name": "@jm-paunlagui/mira",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "description": "A production-grade OracleDB wrapper that mirrors MongoDB's core API while leveraging the full power of Oracle SQL.",
   "keywords": [
     "MongoDB",
