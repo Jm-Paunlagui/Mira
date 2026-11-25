@@ -47,7 +47,11 @@ function makeDriver(extra: Record<string, unknown> = {}) {
     OUT_FORMAT_OBJECT: realOracledb.OUT_FORMAT_OBJECT,
     SYSDBA: realOracledb.SYSDBA,
     DB_TYPE_NUMBER: realOracledb.DB_TYPE_NUMBER,
+    DB_TYPE_CLOB: realOracledb.DB_TYPE_CLOB,
+    DB_TYPE_NCLOB: realOracledb.DB_TYPE_NCLOB,
+    DB_TYPE_BLOB: realOracledb.DB_TYPE_BLOB,
     STRING: realOracledb.STRING,
+    BUFFER: realOracledb.BUFFER,
     oracleClientVersion: undefined as number | undefined,
     initOracleClient: () => {
       throw new Error("NJS-077: already initialized");
@@ -225,6 +229,12 @@ describe("unit/adapter: pure helpers", () => {
     expect(A.moneySafeFetchTypeHandler({ dbType: realOracledb.DB_TYPE_NUMBER, scale: 0 } as never)).toBeUndefined();
     expect(A.moneySafeFetchTypeHandler({ dbType: realOracledb.DB_TYPE_NUMBER } as never)).toBeUndefined();
     expect(A.moneySafeFetchTypeHandler({ dbType: realOracledb.DB_TYPE_VARCHAR, scale: 2 } as never)).toBeUndefined();
+  });
+
+  it("fetch handler materialises LOBs: CLOB / NCLOB → string, BLOB → Buffer", () => {
+    expect(A.moneySafeFetchTypeHandler({ dbType: realOracledb.DB_TYPE_CLOB } as never)).toEqual({ type: realOracledb.STRING });
+    expect(A.moneySafeFetchTypeHandler({ dbType: realOracledb.DB_TYPE_NCLOB } as never)).toEqual({ type: realOracledb.STRING });
+    expect(A.moneySafeFetchTypeHandler({ dbType: realOracledb.DB_TYPE_BLOB } as never)).toEqual({ type: realOracledb.BUFFER });
   });
 
   it("constants", () => {

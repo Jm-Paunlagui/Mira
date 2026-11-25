@@ -35,6 +35,7 @@ beforeAll(async () => {
     TS: { type: "TIMESTAMP(6)" },
     DT: { type: "DATE" },
     BIG: { type: "CLOB" },
+    BIN: { type: "BLOB" },
   });
   await schema.createTable(L, { ID: { type: "NUMBER", primaryKey: true }, BAL: { type: "NUMBER", check: "BAL >= 0" } });
   await coll(L).insertMany(Array.from({ length: 20 }, (_, i) => ({ ID: i + 1, BAL: 500 })), { returning: [] });
@@ -106,6 +107,7 @@ describe("reliability: data round-trips exactly", () => {
       TS: ts,
       DT: new Date("2026-05-06T00:00:00Z"),
       BIG: "x".repeat(100000),
+      BIN: Buffer.from(Array.from({ length: 70000 }, (_, i) => i % 256)),
     };
     await coll(D).insertOne(doc);
     const back = await coll(D).findOne<Record<string, unknown>>({ ID: 1 });
@@ -114,11 +116,12 @@ describe("reliability: data round-trips exactly", () => {
     expect(Number(back?.MONEY)).toBe(98765.4321);
     expect((back?.TS as Date).getTime()).toBe(ts.getTime());
     expect((back?.DT as Date).getTime()).toBe(doc.DT.getTime());
-    // CLOBs come back as driver Lob streams (no fetchAsString), readable via getData()
-    const lob = back?.BIG as { getData: () => Promise<string>; destroy?: () => void };
-    expect(typeof lob.getData).toBe("function");
-    expect((await lob.getData()).length).toBe(100000);
-    lob.destroy?.();
+    // CLOBs come back as plain strings in both Thin and Thick mode (2.0.1).
+    // A driver Lob would outlive its released connection and fail in Thick mode (NJS-003).
+    expect(typeof back?.BIG).toBe("string");
+    expect(back?.BIG).toBe(doc.BIG);
+    expect(Buffer.isBuffer(back?.BIN)).toBe(true);
+    expect((back?.BIN as Buffer).equals(doc.BIN)).toBe(true);
     await coll(D).insertOne({ ID: 2, TXT: "é".repeat(2000) }); // 4,000 bytes exactly
     expect((await coll(D).findOne<{ TXT: string }>({ ID: 2 }))?.TXT).toHaveLength(2000);
   });

@@ -218,7 +218,8 @@ describe("chaos: transactional integrity under failure", () => {
       expect((err as Error).message).toMatch(/ORA-00054/);
       expect(ms).toBeLessThan(1000);
       const [err2, ms2] = await timeIt(() => coll(A).find({ ID: 3 }).forUpdate({ wait: 1 }).toArray().catch((e: Error) => e));
-      expect((err2 as Error).message).toMatch(/ORA-30006/);
+      // 19c: ORA-30006 (resource busy; WAIT timeout expired). 23ai: ORA-00054 + ORA-40097.
+      expect((err2 as Error).message).toMatch(/ORA-30006|ORA-00054/);
       expect(ms2).toBeGreaterThanOrEqual(900);
     });
   }, 30000);
