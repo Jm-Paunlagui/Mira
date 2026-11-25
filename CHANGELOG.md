@@ -1,5 +1,38 @@
 # Changelog
 
+## [Unreleased] — 2.1.0
+
+Theme: Oracle-first, MongoDB-shaped, typed. Everything adds to 2.0; nothing breaks. Built step by step on `feature/2.1.0` (see `docs/ROADMAP-2.1.md`).
+
+### Added — usable from Node, and CI on a live Oracle (roadmap step 1)
+
+- **npm package `@jm-paunlagui/mira`.**
+  - `bun run build` compiles `src/` to CommonJS JavaScript with `.d.ts` types (and source maps) in `dist/`.
+  - `package.json` gets `main`, `types`, an `exports` map and a `files` list. `npm pack` / `prepack` rebuild first.
+  - Runs on Node.js 20+ as well as Bun 1.4+.
+- **`@types/oracledb` is now a runtime dependency.** The public types refer to `oracledb`'s types, so a consumer without it failed to type-check (TS7016).
+- **CI (`.github/workflows/ci.yml`).** Runs on every push and pull request.
+  - A build job: type-check, build, and `npm pack --dry-run`.
+  - A live job against Oracle Database Free 23ai (`gvenzl/oracle-free:23-slim-faststart`), run once in **Thin** and once in **Thick** mode: full suite with coverage, the simulation, and a Node smoke test of the built package.
+  - The job creates the `MIRA` and `MIRA_SIM` schemas with `.github/oracle/setup-users.sql`. It lets the listener accept `FREEPDB1` as a SID, because Mira connects with `(SID=…)`.
+- `test/node/smoke.cjs`: loads the package by name under plain Node, then does a live round trip that checks money, CLOB and aggregate values.
+- README: install from npm, and how `.env` is loaded under Node (`node --env-file=.env`; Bun reads it by itself).
+
+### Tests
+
+Two tests failed only on the CI database:
+- **`unit/adapter` "existing keys win"** expected `APP_DB_USERNAME` to be `mira`, the value in one developer's `.env`. It now sets its own value.
+- **`appDbInUse()`**, used by the leak checks, could catch the pool health monitor's 30-second `ping()` in flight and report 1 connection checked out (2 runs in 3 on the CI image). It now re-reads the count for up to 2 s and returns the lowest value seen, so a real leak, which never returns to 0, still fails the test.
+
+### Found by CI: Thick mode can hang when there are too few worker threads
+
+- **The hang:** on the 4-core GitHub runner, the Thick-mode job hung in "concurrent transfers keep the ledger balanced". That test runs 8 transactions that wait on each other's row locks.
+- **The cause:** in Thick mode each database call runs on a native worker thread (`UV_THREADPOOL_SIZE`), and a call waiting on a lock keeps its thread. With too few threads, the transaction holding the lock never gets one to commit. The database is fine, and Thin mode is unaffected.
+- **Reproduced locally:** `UV_THREADPOOL_SIZE=2` hangs and `16` passes.
+- **What changed:**
+  - CI sets `UV_THREADPOOL_SIZE=32`.
+  - The README warns Thick-mode users to set it to at least their largest `poolMax` before the process starts.
+
 ## [2.0.1] — 2026-11-25
 
 Patch release: Mira now behaves the same in node-oracledb Thin and Thick mode. 2.0.0 was only tested in Thin mode. On a machine with an Oracle Client on the system PATH, the adapter loads Thick mode even when `ORACLE_INSTANT_CLIENT` is blank, and two things broke.

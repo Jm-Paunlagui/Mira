@@ -178,15 +178,19 @@ describe("unit/adapter: driver loading and Oracle client environment", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mira-env-"));
     fs.writeFileSync(path.join(dir, ".env"), "# comment\n\nNOEQUALS\nMIRA_COMPILED_PROBE = yes\nAPP_DB_USERNAME=should-not-override\n");
     const cwd = process.cwd();
+    const userBefore = process.env.APP_DB_USERNAME;
     process.chdir(dir);
     try {
       delete process.env.MIRA_COMPILED_PROBE;
+      // The existing value is whatever this machine set (.env locally, the job env in CI).
+      process.env.APP_DB_USERNAME = "existing-user";
       const a = await loadAdapter(makeDriver(), { compiled: true });
       expect(process.env.MIRA_COMPILED_PROBE).toBe("yes");
-      expect(process.env.APP_DB_USERNAME).toBe("mira");
+      expect(process.env.APP_DB_USERNAME).toBe("existing-user");
       await a.closeAll();
     } finally {
       process.chdir(cwd);
+      process.env.APP_DB_USERNAME = userBefore;
       delete process.env.MIRA_COMPILED_PROBE;
       fs.rmSync(dir, { recursive: true, force: true });
     }
