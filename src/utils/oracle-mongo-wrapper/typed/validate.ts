@@ -33,6 +33,12 @@ export interface ValidationIssue {
 
 /** Thrown by a table defined with { validate: true }. `issues` lists every problem found. */
 export class MiraValidationError extends Error {
+  /**
+   * Bad input, not a database failure: the adapter passes it through a transaction
+   * unwrapped (and does not log it as critical). HTTP: 422 Unprocessable Content.
+   */
+  readonly isOperational = true;
+  readonly statusCode = 422;
   readonly issues: readonly ValidationIssue[];
   constructor(table: string, operation: string, issues: ValidationIssue[]) {
     super(`[${table}] ${operation} is not valid: ${issues.map((i) => `${i.column} ${i.message}`).join("; ")}.`);

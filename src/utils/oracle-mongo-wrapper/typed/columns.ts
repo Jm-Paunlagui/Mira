@@ -33,7 +33,7 @@ export interface ColumnMeta {
   /** A JSON column: "text" = CLOB with an IS JSON check (19c+), "native" = the JSON type (23ai). */
   json?: "text" | "native";
   /** A column Mira maintains: set on insert (createdAt), on every update (updatedAt), or by a soft delete (deletedAt). */
-  role?: "createdAt" | "updatedAt" | "deletedAt";
+  role?: "createdAt" | "updatedAt" | "deletedAt" | "version";
 }
 
 /**
@@ -161,6 +161,13 @@ export const t = {
    * restore() clears it, { force: true } really deletes. One per table.
    */
   deletedAt: () => new Column<Date, Date, true>({ type: "TIMESTAMP(6) WITH TIME ZONE", nullable: true, identity: false, primaryKey: false, role: "deletedAt" }) as DeletedAtColumn,
+  /**
+   * Optimistic locking: NUMBER(10) DEFAULT 1. Every update through the table's collection
+   * adds 1. An updateOne / findOneAndUpdate / replaceOne / deleteOne / findOneAndDelete
+   * whose filter gives the version read earlier, and that finds the row changed since,
+   * throws MiraConcurrencyError instead of silently doing nothing. One per table.
+   */
+  version: () => new Column<number, number, false, true>({ type: "NUMBER(10)", nullable: false, identity: false, primaryKey: false, default: 1, role: "version" }),
   /**
    * Any other Oracle type, with the value type you name:
    * `t.raw<number>("BINARY_DOUBLE")`, `t.raw<Buffer>("RAW(16)")`.

@@ -25,6 +25,7 @@ Oracle Database
     - [Relations and include (2.1)](#relations-and-include-21)
     - [JSON Columns (2.1)](#json-columns-21)
     - [Timestamps, Soft Delete, Hooks and Validation (2.1)](#timestamps-soft-delete-hooks-and-validation-21)
+    - [Optimistic Locking (2.1)](#optimistic-locking-21)
     - [Migrations (2.1)](#migrations-21)
 - [Basic — Your First Queries](#-basic--your-first-queries)
 - [Medium — Filtering, Updating & Chaining](#-medium--filtering-updating--chaining)
@@ -432,6 +433,33 @@ await members.insertOne({ ID: 2, NAME: "x".repeat(50), POINTS: 1.5 });
 - `replaceOne` and `findOneAndReplace` on such a table become a `$set` of every given column except the primary key, so `updatedAt`, hooks and validation apply.
 - These behaviours belong to the collection's `find`, `findOne`, `countDocuments`, `distinct`, `aggregate`, inserts, updates, replaces, deletes and `findOneAnd*`. Statements that work on many rows at once or on other tables (`merge`, `mergeFrom`, `bulkUpdateByKeys`, `updateFromJoin`, `insertFromQuery`, `connectBy`, `pivot`, raw SQL) are 2.0's and do none of this.
 - A typed table without any of these features still gets a plain `OracleCollection` from `on()`.
+
+### Optimistic Locking (2.1)
+
+A `t.version()` column stops two people who read the same row from silently overwriting each other:
+
+```ts
+import { defineTable, t, MiraConcurrencyError } from "@jm-paunlagui/mira";
+
+const Docs = defineTable("DOCS", { ID: t.number(10).primaryKey(), TITLE: t.text(80), VERSION: t.version() });
+const docs = Docs.on(db);
+
+const doc = await docs.findOne({ ID: 1 });                        // { ID: 1, TITLE: "…", VERSION: 3 }
+try {
+  await docs.updateOne({ ID: doc.ID, VERSION: doc.VERSION }, { $set: { TITLE: "New title" } }); // VERSION becomes 4
+} catch (err) {
+  if (err instanceof MiraConcurrencyError) {
+    // Someone saved in between: err.expectedVersion 3, err.currentVersion 4. Re-read and try again.
+  }
+}
+```
+
+- `t.version()` is `NUMBER(10) DEFAULT 1 NOT NULL`. Every update through the collection adds 1 (`$inc`), unless the update sets the column itself. A replacement never sets it.
+- **The check:** `updateOne`, `findOneAndUpdate`, `replaceOne`, `findOneAndReplace`, `deleteOne` and `findOneAndDelete` with a filter that gives the version as a plain number. When such a write matches nothing but the row (the filter without the version) is still there, it changed since it was read, so Mira throws `MiraConcurrencyError` instead of returning a count of 0. When the row is gone, the result is the usual 0.
+- `updateMany` / `deleteMany` are not checked: they are not about one row read earlier.
+- `upsert` with a version in the filter is refused, since a stale version would insert a second row.
+
+**Errors in transactions:** `MiraConcurrencyError` and `MiraValidationError` are *operational* (`isOperational: true`, `statusCode` 409 and 422). Inside `withTransaction` they reach your code with their own class instead of being wrapped as a database failure, and they aren't logged as critical.
 
 ### Migrations (2.1)
 

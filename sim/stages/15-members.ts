@@ -7,7 +7,8 @@
  * Every model method is used once against a known expected state: find, findOne,
  * countDocuments, distinct, aggregate, insertOne, insertMany, updateOne,
  * updateMany, replaceOne, findOneAndUpdate, findOneAndReplace, deleteOne,
- * deleteMany, findOneAndDelete, withDeleted, restore.
+ * deleteMany, findOneAndDelete, withDeleted, restore. Two desk clerks editing the
+ * same member at once show optimistic locking (t.version()).
  */
 import type { Ctx } from "../lib/context";
 import type { Sim } from "../lib/harness";
@@ -30,6 +31,7 @@ export async function membersStage(sim: Sim, ctx: Ctx) {
       JOINED_AT: t.createdAt(),
       CHANGED_AT: t.updatedAt(),
       REMOVED_AT: t.deletedAt(),
+      REV: t.version(),
     },
     {
       validate: true,
@@ -40,7 +42,9 @@ export async function membersStage(sim: Sim, ctx: Ctx) {
         },
         afterUpdate: async (result, filter, update, hctx) => {
           const id = (filter as { ID?: number }).ID;
-          if (result.modifiedCount > 0 && typeof id === "number") await Audit.on(hctx).insertOne({ MEMBER_ID: id, WHAT: `changed ${Object.keys(update.$set ?? update.$inc ?? {}).join(",")}` });
+          // The columns the caller changed (REV is raised by Mira on every update).
+          const changed = Object.keys({ ...update.$set, ...update.$inc }).filter((k) => k !== "REV");
+          if (result.modifiedCount > 0 && typeof id === "number") await Audit.on(hctx).insertOne({ MEMBER_ID: id, WHAT: `changed ${changed.join(",")}` });
         },
         beforeDelete: (filter) => {
           if ((filter as { ID?: number }).ID === 1) throw new Error("the founding member cannot be removed");
@@ -123,6 +127,17 @@ export async function membersStage(sim: Sim, ctx: Ctx) {
     "4 changed REMOVED_AT", // restore() is an update: the update hook sees it
     "5 erased",
   ]);
+  sim.eq("model: every update raised the revision (Ana: +30 points)", (await members.findOne({ ID: 2 }))?.REV, 2);
+
+  // Two clerks open Ana's record at once. The first saves; the second's save is stale.
+  const clerkA = (await members.findOne({ ID: 2 }))!;
+  const clerkB = (await members.findOne({ ID: 2 }))!;
+  sim.eq("model: both clerks read the same revision", [clerkA.REV, clerkB.REV], [2, 2]);
+  await sim.mira(() => members.updateOne({ ID: 2, REV: clerkA.REV }, { $set: { TIER: "gold" } }));
+  await sim.rejects("model: the second clerk's stale save is refused (MiraConcurrencyError), not lost", () => members.updateOne({ ID: 2, REV: clerkB.REV }, { $set: { TIER: "bronze" } }), /changed since it was read \(version 2 expected, now 3\)/);
+  const reread = (await members.findOne({ ID: 2 }))!;
+  await sim.mira(() => members.updateOne({ ID: 2, REV: reread.REV }, { $inc: { POINTS: 1 } }));
+  sim.eq("model: after re-reading, the second clerk's change lands on top of the first", await members.findOne({ ID: 2 }).then((m) => [m?.TIER, m?.POINTS, m?.REV]), ["gold", 151, 4]);
 
   // A transaction rolls back a sign-up and its audit line together.
   await sim.rejects(
