@@ -141,7 +141,10 @@ describe("chaos: pool exhaustion and slow calls", () => {
     expect((err as Error).message).toMatch(/NJS-003|invalid connection/i);
     expect(await appDbInUse()).toBe(0);
     await appDbAlive();
-  });
+    // 30 s like the rest of this block (it had bun's 5 s default): right after the
+    // conn.break() test the pool can still be recovering the cancelled session, and in
+    // Thick mode this test then ran just past 5 s (1 run in 3 locally). Alone it takes ~1 ms.
+  }, 30000);
 
   it("an open breaker on a healthy pool fails fast and closes on a successful probe", async () => {
     await config.withConnection("chaos_cb", async () => 1);

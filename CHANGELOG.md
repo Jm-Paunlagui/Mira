@@ -4,6 +4,33 @@
 
 Theme: Oracle-first, MongoDB-shaped, typed. Everything adds to 2.0; nothing breaks. Built step by step on `feature/2.1.0` (see `docs/ROADMAP-2.1.md`).
 
+### Added — statistics (roadmap step 1)
+
+- **`$group` accumulators.** Each takes a column, an expression, or `{ input, … }`.
+  - `$countDistinct` → `COUNT(DISTINCT …)`
+  - `$median` → `MEDIAN`
+  - `$stdDevPop` / `$stdDevSamp` → `STDDEV_POP` / `STDDEV_SAMP`
+  - `$percentile: { input, p, method }` → `PERCENTILE_CONT` (default) or `PERCENTILE_DISC`. `p` is a number from 0 to 1 or a list of them; a list returns a JS array.
+  - `$push` / `$addToSet` → `JSON_ARRAYAGG(… NULL ON NULL RETURNING CLOB)`, returned by `aggregate()` as JS arrays, with an optional `orderBy`. `$push` keeps NULLs; `$addToSet` keeps each value once.
+  - `$listAgg: { input, separator, distinct, orderBy }` → `LISTAGG(…) WITHIN GROUP (…)`, one string. The separator is bound.
+- **Window options** in `$window`:
+  - `default` for LAG / LEAD.
+  - `ignoreNulls` for LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE.
+  - `RATIO_TO_REPORT`.
+- **NULLS FIRST / LAST** wherever a sort is given: `{ col: { order: 1 | -1, nulls: "first" | "last" } }` in `sort()`, `$sort`, a window's `orderBy`, an accumulator's `orderBy`, set operations, `withCTE`, `withRecursiveCTE` and `connectBy`'s `orderSiblings`. `1` / `-1` still work as before.
+- **`FETCH … WITH TIES`:** `limit(n, { withTies: true })` on a sorted `find()`, and `{ $limit: { n, withTies: true } }` directly after a `$sort`. Without a sort Mira throws: Oracle would silently return exactly n rows.
+- `buildAggregateSQL` also returns `arrays` (the output columns holding a JSON array) when there are any; `buildWindowExpr` takes an optional bind function, used for a non-number `default`.
+
+### Changed
+
+- A pipeline `$limit` must be a non-negative integer (or `{ n, withTies }`); anything else throws instead of reaching Oracle as `FETCH FIRST NaN ROWS`.
+
+### Tests and simulation
+
+- New `test/unit/statistics.test.ts` (SQL shape and argument checks) and `test/integration/statistics.test.ts`. The live tests compute every expected value from the fixture, including Oracle's percentile interpolation.
+- The `unknown expression operator` test used `$stdDevPop` as its example of an unknown operator; it now uses `$kurtosis`.
+- The simulation's reports stage adds the branch KPIs: distinct customers, median, standard deviation, P10/P90 and discrete P90 of the ticket, receipts (`$push`), quarters traded (`$addToSet`, `$listAgg`), each branch's revenue share (`RATIO_TO_REPORT`) with the previous branch's revenue (`LAG` default 0), the next customer with a known city (`LEAD` IGNORE NULLS), customers by city with NULLs first, and ties at the top (`WITH TIES` in `find()` and in a pipeline). 55 queries through Mira, 0 gaps.
+
 ### Added — usable from Node, and CI on a live Oracle (roadmap step 1)
 
 - **npm package `@jm-paunlagui/mira`.**
@@ -18,7 +45,7 @@ Theme: Oracle-first, MongoDB-shaped, typed. Everything adds to 2.0; nothing brea
 - `test/node/smoke.cjs`: loads the package by name under plain Node, then does a live round trip that checks money, CLOB and aggregate values.
 - README: install from npm, and how `.env` is loaded under Node (`node --env-file=.env`; Bun reads it by itself).
 
-### Tests
+### Tests fixed on the CI database
 
 Two tests failed only on the CI database:
 - **`unit/adapter` "existing keys win"** expected `APP_DB_USERNAME` to be `mira`, the value in one developer's `.env`. It now sets its own value.

@@ -468,7 +468,8 @@ describe("unit: aggregate pipeline", () => {
 
   it("DEFECT: an unknown expression operator is refused, not turned into a column name", () => {
     expect(() => agg([{ $project: { R: { $cosine: ["$A", 0] } } }])).toThrow(/Unsupported expression operator "\$cosine"/);
-    expect(() => agg([{ $group: { _id: "$R", s: { $stdDevPop: "$A" } } }])).toThrow(/Unsupported expression operator "\$stdDevPop"/);
+    // ($stdDevPop was the example here until 2.1 made it a real accumulator.)
+    expect(() => agg([{ $group: { _id: "$R", s: { $kurtosis: "$A" } } }])).toThrow(/Unsupported expression operator "\$kurtosis"/);
   });
 
   it("$project with nothing selectable falls back to *", () => {

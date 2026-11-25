@@ -184,6 +184,16 @@ const oracleMongoWrapperMessages = {
     `[windowFunctions] Unsupported window function: ${String(fn)}.`,
   WINDOW_INVALID_ARGUMENT: (name: unknown, value: unknown) =>
     `[windowFunctions] ${name} must be a positive integer, got ${typeof value === "number" ? value : (JSON.stringify(value)?.slice(0, 40) ?? typeof value)}.`,
+  WINDOW_INVALID_OPTION: (why: unknown) =>
+    `[windowFunctions] ${String(why)}.`,
+  SORT_INVALID: (col: unknown, why: unknown) =>
+    `[sort] ${String(col).slice(0, 40)}: ${String(why)}.`,
+  ACCUMULATOR_INVALID: (op: unknown, why: unknown) =>
+    `[aggregatePipeline] ${String(op)}: ${String(why)}.`,
+  WITH_TIES_NEEDS_SORT: (where: unknown) =>
+    `[${String(where)}] withTies needs a sort: FETCH … WITH TIES without ORDER BY silently returns exactly n rows.`,
+  WITH_TIES_AFTER_SORT:
+    "[aggregatePipeline] { $limit: { withTies: true } } must come directly after a $sort stage, whose order it repeats.",
   WINDOW_INVALID_FRAME: (frame: unknown) =>
     `[windowFunctions] Invalid frame "${String(frame).slice(0, 80)}". Use ROWS|RANGE with UNBOUNDED PRECEDING / n PRECEDING / CURRENT ROW / n FOLLOWING / UNBOUNDED FOLLOWING.`,
   AGGREGATE_UNKNOWN_FUNCTION: (scope: unknown, fn: unknown) =>

@@ -170,6 +170,105 @@ export async function reportsStage(sim: Sim, ctx: Ctx, state: State) {
   const q3 = model.orders.filter((o) => o.quarter === "Q3");
   sim.eq("aggregate $out: Q3 receipts copied", (await raw<{ R: number }>(`SELECT RECEIPT_NO AS R FROM "${T.ORDERS_OUT}" ORDER BY 1`)).map((r) => Number(r.R)), q3.map((o) => o.receipt));
 
+  // ── 2.1 statistics: branch KPIs, revenue share, ties and NULL ordering ──────
+  // Money is compared in units rounded to 6 places: MEDIAN / STDDEV / PERCENTILE return
+  // unscaled NUMBERs, so they arrive as JS numbers, not as the exact money strings.
+  const sold = { STATUS: { $in: ["paid", "settled"] } };
+  const r6 = (x: unknown) => (x == null ? null : Math.round(Number(x) * 1e6) / 1e6);
+  const units = (cs: number[]) => cs.map((c) => c / 100).sort((a, b) => a - b);
+  const pctCont = (xs: number[], p: number) => {
+    const rn = p * (xs.length - 1), lo = Math.floor(rn), hi = Math.ceil(rn);
+    return xs[lo] + (rn - lo) * (xs[hi] - xs[lo]);
+  };
+  const pctDisc = (xs: number[], p: number) => xs[Math.max(0, Math.ceil(p * xs.length) - 1)];
+  const stdev = (xs: number[], sample: boolean) => {
+    if (sample && xs.length < 2) return null; // STDDEV_SAMP of one row is NULL
+    const m = sum(xs) / xs.length;
+    return Math.sqrt(sum(xs.map((x) => (x - m) ** 2)) / (xs.length - (sample ? 1 : 0)));
+  };
+  const storeIds = [...new Set(model.orders.map((o) => o.storeId))].sort((a, b) => a - b);
+  const ofStore = (s: number) => model.orders.filter((o) => o.storeId === s);
+  const kpi = await sim.mira(() =>
+    orders.aggregate([
+      { $match: sold },
+      {
+        $group: {
+          _id: "$STORE_ID",
+          CUSTOMERS: { $countDistinct: "$CUSTOMER_ID" },
+          MED: { $median: "$TOTAL" },
+          SD: { $stdDevSamp: "$TOTAL" },
+          SDP: { $stdDevPop: "$TOTAL" },
+          P: { $percentile: { input: "$TOTAL", p: [0.1, 0.9] } },
+          P90D: { $percentile: { input: "$TOTAL", p: 0.9, method: "discrete" } },
+          RECEIPTS: { $push: { input: "$RECEIPT_NO", orderBy: { RECEIPT_NO: 1 } } },
+          QUARTERS: { $addToSet: { input: "$QUARTER", orderBy: { QUARTER: 1 } } },
+          QLIST: { $listAgg: { input: "$QUARTER", separator: "/", distinct: true, orderBy: { QUARTER: 1 } } },
+        },
+      },
+      { $sort: { STORE_ID: 1 } },
+    ]),
+  );
+  sim.eq(
+    "branch KPIs: distinct customers, median / spread / P10-P90 / discrete P90 of the ticket",
+    kpi.map((r) => [Number(r.STORE_ID), Number(r.CUSTOMERS), r6(r.MED), r6(r.SD), r6(r.SDP), (r.P as number[]).map(r6), r6(r.P90D)]),
+    storeIds.map((s) => {
+      const t = units(ofStore(s).map((o) => o.total));
+      return [s, new Set(ofStore(s).map((o) => o.customerId)).size, r6(pctCont(t, 0.5)), r6(stdev(t, true)), r6(stdev(t, false)), [r6(pctCont(t, 0.1)), r6(pctCont(t, 0.9))], r6(pctDisc(t, 0.9))];
+    }),
+  );
+  sim.eq(
+    "branch KPIs: receipts ($push, in order), quarters traded ($addToSet, $listAgg)",
+    kpi.map((r) => [Number(r.STORE_ID), r.RECEIPTS, r.QUARTERS, r.QLIST]),
+    storeIds.map((s) => {
+      const qs = [...new Set(ofStore(s).map((o) => o.quarter))].sort();
+      return [s, ofStore(s).map((o) => o.receipt).sort((a, b) => a - b), qs, qs.join("/")];
+    }),
+  );
+  const share = await sim.mira(() =>
+    orders.aggregate([
+      { $match: sold },
+      { $group: { _id: "$STORE_ID", REV: { $sum: "$TOTAL" } } },
+      { $addFields: { SHARE: { $window: { fn: "RATIO_TO_REPORT", field: "REV" } }, PREV_REV: { $window: { fn: "LAG", field: "REV", orderBy: { STORE_ID: 1 }, default: 0 } } } },
+      { $sort: { STORE_ID: 1 } },
+    ]),
+  );
+  const revOfStore = (s: number) => sum(ofStore(s).map((o) => o.total));
+  const allRev = sum(model.orders.map((o) => o.total));
+  sim.eq(
+    "revenue share per branch (RATIO_TO_REPORT) and the previous branch's revenue (LAG, default 0)",
+    share.map((r) => [Number(r.STORE_ID), r6(r.SHARE), cents(r.PREV_REV)]),
+    storeIds.map((s, i) => [s, r6(revOfStore(s) / allRev), i ? revOfStore(storeIds[i - 1]) : 0]),
+  );
+  const nextCity = await sim.mira(() =>
+    customers.aggregate([{ $project: { ID: 1, NEXT_CITY: { $window: { fn: "LEAD", field: "CITY", orderBy: { ID: 1 }, ignoreNulls: true, default: "-" } } } }, { $sort: { ID: 1 } }]),
+  );
+  sim.eq(
+    "next customer's city, skipping customers with none (LEAD IGNORE NULLS, default '-')",
+    nextCity.map((r) => r.NEXT_CITY),
+    custRows.map((_, i) => custRows.slice(i + 1).find((c) => c.CITY != null)?.CITY ?? "-"),
+  );
+  const nullsFirst = (await customers.find({}).sort({ CITY: { order: 1, nulls: "first" }, ID: 1 }).project({ CITY: 1 }).toArray()) as { CITY: string | null }[];
+  sim.eq(
+    "customers by city, those without a city first (NULLS FIRST)",
+    nullsFirst.map((r) => r.CITY),
+    [...custRows.filter((c) => c.CITY == null), ...custRows.filter((c) => c.CITY != null).sort((a, b) => ((a.CITY as string) < (b.CITY as string) ? -1 : (a.CITY as string) > (b.CITY as string) ? 1 : a.ID - b.ID))].map((c) => c.CITY),
+  );
+  // Every ticket total is distinct, so ties are shown on the branch: "limit 1" of the
+  // orders by branch, WITH TIES, is all of the first branch's orders.
+  const firstBranch = (await sim.mira(() => orders.find(sold).sort({ STORE_ID: 1 }).limit(1, { withTies: true }).project({ RECEIPT_NO: 1 }).toArray())) as { RECEIPT_NO: number }[];
+  sim.eq("first branch's receipts: limit 1 WITH TIES keeps every order tied on the branch", firstBranch.map((r) => Number(r.RECEIPT_NO)).sort((a, b) => a - b), ofStore(storeIds[0]).map((o) => o.receipt).sort((a, b) => a - b));
+  const regulars = await sim.mira(() =>
+    orders.aggregate([{ $match: sold }, { $group: { _id: "$CUSTOMER_ID", N: { $count: "*" } } }, { $sort: { N: -1 } }, { $limit: { n: 1, withTies: true } }]),
+  );
+  const visits = new Map<number, number>();
+  for (const o of model.orders) visits.set(o.customerId, (visits.get(o.customerId) ?? 0) + 1);
+  const most = Math.max(...visits.values());
+  sim.eq(
+    "most frequent customers, every one tied at the top ($limit WITH TIES)",
+    regulars.map((r) => Number(r.CUSTOMER_ID)).sort((a, b) => a - b),
+    [...visits].filter(([, n]) => n === most).map(([id]) => id).sort((a, b) => a - b),
+  );
+
   // ── Set operations ───────────────────────────────────────────────────────
   const vip = () => customers.find({ TIER: "vip" }).project({ NAME: 1 });
   const cebu = () => customers.find({ CITY: "Cebu" }).project({ NAME: 1 });

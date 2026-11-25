@@ -20,6 +20,10 @@
  *   FIRST_VALUE / LAST_VALUE — first/last value in window
  *   NTH_VALUE  — Nth value in window
  *   SUM / AVG / COUNT / MIN / MAX — running aggregates
+ *   RATIO_TO_REPORT — a value's share of its partition total
+ *
+ * OPTIONS (2.1): `default` for LAG / LEAD, `ignoreNulls` for the value
+ * functions, and NULLS FIRST / LAST in orderBy ({ col: { order, nulls } }).
  *
  * HOW IT WORKS:
  *   Each analytic function uses OVER() to define its window:
@@ -37,7 +41,7 @@
  * ============================================================================
  */
 
-import { quoteIdentifier } from "../utils";
+import { quoteIdentifier, sortTerm } from "../utils";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
@@ -46,6 +50,9 @@ import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
  * listed here is refused (CWE-89).
  */
 const EXTRA_WINDOW_FUNCTIONS = new Set(["CUME_DIST", "PERCENT_RANK"]);
+
+/** The value functions that accept IGNORE NULLS. */
+const NULL_SKIPPING_FUNCTIONS = new Set(["LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE"]);
 
 /** A frame bound: UNBOUNDED PRECEDING|FOLLOWING, CURRENT ROW, or n PRECEDING|FOLLOWING. */
 const FRAME_BOUND = String.raw`(?:UNBOUNDED\s+(?:PRECEDING|FOLLOWING)|CURRENT\s+ROW|\d+\s+(?:PRECEDING|FOLLOWING))`;
@@ -70,15 +77,44 @@ function _positiveInt(name: string, value: unknown): void {
  * @param {number} [spec.offset] - Offset for LAG/LEAD (default: 1)
  * @param {number} [spec.n] - Bucket count for NTILE (default: 4) or row for NTH_VALUE
  * @param {string} [spec.frame] - Custom frame clause (e.g., 'ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING')
+ * @param {*} [spec.default] - LAG / LEAD: value for rows whose offset falls outside the partition
+ * @param {boolean} [spec.ignoreNulls] - LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE: skip NULL values
+ * @param {Function} [bind] - Binds a literal and returns its placeholder. The pipeline passes one;
+ *   without it only a number or null `default` can be used (written as a literal).
  * @returns {string} The complete SQL analytic expression
  */
-function buildWindowExpr(spec: { fn: string; field?: string; partitionBy?: string | string[]; orderBy?: Record<string, unknown>; offset?: number; n?: number; frame?: string; }): string {
-  const { fn, field, partitionBy, orderBy, offset, n, frame } = spec;
+function buildWindowExpr(
+  spec: { fn: string; field?: string; partitionBy?: string | string[]; orderBy?: Record<string, unknown>; offset?: number; n?: number; frame?: string; default?: unknown; ignoreNulls?: boolean },
+  bind?: (value: unknown) => string,
+): string {
+  const { fn, field, partitionBy, orderBy, offset, n, frame, ignoreNulls } = spec;
   _positiveInt("n", n);
   _positiveInt("offset", offset);
   if (frame !== undefined && !(typeof frame === "string" && FRAME_RE.test(frame.trim()))) {
     throw new TypeError(MSG.WINDOW_INVALID_FRAME(frame));
   }
+  const fnUpper = String(fn).toUpperCase();
+  const hasDefault = Object.prototype.hasOwnProperty.call(spec, "default");
+  if (hasDefault && fnUpper !== "LAG" && fnUpper !== "LEAD") {
+    throw new Error(MSG.WINDOW_INVALID_OPTION(`default applies to LAG and LEAD only, not ${fnUpper}`));
+  }
+  if (ignoreNulls && !NULL_SKIPPING_FUNCTIONS.has(fnUpper)) {
+    throw new Error(MSG.WINDOW_INVALID_OPTION(`ignoreNulls applies to ${[...NULL_SKIPPING_FUNCTIONS].join(", ")}, not ${fnUpper}`));
+  }
+  if (fnUpper === "RATIO_TO_REPORT" && (orderBy || frame)) {
+    throw new Error(MSG.WINDOW_INVALID_OPTION("RATIO_TO_REPORT takes partitionBy only: Oracle allows no ORDER BY or frame in its window"));
+  }
+  // LAG / LEAD third argument. Numbers and null are exact literals; anything else is bound.
+  let defaultArg = "";
+  if (hasDefault) {
+    const d = spec.default;
+    if (typeof d === "number" && !Number.isFinite(d)) throw new Error(MSG.WINDOW_INVALID_OPTION("default must be a finite number, a string, a Date or null"));
+    if (d === null) defaultArg = ", NULL";
+    else if (typeof d === "number") defaultArg = `, ${d}`;
+    else if (bind) defaultArg = `, ${bind(d)}`;
+    else throw new Error(MSG.WINDOW_INVALID_OPTION("a non-number default needs bind values: use it in a pipeline $window, or pass a bind function"));
+  }
+  const nullsClause = ignoreNulls ? " IGNORE NULLS" : "";
 
   // Build OVER clause
   const overParts: string[] = [];
@@ -91,8 +127,7 @@ function buildWindowExpr(spec: { fn: string; field?: string; partitionBy?: strin
   if (orderBy) {
     const orderCols = Object.entries(orderBy)
       .map(
-        ([col, dir]) =>
-          `${quoteIdentifier(col)} ${dir === -1 ? "DESC" : "ASC"}`,
+        ([col, dir]) => sortTerm(col, dir),
       )
       .join(", ");
     overParts.push(`ORDER BY ${orderCols}`);
@@ -105,7 +140,6 @@ function buildWindowExpr(spec: { fn: string; field?: string; partitionBy?: strin
     overParts.length > 0 ? `OVER (${overParts.join(" ")})` : "OVER ()";
 
   // Build function call
-  const fnUpper = String(fn).toUpperCase();
   switch (fnUpper) {
     case "ROW_NUMBER":
       return `ROW_NUMBER() ${overClause}`;
@@ -116,15 +150,15 @@ function buildWindowExpr(spec: { fn: string; field?: string; partitionBy?: strin
     case "NTILE":
       return `NTILE(${n || 4}) ${overClause}`;
     case "LAG":
-      return `LAG(${quoteIdentifier(field as string)}, ${offset || 1}) ${overClause}`;
     case "LEAD":
-      return `LEAD(${quoteIdentifier(field as string)}, ${offset || 1}) ${overClause}`;
+      return `${fnUpper}(${quoteIdentifier(field as string)}, ${offset || 1}${defaultArg})${nullsClause} ${overClause}`;
     case "FIRST_VALUE":
-      return `FIRST_VALUE(${quoteIdentifier(field as string)}) ${overClause}`;
     case "LAST_VALUE":
-      return `LAST_VALUE(${quoteIdentifier(field as string)}) ${overClause}`;
+      return `${fnUpper}(${quoteIdentifier(field as string)})${nullsClause} ${overClause}`;
     case "NTH_VALUE":
-      return `NTH_VALUE(${quoteIdentifier(field as string)}, ${n || 1}) ${overClause}`;
+      return `NTH_VALUE(${quoteIdentifier(field as string)}, ${n || 1})${nullsClause} ${overClause}`;
+    case "RATIO_TO_REPORT":
+      return `RATIO_TO_REPORT(${quoteIdentifier(field as string)}) ${overClause}`;
     case "SUM":
       return `SUM(${field === "*" ? "*" : quoteIdentifier(field as string)}) ${overClause}`;
     case "AVG":
