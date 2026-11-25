@@ -1,0 +1,128 @@
+name: CI
+
+# Every push and pull request: type-check and build the npm package, then run the
+# full test suite, the simulation and a Node smoke test against a live Oracle
+# Database Free (23ai) container, in node-oracledb Thin mode and in Thick mode.
+# 2.0.0 was only tested in Thin mode; 2.0.1's three defects showed up in Thick.
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Type-check and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run build
+      # What npm would publish (prepack rebuilds dist/).
+      - run: npm pack --dry-run
+
+  test:
+    name: Oracle 23ai (${{ matrix.driver }} mode)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        driver: [thin, thick]
+    services:
+      oracle:
+        image: gvenzl/oracle-free:23-slim-faststart
+        env:
+          # A throwaway container reachable only from this job's runner.
+          ORACLE_PASSWORD: MiraCi_sys_2026
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DB_TYPE: oracle
+      DB_HOST: localhost
+      DB_PORT: "1521"
+      # Mira connects with (SID=...); the listener is told below to accept the PDB name as one.
+      DB_APP_SERVICE_NAME: FREEPDB1
+      APP_DB_USERNAME: MIRA
+      APP_DB_PASSWORD: MiraCi_app_2026
+      APP_TEST_DB_USERNAME: ""
+      MIRA_SIM_DB_USERNAME: MIRA_SIM
+      MIRA_SIM_DB_PASSWORD: MiraCi_app_2026
+      MIRA_SIM_GRANTEE: MIRA
+      ORACLE_INSTANT_CLIENT: ""
+      ENABLE_CONSOLE_LOGS: "false"
+      # Thick mode runs every database call on a native worker thread. A call waiting
+      # on a row lock holds its thread, so with fewer threads than such calls the lock
+      # holder never gets one to commit and the client hangs (seen on this 4-core
+      # runner: "concurrent transfers" ran 8 at once). node-oracledb's advice: at
+      # least as many threads as pooled connections. Thin mode is unaffected.
+      UV_THREADPOOL_SIZE: "32"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: bun install --frozen-lockfile
+
+      - name: Prepare the database (listener, MIRA and MIRA_SIM schemas)
+        env:
+          ORACLE: ${{ job.services.oracle.id }}
+        run: |
+          # Mira builds (CONNECT_DATA=(SID=...)): let the listener take FREEPDB1 as a SID.
+          docker exec "$ORACLE" bash -c 'echo "USE_SID_AS_SERVICE_LISTENER = ON" >> "$ORACLE_HOME/network/admin/listener.ora" && lsnrctl reload'
+          docker cp .github/oracle/setup-users.sql "$ORACLE":/tmp/setup-users.sql
+          docker exec "$ORACLE" sqlplus -s / as sysdba @/tmp/setup-users.sql "$APP_DB_PASSWORD"
+
+      - name: Install Oracle Instant Client (Thick mode)
+        if: matrix.driver == 'thick'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libaio1t64 unzip
+          # Instant Client looks for libaio.so.1; Ubuntu 24.04 ships it as libaio.so.1t64.
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
+          curl -sSLo /tmp/ic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip
+          sudo unzip -q /tmp/ic.zip -d /opt/oracle
+          IC_DIR=$(ls -d /opt/oracle/instantclient_*)
+          # On Linux the client is found through the library path, not ORACLE_INSTANT_CLIENT.
+          echo "LD_LIBRARY_PATH=$IC_DIR" >> "$GITHUB_ENV"
+
+      - name: Test suite (with coverage)
+        run: bun run test:coverage
+
+      - name: Driver mode check
+        run: |
+          bun -e 'const { createDb } = require("./src/utils/oracle-mongo-wrapper"); const db = createDb("appDb"); const mode = db.oracledb.oracleClientVersion ? "thick" : "thin"; console.log("driver mode:", mode); if (mode !== process.env.EXPECTED_MODE) process.exit(1); process.exit(0);'
+        env:
+          EXPECTED_MODE: ${{ matrix.driver }}
+
+      - name: Simulation
+        run: bun run sim
+
+      - name: Node smoke test (the npm build under Node)
+        run: |
+          bun run build
+          node test/node/smoke.cjs
