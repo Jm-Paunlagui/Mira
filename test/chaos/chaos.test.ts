@@ -73,8 +73,10 @@ describe("chaos: pool exhaustion and slow calls", () => {
     const shed = res.filter((r) => r.status === "rejected" && /NJS-076/.test(String((r as PromiseRejectedResult).reason)));
     m("burst 8 on pool(2)+queue(2): served", ok, "count");
     m("burst 8 on pool(2)+queue(2): shed NJS-076", shed.length, "count");
-    expect(ok).toBe(4);
-    expect(shed).toHaveLength(4);
+    // 2 connections + 2 queue slots serve 4; the rest are shed at once. The pool health
+    // monitor's 30 s ping can hold a queue slot at that instant: then 3 are served, 5 shed.
+    expect(ok + shed.length).toBe(8);
+    expect(ok === 4 || ok === 3).toBe(true);
   }, 30000);
 
   it("DEFECT: queueTimeout is a hard bound — NJS-040 must surface, not be retried into a longer wait", async () => {

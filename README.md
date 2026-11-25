@@ -22,6 +22,7 @@ Oracle Database
     - [Prerequisites — Database Configuration](#prerequisites--database-configuration)
     - [Imports & Connection](#imports--connection)
     - [Typed Tables (2.1)](#typed-tables-21)
+    - [Relations and include (2.1)](#relations-and-include-21)
     - [Migrations (2.1)](#migrations-21)
 - [Basic — Your First Queries](#-basic--your-first-queries)
 - [Medium — Filtering, Updating & Chaining](#-medium--filtering-updating--chaining)
@@ -262,6 +263,48 @@ bun run mira generate types --import ../my-mira-path            # in this reposi
 ```
 
 The command reads `DB_*` / `APP_DB_*` from the environment or from `.env` (`--env <file>` to pick another), and writes one `defineTable()` and one `…Row` type per table. In code: `await generateTableTypes(db, { tables, importFrom })` returns the same source text. CHECK constraints and multi-column keys are not written; they do not change the row types.
+
+### Relations and include (2.1)
+
+Declare how typed tables relate, once every table exists, then fetch related rows **in the same statement**: no extra query per row.
+
+```ts
+import { defineTable, t, relations, hasMany, hasOne, belongsTo } from "@jm-paunlagui/mira";
+
+export const Customers = defineTable("CUSTOMERS", { ID: t.id(), NAME: t.text(60) });
+export const Orders = defineTable("ORDERS", { ID: t.id(), CUSTOMER_ID: t.number(), TOTAL: t.money() });
+
+export const CustomersR = relations(Customers, {
+    orders: hasMany(Orders, { foreignKey: "CUSTOMER_ID" }),   // ORDERS.CUSTOMER_ID = CUSTOMERS.ID
+    biggest: hasOne(Orders, { foreignKey: "CUSTOMER_ID" }),
+});
+export const OrdersR = relations(Orders, {
+    customer: belongsTo(Customers, { foreignKey: "CUSTOMER_ID" }), // ORDERS.CUSTOMER_ID = CUSTOMERS.ID
+});
+
+const rows = await CustomersR.on(db)
+    .find({ NAME: { $like: "A%" } })
+    .include("orders", { where: { TOTAL: { $gt: 100 } }, sort: { TOTAL: -1 }, limit: 5 })
+    .include("biggest", { sort: { TOTAL: -1 } })
+    .toArray();
+// rows[0].orders:  { ID: number; CUSTOMER_ID: number; TOTAL: string }[]
+// rows[0].biggest: { ID: number; CUSTOMER_ID: number; TOTAL: string } | null
+
+const o = await OrdersR.on(db).find({ ID: 7 }).project({ ID: 1 }).include("customer").next();
+// o.customer: { ID: number; NAME: string } | null
+```
+
+| Relation | Key | `include()` gives | Options |
+| --- | --- | --- | --- |
+| `hasMany(Target, { foreignKey, localKey? })` | `Target.foreignKey = this.localKey` (default: this table's primary key) | an array (`[]` when none) | `where`, `sort`, `limit` |
+| `hasOne(Target, { foreignKey, localKey? })` | same | the first row by `sort`, or `null` | `where`, `sort` |
+| `belongsTo(Target, { foreignKey, references? })` | `this.foreignKey = Target.references` (default: its primary key) | the row, or `null` | `where` |
+
+- **One statement.** Each included relation is a correlated subquery in the SELECT list, built with `JSON_ARRAYAGG` / `JSON_OBJECT`. `limit` keeps the first n related rows **per parent row**.
+- **Related rows keep Mira's types.** Money and decimals are the same exact text as at top level, `DATE` / `TIMESTAMP` columns are `Date`, and CLOB is a string. BLOB and RAW columns are left out, because JSON has no binary type. Read them with a separate query.
+- **It combines** with filters, `sort`, `skip`, `limit`, `project` (on the parent's columns), `forEach`, `next`, `await`, and `on(session)` in transactions.
+- `relations()` returns the same table with relations attached: `name`, `columns`, `ddl()`, `create()` and `on()` are unchanged. Declaring relations apart from the tables lets two tables point at each other, and keeps generated table files as they are.
+- Only one level of nesting is supported: an included row cannot include further relations yet.
 
 ### Migrations (2.1)
 

@@ -68,6 +68,7 @@
 import type { DbConnection } from "../db";
 import { quoteIdentifier, bindSafe, buildOrderBy, buildProjection } from "../utils";
 import { parseFilter } from "../parsers/filterParser";
+import { buildIncludeSQL, decodeIncluded, type IncludeOptions, type RelationSpec } from "../typed/include";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /** A `{ $subquery }` projection value: a correlated scalar subquery column. */
@@ -135,6 +136,9 @@ class QueryBuilder {
     declare _withTies: boolean;
     declare _sort: Record<string, unknown> | null;
     declare _conn: import("../db").DbConnection | null;
+    /** The relations include() can fetch (from a typed table with relations). */
+    declare _relations?: Readonly<Record<string, RelationSpec>>;
+    declare _includes: Array<{ name: string; spec: RelationSpec; options: IncludeOptions }>;
     declare db: import("../db").WrapperDb;
     declare filter: Record<string, unknown>;
     declare tableName: string;
@@ -160,6 +164,7 @@ class QueryBuilder {
         this._sample = options.sample || null;
         this._asOf = options.asOf || null;
         this._terminated = false; // Prevents chaining after a terminal method
+        this._includes = [];
     }
 
     /**
@@ -180,6 +185,23 @@ class QueryBuilder {
     }
 
     // ─── Chain Methods (return the same QueryBuilder for chaining) ───
+
+    /**
+     * Fetch a declared relation in the same statement: each row gets the related
+     * rows (hasMany: an array) or row (belongsTo / hasOne: an object or null)
+     * under the relation's name. Declare relations with relations() on typed tables.
+     * @param {string} name - Relation name
+     * @param {Object} [options] - { where, sort, limit } on the related rows (limit: hasMany only)
+     * @returns {QueryBuilder} this (for chaining)
+     */
+    include(name: string, options: IncludeOptions = {}): QueryBuilder {
+        this._checkTerminated();
+        const spec = this._relations?.[name];
+        if (!spec) throw new Error(MSG.INCLUDE_UNKNOWN_RELATION(this.tableName, name, Object.keys(this._relations ?? {})));
+        if (this._includes.some((i) => i.name === name)) throw new Error(MSG.INCLUDE_TWICE(name));
+        this._includes.push({ name, spec, options });
+        return this;
+    }
 
     /**
      * Set the sort order.
@@ -358,6 +380,17 @@ class QueryBuilder {
             // We'll post-process exclusions after query, or use approach below
         }
 
+        // Included relations: one correlated subquery each, in the select list.
+        if (this._includes.length > 0) {
+            if (selectCols === "*") selectCols = "t0.*"; // "*" cannot share a select list
+            const parts = this._includes.map((inc, i) => {
+                const built = buildIncludeSQL(inc.spec, inc.name, inc.options, "t0", `inc${i}_`);
+                Object.assign(binds, built.binds);
+                return built.sql;
+            });
+            selectCols = `${selectCols}, ${parts.join(", ")}`;
+        }
+
         // Table reference
         let tableRef = `${quoteIdentifier(this.tableName)} t0`;
 
@@ -513,6 +546,7 @@ class QueryBuilder {
                         return doc;
                     });
                 }
+                if (this._includes.length > 0) rows = rows.map((row: Record<string, unknown>) => this._decodeIncludes(row));
 
                 return rows;
             } catch (err) {
@@ -526,6 +560,12 @@ class QueryBuilder {
             return fn(this._conn);
         }
         return this.db.withConnection(fn);
+    }
+
+    /** Included relations' JSON text into arrays / objects, in place. */
+    _decodeIncludes(row: Record<string, unknown>): Record<string, unknown> {
+        for (const inc of this._includes) row[inc.name] = decodeIncluded(inc.spec, row[inc.name]);
+        return row;
     }
 
     // ─── Terminal Methods ─────────────────────────────────────────
@@ -592,7 +632,8 @@ class QueryBuilder {
                     }
                     let out: unknown;
                     try {
-                        out = fn(row);
+                        // Included relations are decoded first; a failure there stops the stream like a callback error.
+                        out = fn(this._includes.length > 0 ? this._decodeIncludes(row) : row);
                     } catch (err) {
                         fail(err);
                         return;

@@ -119,6 +119,39 @@ Two tests failed only on the CI database:
 - `test/unit/migrations.test.ts`: errors other than "already exists" / "lock busy", a dry run never touching the real connection, and the new-file helpers.
 - Simulation, schema stage: a supplier table, its seed and a view arrive as three migrations. The stage checks `list`, a dry run, `up`, a repeat `up`, `down`, `status` by batch, a second `up`, and a refused `up` after a migration's code changed. Result: 307 checks, 129 of 129 public functions.
 
+### Added — relations and include (roadmap step 3)
+
+- **`relations(table, { name: hasMany(…) | hasOne(…) | belongsTo(…) })`** attaches relations to a typed table. They are declared apart from the tables, so two tables can point at each other and generated table files stay as they are.
+  - `hasMany(Target, { foreignKey, localKey? })` and `hasOne(...)`: `Target.foreignKey = this.localKey`, by default this table's primary key.
+  - `belongsTo(Target, { foreignKey, references? })`: `this.foreignKey = Target.references`, by default the target's primary key.
+  - Names, columns and keys are checked when relations are declared.
+- **`find().include(name, { where, sort, limit })`** fetches related rows in the **same statement**. Each relation is a correlated subquery in the SELECT list.
+  - `hasMany` uses `JSON_ARRAYAGG(JSON_OBJECT …)` and gives an array, `[]` when there are none. `limit` keeps the first n rows per parent row, numbered with `ROW_NUMBER` (not `FETCH FIRST`; see 2.0.1's LATERAL row-limit bug).
+  - `hasOne` / `belongsTo` use `JSON_OBJECT` and give an object or `null`.
+  - It works with filters, `sort`, `skip`, `limit`, `project`, `forEach`, `next`, `await` and sessions.
+- **Related rows keep Mira's types.** Scaled NUMBER columns are written with `TO_CHAR`, the same exact text as a top-level money column. DATE / TIMESTAMP columns become `Date`, CLOB text stays text, and BLOB / RAW columns are left out because JSON has no binary type.
+- **Typed.** `include()` adds `orders: Order[]` or `customer: Customer | null` to the row type. The `where` and `sort` options are checked against the related table, and `limit` is accepted only for `hasMany`. A relation can't be projected as a column, and a table without relations has nothing to include.
+- Exported: `relations`, `hasMany`, `hasOne`, `belongsTo`; types `Relation`, `NestedRow`, `IncludeOptions`, `IncludeOptionsOf`. `TypedQuery` gains its relation parameters, and existing `TypedQuery<R>` uses still compile.
+
+### Fixed — insertMany with a column given as a number and as a numeric string
+
+- A typed money column accepts `string | number`. `insertMany` chose one bind type per column from the first value, so `[{ AMT: "10.5" }, { AMT: 99 }]` failed with `NJS-011`.
+- A column that mixes the two is now bound as text, with numbers sent as their decimal text, which Oracle converts exactly, as it does for a money string in `insertOne`. Proven first by a `DEFECT:` test.
+
+### Tests and simulation (relations)
+
+- `test/integration/relations.test.ts` (11 tests, live):
+  - one statement per query
+  - nested values equal to a direct read (money, decimals, dates, TIMESTAMP WITH TIME ZONE, a 6,000-character CLOB, BLOB left out)
+  - per-parent `where` / `sort` / `limit`, `hasOne`, `belongsTo` with a projection, several includes with filters, `next` / `forEach` / `await`, a rolled-back session
+  - every error, and the checks made when relations are declared
+- `test/types/relations.types.ts`: exact nested types, plus 8 misuses that must not compile.
+- Simulation, reports stage, each checked against the model:
+  - each VIP's three biggest tickets (`hasMany` with `where` / `sort` / `limit`)
+  - the customer behind every ticket of 300.00 or more (`belongsTo`)
+  - each customer's first receipt (`hasOne`)
+  - Result: 310 checks, 61 queries, 134 of 134 public functions.
+
 ## [2.0.1] — 2026-11-25
 
 Patch release: Mira now behaves the same in node-oracledb Thin and Thick mode. 2.0.0 was only tested in Thin mode. On a machine with an Oracle Client on the system PATH, the adapter loads Thick mode even when `ORACLE_INSTANT_CLIENT` is blank, and two things broke.

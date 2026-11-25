@@ -63,6 +63,7 @@ import { createPerformance } from "./advanced/performanceUtils"; // EXPLAIN PLAN
 import { defineTable, TypedTable } from "./typed/table";
 import { t } from "./typed/columns";
 import { generateTableTypes } from "./typed/generate";
+import { relations, hasMany, hasOne, belongsTo } from "./typed/relations";
 
 // ─── Migrations (2.1): versioned schema changes with history, lock and dry run ─
 import { createMigrator } from "./migrate/migrator";
@@ -70,8 +71,10 @@ import { createMigrator } from "./migrate/migrator";
 // ─── Shared utility functions ────────────────────────────────────
 import { quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection } from "./utils";
 
-export { createDb, OracleCollection, OracleSchema, OracleDCL, QueryBuilder, Transaction, parseFilter, parseUpdate, buildAggregateSQL, buildWindowExpr, buildJoinSQL, SetResultBuilder, withCTE, withRecursiveCTE, series, buildScalarSubquery, buildExistsSubquery, buildNotExistsSubquery, buildCorrelatedSubquery, buildInSelectSubquery, buildAnyAllSubquery, buildConnectBy, buildPivot, buildUnpivot, createPerformance, quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection, defineTable, TypedTable, t, generateTableTypes, createMigrator };
-export type { RowOf, InsertOf, Filter, Update, Sort, Projection, Projected, TypedCollection, TypedQuery, TableTarget } from "./typed/table";
+export { createDb, OracleCollection, OracleSchema, OracleDCL, QueryBuilder, Transaction, parseFilter, parseUpdate, buildAggregateSQL, buildWindowExpr, buildJoinSQL, SetResultBuilder, withCTE, withRecursiveCTE, series, buildScalarSubquery, buildExistsSubquery, buildNotExistsSubquery, buildCorrelatedSubquery, buildInSelectSubquery, buildAnyAllSubquery, buildConnectBy, buildPivot, buildUnpivot, createPerformance, quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection, defineTable, TypedTable, t, generateTableTypes, createMigrator, relations, hasMany, hasOne, belongsTo };
+export type { RowOf, InsertOf, Filter, Update, Sort, Projection, Projected, TypedCollection, TypedQuery, TableTarget, IncludeOptionsOf } from "./typed/table";
+export type { Relation, NestedRow } from "./typed/relations";
+export type { IncludeOptions } from "./typed/include";
 export type { Column, ColumnMeta } from "./typed/columns";
 export type { GenerateOptions } from "./typed/generate";
 export type { Migration, MigrationContext, MigratorOptions, MigrationStatus, MigrationState, MigrationRun, Migrator } from "./migrate/migrator";

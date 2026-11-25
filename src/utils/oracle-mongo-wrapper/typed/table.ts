@@ -30,6 +30,8 @@ import type { QueryBuilder } from "../core/QueryBuilder";
 import { OracleSchema } from "../schema/OracleSchema";
 import type { WrapperDb } from "../db";
 import type { AnyColumn, ColumnMeta } from "./columns";
+import type { RelationSpec } from "./include";
+import type { AnyRelation, Relation } from "./relations";
 
 // ─── Row, insert and write types derived from the columns ───────────────────
 
@@ -120,18 +122,28 @@ export type Projected<R, P> = [IncludedKeys<P>] extends [never] ? Simplify<Omit<
 type LimitOptions = Parameters<QueryBuilder["limit"]>[1];
 type ForUpdateMode = Parameters<QueryBuilder["forUpdate"]>[0];
 
-/** A find() chain on a typed table, yielding rows of type R. */
-export interface TypedQuery<R> extends PromiseLike<R[]> {
-  sort(spec: Sort<R>): TypedQuery<R>;
-  limit(n: number, options?: LimitOptions): TypedQuery<R>;
-  skip(n: number): TypedQuery<R>;
-  project<P extends Projection<R>>(spec: P): TypedQuery<Projected<R, P>>;
-  forUpdate(mode: ForUpdateMode): TypedQuery<R>;
-  toArray(): Promise<R[]>;
-  next(): Promise<R | null>;
+/** include() options for one relation: a filter and order on the related table; limit for hasMany. */
+export type IncludeOptionsOf<Rel> = Rel extends Relation<infer Kind, infer TC>
+  ? { where?: Filter<WriteRowOf<TC>>; sort?: Sort<RowOf<TC>> } & (Kind extends "hasMany" ? { limit?: number } : {})
+  : never;
+
+/**
+ * A find() chain on a typed table. B is the row (narrowed by project()), Rel the
+ * table's relations, Inc what include() has added so far. Rows are B & Inc.
+ */
+export interface TypedQuery<B, Rel = {}, Inc = {}> extends PromiseLike<Array<Simplify<B & Inc>>> {
+  sort(spec: Sort<B>): TypedQuery<B, Rel, Inc>;
+  limit(n: number, options?: LimitOptions): TypedQuery<B, Rel, Inc>;
+  skip(n: number): TypedQuery<B, Rel, Inc>;
+  project<P extends Projection<B>>(spec: P): TypedQuery<Projected<B, P>, Rel, Inc>;
+  /** Fetch a declared relation in the same statement (see relations()). */
+  include<K extends keyof Rel & string>(name: K, options?: IncludeOptionsOf<Rel[K]>): TypedQuery<B, Rel, Inc & { [P in K]: Rel[K] extends { $out: infer O } ? O : never }>;
+  forUpdate(mode: ForUpdateMode): TypedQuery<B, Rel, Inc>;
+  toArray(): Promise<Array<Simplify<B & Inc>>>;
+  next(): Promise<Simplify<B & Inc> | null>;
   hasNext(): Promise<boolean>;
   count(): Promise<number>;
-  forEach(fn: (row: R) => unknown): Promise<void>;
+  forEach(fn: (row: Simplify<B & Inc>) => unknown): Promise<void>;
   explain(): Promise<string>;
   /** The same QueryBuilder with 2.0's untyped signatures. */
   readonly untyped: QueryBuilder;
@@ -141,9 +153,9 @@ type Out<M extends keyof OracleCollection> = OracleCollection[M] extends (...a: 
 type Arg<M extends keyof OracleCollection, I extends number> = OracleCollection[M] extends (...a: infer A) => unknown ? A[I] : never;
 
 /** A collection on a typed table. Same object and behaviour as OracleCollection; typed signatures. */
-export interface TypedCollection<R, I, W> {
+export interface TypedCollection<R, I, W, Rel = {}> {
   readonly tableName: string;
-  find(filter?: Filter<W>, options?: Arg<"find", 1>): TypedQuery<R>;
+  find(filter?: Filter<W>, options?: Arg<"find", 1>): TypedQuery<R, Rel>;
   findOne(filter: Filter<W>): Promise<R | null>;
   countDocuments(filter?: Filter<W>): Promise<number>;
   distinct<K extends keyof R & string>(field: K, filter?: Filter<W>): Promise<Array<R[K]>>;
@@ -169,7 +181,7 @@ export type TableTarget = WrapperDb | { collection(tableName: string): OracleCol
 type ColumnSpec = Parameters<OracleSchema["createTable"]>[1][string];
 
 /** A table definition. Build one with defineTable(); bind it to a db or session with on(). */
-export class TypedTable<C extends Columns> {
+export class TypedTable<C extends Columns, Rel extends Record<string, AnyRelation> = {}> {
   /** Type-only: one row as Mira returns it (`typeof Orders.$row`). */
   declare readonly $row: RowOf<C>;
   /** Type-only: the document insertOne() accepts. */
@@ -177,8 +189,10 @@ export class TypedTable<C extends Columns> {
   readonly name: string;
   /** The column builders (frozen). */
   readonly columns: C;
+  /** Relations attached with relations(): what include() can fetch. */
+  readonly relations: Readonly<Record<string, RelationSpec>>;
 
-  constructor(name: string, columns: C) {
+  constructor(name: string, columns: C, relationSpecs: Record<string, RelationSpec> = {}) {
     if (typeof name !== "string" || name.trim() === "") throw new TypeError("[defineTable] the table name must be a non-empty string.");
     const entries = Object.entries(columns ?? {});
     if (entries.length === 0) throw new TypeError(`[defineTable] ${name}: define at least one column.`);
@@ -189,13 +203,16 @@ export class TypedTable<C extends Columns> {
     if (identities.length > 1) throw new TypeError(`[defineTable] ${name}: Oracle allows one identity column per table (ORA-30669), got ${identities.join(", ")}.`);
     this.name = name;
     this.columns = Object.freeze({ ...columns });
+    this.relations = Object.freeze({ ...relationSpecs });
   }
 
   /** The table as a typed collection on a db handle, or inside a transaction session. */
-  on(target: TableTarget): TypedCollection<RowOf<C>, InsertOf<C>, WriteRowOf<C>> {
+  on(target: TableTarget): TypedCollection<RowOf<C>, InsertOf<C>, WriteRowOf<C>, Rel> {
     const t = target as { collection?: unknown };
     const coll = typeof t.collection === "function" ? (t as { collection(n: string): OracleCollection }).collection(this.name) : new OracleCollection(this.name, target as WrapperDb);
-    return coll as unknown as TypedCollection<RowOf<C>, InsertOf<C>, WriteRowOf<C>>;
+    // The collection hands the relations to every find(), where include() reads them.
+    if (Object.keys(this.relations).length > 0) coll._relations = this.relations;
+    return coll as unknown as TypedCollection<RowOf<C>, InsertOf<C>, WriteRowOf<C>, Rel>;
   }
 
   /** The column specs createTable() takes (also what migrations compare). */
