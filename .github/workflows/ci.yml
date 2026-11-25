@@ -72,6 +72,12 @@ jobs:
       MIRA_SIM_GRANTEE: MIRA
       ORACLE_INSTANT_CLIENT: ""
       ENABLE_CONSOLE_LOGS: "false"
+      # Thick mode runs every database call on a native worker thread. A call waiting
+      # on a row lock holds its thread, so with fewer threads than such calls the lock
+      # holder never gets one to commit and the client hangs (seen on this 4-core
+      # runner: "concurrent transfers" ran 8 at once). node-oracledb's advice: at
+      # least as many threads as pooled connections. Thin mode is unaffected.
+      UV_THREADPOOL_SIZE: "32"
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2

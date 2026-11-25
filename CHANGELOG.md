@@ -24,6 +24,15 @@ Two tests failed only on the CI database:
 - **`unit/adapter` "existing keys win"** expected `APP_DB_USERNAME` to be `mira`, the value in one developer's `.env`. It now sets its own value.
 - **`appDbInUse()`**, used by the leak checks, could catch the pool health monitor's 30-second `ping()` in flight and report 1 connection checked out (2 runs in 3 on the CI image). It now re-reads the count for up to 2 s and returns the lowest value seen, so a real leak, which never returns to 0, still fails the test.
 
+### Found by CI: Thick mode can hang when there are too few worker threads
+
+- **The hang:** on the 4-core GitHub runner, the Thick-mode job hung in "concurrent transfers keep the ledger balanced". That test runs 8 transactions that wait on each other's row locks.
+- **The cause:** in Thick mode each database call runs on a native worker thread (`UV_THREADPOOL_SIZE`), and a call waiting on a lock keeps its thread. With too few threads, the transaction holding the lock never gets one to commit. The database is fine, and Thin mode is unaffected.
+- **Reproduced locally:** `UV_THREADPOOL_SIZE=2` hangs and `16` passes.
+- **What changed:**
+  - CI sets `UV_THREADPOOL_SIZE=32`.
+  - The README warns Thick-mode users to set it to at least their largest `poolMax` before the process starts.
+
 ## [2.0.1] — 2026-11-25
 
 Patch release: Mira now behaves the same in node-oracledb Thin and Thick mode. 2.0.0 was only tested in Thin mode. On a machine with an Oracle Client on the system PATH, the adapter loads Thick mode even when `ORACLE_INSTANT_CLIENT` is blank, and two things broke.
