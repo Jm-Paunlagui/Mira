@@ -41,6 +41,8 @@
  *
  * SUPPORTED AGGREGATE EXPRESSIONS (inside $group, $project, $addFields):
  *   $sum, $avg, $min, $max, $count, $first, $last
+ *   $countDistinct, $median, $stdDevPop, $stdDevSamp, $percentile (2.1)
+ *   $push, $addToSet (JSON arrays, returned as JS arrays), $listAgg (one string) (2.1)
  *   $add, $subtract, $mul, $divide (arithmetic)
  *   $concat, $toUpper, $toLower, $substr (string operations)
  *   $cond (conditional: CASE WHEN ... THEN ... ELSE ... END)
@@ -70,7 +72,7 @@
  * ============================================================================
  */
 
-import { quoteIdentifier, renameBinds } from "../utils";
+import { quoteIdentifier, renameBinds, sortTerm } from "../utils";
 import { parseFilter } from "../parsers/filterParser";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
@@ -105,7 +107,9 @@ function _createCounter(): Counter {
  * @param {string} tableName - The base table name
  * @param {Array} pipeline - Array of stage objects (e.g. [{ $match: {...} }, ...])
  * @param {Object} db - db interface from createDb() (needed for oracledb constants)
- * @returns {{ sql: string, binds: Object }} The SQL string and bind variables
+ * @returns {{ sql: string, binds: Object, arrays?: Object }} The SQL, its bind variables and, when
+ *   $push / $addToSet / $percentile (list of p) produce JSON arrays, those output
+ *   columns ("array", or "set" to de-duplicate) for aggregate() to parse.
  *
  * @example
  *   const { sql, binds } = buildAggregateSQL("orders", [
@@ -113,7 +117,7 @@ function _createCounter(): Counter {
  *     { $group: { _id: "$region", total: { $sum: "$amount" } } },
  *   ], db);
  */
-function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<string, unknown>, aliasPrefix = "", hoist?: Array<{ alias: string; sql: string }>, base?: Array<{ alias: string; sql: string; cols?: string[]; suffix?: string }>): { sql: string; binds: Record<string, unknown>; } {
+function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<string, unknown>, aliasPrefix = "", hoist?: Array<{ alias: string; sql: string }>, base?: Array<{ alias: string; sql: string; cols?: string[]; suffix?: string }>): { sql: string; binds: Record<string, unknown>; arrays?: Record<string, "array" | "set"> } {
   const counter = _createCounter();
   const ctes: Array<{ alias: string; sql: string }> = [];
   const allBinds: Record<string, unknown> = {};
@@ -122,6 +126,10 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
   let outTable: string | null = null;
   let mergeSpec: DslSpec = null;
   let hasMerge = false;
+  // The most recent $sort: a following { $limit: { withTies } } repeats its ORDER BY.
+  let lastSort: { idx: number; orderBy: string } | null = null;
+  // Output columns holding a JSON array from $push / $addToSet / $percentile with a list of p.
+  const arrays: Record<string, "array" | "set"> = {};
 
   // Pre-scan for $having — attach to preceding $group
   for (let i = 0; i < pipeline.length; i++) {
@@ -197,6 +205,14 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
         );
         Object.assign(allBinds, binds);
         ctes.push({ alias: stageAlias, sql });
+        // Accumulators that return a JSON array: aggregate() parses these columns.
+        for (const [k, acc] of Object.entries(stage.$group as Record<string, DslSpec>)) {
+          if (k === "_id" || !acc || typeof acc !== "object") continue;
+          const op = Object.keys(acc)[0];
+          if (op in ARRAY_ACCUMULATORS) arrays[k.toUpperCase()] = ARRAY_ACCUMULATORS[op];
+          else if (op === "$percentile" && Array.isArray(acc.$percentile?.p)) arrays[k.toUpperCase()] = "array";
+          else delete arrays[k.toUpperCase()];
+        }
         const id = stage.$group._id;
         for (const k of Object.keys(stage.$group)) if (k !== "_id") aliases.add(k.toUpperCase());
         if (id && typeof id === "object" && !id.$rollup && !id.$cube && !id.$groupingSets) for (const k of Object.keys(id)) aliases.add(k.toUpperCase());
@@ -209,14 +225,23 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
           alias: stageAlias,
           sql: `SELECT * FROM ${prevSource} ORDER BY ${orderBy}`,
         });
+        lastSort = { idx: stageIdx, orderBy };
         break;
       }
 
       case "$limit": {
-        ctes.push({
-          alias: stageAlias,
-          sql: `SELECT * FROM ${prevSource} FETCH FIRST ${Number(stage.$limit)} ROWS ONLY`,
-        });
+        // $limit: n, or { n, withTies }. WITH TIES needs the ORDER BY in the same
+        // SELECT (without it Oracle silently returns exactly n rows), so it repeats
+        // the $sort directly before it — the rows it reads have that sort's columns.
+        const spec = stage.$limit !== null && typeof stage.$limit === "object" ? stage.$limit : { n: stage.$limit };
+        const n = spec.n;
+        if (!(Number.isInteger(n) && n >= 0)) throw new TypeError(MSG.INVALID_ROW_COUNT("aggregatePipeline", "$limit", n));
+        let sql = `SELECT * FROM ${prevSource} FETCH FIRST ${n} ROWS ONLY`;
+        if (spec.withTies === true) {
+          if (!lastSort || lastSort.idx !== stageIdx - 1) throw new Error(MSG.WITH_TIES_AFTER_SORT);
+          sql = `SELECT * FROM ${prevSource} ORDER BY ${lastSort.orderBy} FETCH FIRST ${n} ROWS WITH TIES`;
+        }
+        ctes.push({ alias: stageAlias, sql });
         break;
       }
 
@@ -419,7 +444,7 @@ function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<s
   // … optionally written somewhere by $merge / $out.
   if (hasMerge) return { sql: _buildMergeStatement(mergeSpec, sql), binds: allBinds };
   if (outTable) sql = `INSERT INTO ${quoteIdentifier(outTable)} ${sql}`;
-  return { sql, binds: allBinds };
+  return Object.keys(arrays).length ? { sql, binds: allBinds, arrays } : { sql, binds: allBinds };
 }
 
 /**
@@ -592,6 +617,43 @@ function _buildAggExpr(expr: Record<string, DslSpec>, binds: Record<string, unkn
         return v.map(arg);
       };
       switch (op) {
+        // ── 2.1 statistics: each takes "$COL" / an expression, or { input, ...options } ──
+        case "$countDistinct":
+          return `COUNT(DISTINCT ${one(_accInput(op, val).input)})`;
+        case "$median":
+          return `MEDIAN(${one(_accInput(op, val).input)})`;
+        case "$stdDevPop":
+          return `STDDEV_POP(${one(_accInput(op, val).input)})`;
+        case "$stdDevSamp":
+          return `STDDEV_SAMP(${one(_accInput(op, val).input)})`;
+        case "$push":
+        case "$addToSet": {
+          // A JSON array the caller gets back as a JS array (aggregate() parses the
+          // columns buildAggregateSQL flags). NULL ON NULL keeps NULLs, as MongoDB does;
+          // $addToSet de-duplicates after parsing, because 19c's JSON_ARRAYAGG has no DISTINCT.
+          const { input, orderBy } = _accInput(op, val);
+          return `JSON_ARRAYAGG(${one(input)}${_accOrder(orderBy, " ")} NULL ON NULL RETURNING CLOB)`;
+        }
+        case "$listAgg": {
+          const { input, orderBy, separator = ",", distinct } = _accInput(op, val);
+          if (typeof separator !== "string") throw new Error(MSG.ACCUMULATOR_INVALID(op, "separator must be a string"));
+          const value = one(input);
+          const within = orderBy ? _accOrder(orderBy, "") : `ORDER BY ${value}`;
+          return `LISTAGG(${distinct === true ? "DISTINCT " : ""}${value}, ${_bindValue(separator, binds, counter)}) WITHIN GROUP (${within})`;
+        }
+        case "$percentile": {
+          const { input, p, method = "continuous" } = _accInput(op, val);
+          if (method !== "continuous" && method !== "discrete") throw new Error(MSG.ACCUMULATOR_INVALID(op, 'method must be "continuous" or "discrete"'));
+          const ps = Array.isArray(p) ? p : [p];
+          // p is written into the SQL (Oracle wants a constant), so it must be a number in [0, 1].
+          if (ps.length === 0 || !ps.every((x) => typeof x === "number" && x >= 0 && x <= 1)) {
+            throw new Error(MSG.ACCUMULATOR_INVALID(op, "p must be a number from 0 to 1, or a non-empty list of them"));
+          }
+          const fn = method === "discrete" ? "PERCENTILE_DISC" : "PERCENTILE_CONT";
+          const value = one(input);
+          const terms = ps.map((x) => `${fn}(${x}) WITHIN GROUP (ORDER BY ${value})`);
+          return Array.isArray(p) ? `JSON_ARRAY(${terms.join(", ")})` : terms[0];
+        }
         case "$sum":
           return `SUM(${one(val)})`;
         case "$avg":
@@ -743,7 +805,7 @@ function _buildAggExpr(expr: Record<string, DslSpec>, binds: Record<string, unkn
           return `JSON_VALUE(${one(val)}, '$.size()' RETURNING NUMBER)`;
         case "$window": {
           const { buildWindowExpr } = (require("./windowFunctions") as typeof import("./windowFunctions"));
-          return buildWindowExpr(val);
+          return buildWindowExpr(val, (v) => _bindValue(v, binds, counter));
         }
         default:
           // An unknown operator used to fall through to a column named after its
@@ -793,6 +855,26 @@ function _isExpr(val: unknown): val is Record<string, unknown> {
   const keys = Object.keys(val);
   return keys.length === 1 && keys[0].startsWith("$");
 }
+
+/**
+ * A 2.1 accumulator's argument: "$COL" or an expression ({ $mul: … }) is the input
+ * itself; an options object ({ input, orderBy, … }, no "$" keys) carries it in `input`.
+ */
+function _accInput(op: string, val: DslSpec): DslSpec {
+  const isOptions = val !== null && typeof val === "object" && !Array.isArray(val) && !(val instanceof Date) && !Object.keys(val).some((k) => k.startsWith("$"));
+  const spec = isOptions ? val : { input: val };
+  if (spec.input === undefined) throw new Error(MSG.ACCUMULATOR_INVALID(op, "give a column (\"$COL\"), an expression, or { input: … }"));
+  return spec;
+}
+
+/** An accumulator's own ORDER BY (inside JSON_ARRAYAGG / WITHIN GROUP); "" when none. */
+function _accOrder(orderBy: DslSpec, lead: string): string {
+  if (!orderBy) return "";
+  return `${lead}ORDER BY ${Object.entries(orderBy as Record<string, unknown>).map(([c, d]) => sortTerm(c, d)).join(", ")}`;
+}
+
+/** $group accumulators whose JSON result aggregate() turns into a JS array. */
+const ARRAY_ACCUMULATORS: Readonly<Record<string, "array" | "set">> = Object.freeze({ $push: "array", $addToSet: "set" });
 
 /** Bind any literal value (number, string, boolean, Date, null) and return its placeholder. */
 function _bindValue(val: unknown, binds: Record<string, unknown>, counter: Counter): string {
@@ -896,8 +978,7 @@ function _buildCondExpr(cond: DslSpec, binds: Record<string, unknown>, counter: 
 function _buildSortString(sortSpec: Record<string, unknown>) {
   return Object.entries(sortSpec)
     .map(
-      ([col, dir]) =>
-        `${quoteIdentifier(col.toUpperCase())} ${dir === -1 ? "DESC" : "ASC"}`,
+      ([col, dir]) => sortTerm(col.toUpperCase(), dir),
     )
     .join(", ");
 }

@@ -47,7 +47,7 @@
 
 import type { DbConnection } from "../db";
 import type { QueryBuilder } from "../core/QueryBuilder";
-import { quoteIdentifier, renameBinds } from "../utils";
+import { quoteIdentifier, renameBinds, sortTerm } from "../utils";
 import { buildAggregateSQL, compileExpression } from "./aggregatePipeline";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
@@ -205,8 +205,7 @@ class CTEResult {
     if (this._sort) {
       const orderBy = Object.entries(this._sort)
         .map(
-          ([col, dir]) =>
-            `${quoteIdentifier(col)} ${dir === -1 ? "DESC" : "ASC"}`,
+          ([col, dir]) => sortTerm(col, dir),
         )
         .join(", ");
       selectSql += ` ORDER BY ${orderBy}`;
@@ -356,8 +355,7 @@ class RecursiveCTEResult {
     if (this._sort) {
       const orderBy = Object.entries(this._sort)
         .map(
-          ([col, dir]) =>
-            `${quoteIdentifier(col)} ${dir === -1 ? "DESC" : "ASC"}`,
+          ([col, dir]) => sortTerm(col, dir),
         )
         .join(", ");
       selectSql += ` ORDER BY ${orderBy}`;

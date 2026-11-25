@@ -93,6 +93,28 @@ import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
  * @param {*} value
  * @returns {*}
  */
+/**
+ * Turn the JSON text of $push / $addToSet / $percentile-list columns into JS arrays.
+ * "set" columns keep the first occurrence of each value (19c's JSON_ARRAYAGG has
+ * no DISTINCT). A NULL column (an empty group under ROLLUP, say) stays null.
+ */
+function _parseArrayColumns(rows: Record<string, unknown>[], arrays: Record<string, "array" | "set">): Record<string, unknown>[] {
+    for (const row of rows) {
+        for (const [col, kind] of Object.entries(arrays)) {
+            if (typeof row[col] !== "string") continue;
+            const values = JSON.parse(row[col] as string) as unknown[];
+            if (kind === "set") {
+                const seen = new Set<string>();
+                row[col] = values.filter((v) => {
+                    const key = JSON.stringify(v);
+                    return seen.has(key) ? false : (seen.add(key), true);
+                });
+            } else row[col] = values;
+        }
+    }
+    return rows;
+}
+
 function _deepClone<T>(value: T): T;
 function _deepClone(value: unknown): unknown {
     if (value === null || typeof value !== "object") return value;
@@ -1511,7 +1533,7 @@ class OracleCollection {
         // ISO strings which then fail Oracle's NLS_DATE_FORMAT implicit conversion
         // (ORA-01843) when used as bind values against DATE columns.
         const pipelineCopy = _deepClone(pipeline);
-        const { sql, binds } = buildAggregateSQL(
+        const { sql, binds, arrays } = buildAggregateSQL(
             this.tableName,
             pipelineCopy,
             this.db,
@@ -1523,7 +1545,8 @@ class OracleCollection {
                     outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
                     autoCommit: !this._conn,
                 });
-                return result.rows || [];
+                const rows = (result.rows || []) as Record<string, unknown>[];
+                return arrays ? _parseArrayColumns(rows, arrays) : rows;
             } catch (err) {
                 throw new Error(
                     MSG.wrapError(

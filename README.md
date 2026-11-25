@@ -368,7 +368,9 @@ const results = await users
     .toArray(); // Execute and return rows
 ```
 
-**Sort direction:** `1` = ascending (A→Z, 0→9), `-1` = descending (Z→A, 9→0)
+**Sort direction:** `1` = ascending (A→Z, 0→9), `-1` = descending (Z→A, 9→0). To place NULLs, give an object: `{ city: { order: 1, nulls: "first" } }` → `ORDER BY "city" ASC NULLS FIRST` (`nulls`: `"first"` or `"last"`). The same form works in a pipeline `$sort`, a window's `orderBy` and an accumulator's `orderBy`.
+
+**Ties:** `.sort({ score: -1 }).limit(3, { withTies: true })` → `FETCH FIRST 3 ROWS WITH TIES`: rows tied with the third on the sort keys are kept too. It needs a `sort()`; without one Oracle would silently return exactly 3 rows, so Mira throws.
 
 **Projection:** `{ name: 1, email: 1 }` = include only name and email. `{ password: 0 }` = exclude password, include everything else.
 
@@ -500,7 +502,7 @@ const report = await orders.aggregate([
 | `$project`   | `SELECT col1, col2`       | Pick/rename/compute columns             |
 | `$addFields` | `SELECT *, newCol`        | Add new columns, keep existing ones     |
 | `$sort`      | `ORDER BY`                | Sort results                            |
-| `$limit`     | `FETCH FIRST N ROWS ONLY` | Limit row count                         |
+| `$limit`     | `FETCH FIRST N ROWS ONLY` | Limit row count. `{ $limit: { n: 3, withTies: true } }` right after a `$sort` keeps ties (`WITH TIES`) |
 | `$skip`      | `OFFSET N ROWS`           | Skip rows                               |
 | `$count`     | `SELECT COUNT(*) AS name` | Count rows                              |
 | `$lookup`    | `JOIN`                    | Join another table                      |
@@ -528,6 +530,32 @@ await orders.aggregate([
     { $sort: { totalSpent: -1 } },
 ]);
 ```
+
+**Statistics and lists (2.1).** Each takes a column (`"$amount"`), an expression, or an options object with `input`:
+
+```js
+await orders.aggregate([
+    {
+        $group: {
+            _id: "$region",
+            customers: { $countDistinct: "$customerId" }, // COUNT(DISTINCT customerId)
+            medianTicket: { $median: "$amount" }, // MEDIAN(amount)
+            spread: { $stdDevSamp: "$amount" }, // STDDEV_SAMP (also $stdDevPop)
+            p90: { $percentile: { input: "$amount", p: 0.9 } }, // PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY amount)
+            p10p90: { $percentile: { input: "$amount", p: [0.1, 0.9] } }, // a list of p → a JS array [p10, p90]
+            p90disc: { $percentile: { input: "$amount", p: 0.9, method: "discrete" } }, // PERCENTILE_DISC
+            receipts: { $push: { input: "$receiptNo", orderBy: { receiptNo: 1 } } }, // JS array, NULLs kept
+            products: { $addToSet: "$product" }, // JS array, each value once
+            productList: { $listAgg: { input: "$product", separator: ", ", distinct: true } }, // one string (LISTAGG)
+        },
+    },
+]);
+```
+
+- `$push` / `$addToSet` are built with `JSON_ARRAYAGG(… RETURNING CLOB)` and come back from `aggregate()` as **JS arrays**, like MongoDB. `$push` keeps NULLs; `$addToSet` keeps the first of each value (19c's `JSON_ARRAYAGG` has no `DISTINCT`). Numbers in them are JS numbers, so money in an array is not the exact string a money column gives.
+- The arrays are parsed for the pipeline's final output. A later stage that renames or recomputes the column gets the JSON text.
+- `$listAgg` options: `separator` (default `","`, bound), `distinct`, `orderBy` (default: the value). The result is one string, limited by Oracle's VARCHAR2 size (4000 bytes unless `MAX_STRING_SIZE = EXTENDED`).
+- `$percentile`: `p` is a number from 0 to 1 or a list of them; `method` is `"continuous"` (default, interpolated) or `"discrete"` (an actual value).
 
 ### $having — Filter After Grouping
 
@@ -816,8 +844,23 @@ await orders.aggregate([
 | `LAST_VALUE`                    | Last value in the window             |
 | `NTH_VALUE`                     | Nth value in the window              |
 | `SUM`/`AVG`/`COUNT`/`MIN`/`MAX` | Running aggregates                   |
+| `RATIO_TO_REPORT`               | A value's share of its partition total (`partitionBy` only, no `orderBy` or `frame`) |
+| `CUME_DIST` / `PERCENT_RANK`    | Cumulative distribution / percent rank |
 
-**Parameters:** `fn`, `field`, `partitionBy`, `orderBy`, `offset` (for LAG/LEAD), `n` (for NTILE/NTH_VALUE), `frame`
+**Parameters:** `fn`, `field`, `partitionBy`, `orderBy`, `offset` (for LAG/LEAD), `n` (for NTILE/NTH_VALUE), `frame`, and (2.1):
+
+- `default` (LAG / LEAD): the value for rows whose offset falls outside the partition, instead of NULL. Numbers and `null` are written as literals; strings and dates are bound.
+- `ignoreNulls: true` (LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE): skip NULL values.
+- `orderBy` takes `{ col: { order, nulls } }` for NULLS FIRST / LAST.
+
+```js
+// Previous month's revenue, 0 for the first month; next customer with a known city
+{ $addFields: {
+    prevRev: { $window: { fn: "LAG", field: "rev", orderBy: { month: 1 }, default: 0 } },
+    nextCity: { $window: { fn: "LEAD", field: "city", orderBy: { id: 1 }, ignoreNulls: true, default: "-" } },
+    share: { $window: { fn: "RATIO_TO_REPORT", field: "rev", partitionBy: "region" } },
+} }
+```
 
 ### CTEs (Common Table Expressions)
 
@@ -1233,6 +1276,13 @@ console.log(sql);
 | `$count`        | `COUNT(*)`                            | `{ total: { $count: '*' } }`                                |
 | `$first`        | `MIN(col)` (first in group)           | `{ first: { $first: '$name' } }`                            |
 | `$last`         | `MAX(col)` (last in group)            | `{ last: { $last: '$name' } }`                              |
+| `$countDistinct` | `COUNT(DISTINCT col)`                | `{ n: { $countDistinct: '$customerId' } }`                  |
+| `$median`       | `MEDIAN(col)`                         | `{ med: { $median: '$amount' } }`                           |
+| `$stdDevPop` / `$stdDevSamp` | `STDDEV_POP` / `STDDEV_SAMP` | `{ sd: { $stdDevSamp: '$amount' } }`                        |
+| `$percentile`   | `PERCENTILE_CONT` / `PERCENTILE_DISC` | `{ p90: { $percentile: { input: '$amount', p: 0.9 } } }`    |
+| `$push`         | `JSON_ARRAYAGG` → JS array            | `{ ids: { $push: { input: '$id', orderBy: { id: 1 } } } }`  |
+| `$addToSet`     | `JSON_ARRAYAGG` → JS array, de-duplicated | `{ tags: { $addToSet: '$tag' } }`                       |
+| `$listAgg`      | `LISTAGG(col, sep) WITHIN GROUP (…)`  | `{ names: { $listAgg: { input: '$name', separator: ', ' } } }` |
 | `$concat`       | `col1 \|\| col2`                      | `{ full: { $concat: ['$first', '$last'] } }`                |
 | `$toUpper`      | `UPPER(col)`                          | `{ name: { $toUpper: '$name' } }`                           |
 | `$toLower`      | `LOWER(col)`                          | `{ name: { $toLower: '$name' } }`                           |

@@ -234,10 +234,26 @@ function buildOrderBy(sortSpec: Record<string, unknown> | null | undefined): str
   ) {
     return "";
   }
-  const parts = Object.entries(sortSpec).map(([col, dir]) => {
-    return `${quoteIdentifier(col)} ${dir === -1 ? "DESC" : "ASC"}`;
-  });
+  const parts = Object.entries(sortSpec).map(([col, dir]) => sortTerm(col, dir));
   return `ORDER BY ${parts.join(", ")}`;
+}
+
+/**
+ * One ORDER BY term. `dir` is 1 (ASC), -1 (DESC), or `{ order?: 1 | -1, nulls?: "first" | "last" }`
+ * for NULLS FIRST / LAST. Any other plain value keeps the historical meaning (ASC).
+ * `col` is taken as is (callers upper-case it when their stage does).
+ */
+function sortTerm(col: string, dir: unknown): string {
+  if (dir === null || typeof dir !== "object") return `${quoteIdentifier(col)} ${dir === -1 ? "DESC" : "ASC"}`;
+  const { order = 1, nulls } = dir as { order?: unknown; nulls?: unknown };
+  if (order !== 1 && order !== -1) throw new Error(MSG.SORT_INVALID(col, "order must be 1 or -1"));
+  let term = `${quoteIdentifier(col)} ${order === -1 ? "DESC" : "ASC"}`;
+  if (nulls !== undefined) {
+    const n = typeof nulls === "string" ? nulls.toUpperCase() : "";
+    if (n !== "FIRST" && n !== "LAST") throw new Error(MSG.SORT_INVALID(col, 'nulls must be "first" or "last"'));
+    term += ` NULLS ${n}`;
+  }
+  return term;
 }
 
 // ─── buildProjection ────────────────────────────────────────────
@@ -307,4 +323,4 @@ function buildProjection(projection: Record<string, unknown> | null | undefined)
   };
 }
 
-export { quoteIdentifier, bindSafe, convertTypes, rowToDoc, mergeBinds, renameBinds, inlineBinds, buildOrderBy, buildProjection };
+export { quoteIdentifier, bindSafe, convertTypes, rowToDoc, mergeBinds, renameBinds, inlineBinds, buildOrderBy, buildProjection, sortTerm };

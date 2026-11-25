@@ -132,6 +132,7 @@ class QueryBuilder {
     declare _projection: Record<string, unknown> | null;
     declare _skip: unknown;
     declare _limit: unknown;
+    declare _withTies: boolean;
     declare _sort: Record<string, unknown> | null;
     declare _conn: import("../db").DbConnection | null;
     declare db: import("../db").WrapperDb;
@@ -189,11 +190,15 @@ class QueryBuilder {
     /**
      * Limit the number of rows returned.
      * @param {number} n - Maximum number of rows
+     * @param {Object} [options]
+     * @param {boolean} [options.withTies] - FETCH FIRST n ROWS WITH TIES: also keep every row
+     *   tied with the n-th on the sort keys. Needs a sort().
      * @returns {QueryBuilder} this (for chaining)
      */
-    limit(n: number): QueryBuilder {
+    limit(n: number, options: { withTies?: boolean } = {}): QueryBuilder {
         this._checkTerminated();
         this._limit = _rowCount("QueryBuilder.limit", "limit", n);
+        this._withTies = options.withTies === true;
         return this;
     }
 
@@ -375,7 +380,11 @@ class QueryBuilder {
         const orderBy = this._sort ? ` ${buildOrderBy(this._sort)}` : "";
         let paging = "";
         if (this._skip != null) paging += ` OFFSET ${Number(this._skip)} ROWS`;
-        if (this._limit != null) paging += ` FETCH FIRST ${Number(this._limit)} ROWS ONLY`;
+        if (this._limit != null) {
+            // WITH TIES without ORDER BY silently returns exactly n rows: refuse it.
+            if (this._withTies && !orderBy) throw new Error(MSG.WITH_TIES_NEEDS_SORT("QueryBuilder.limit"));
+            paging += ` FETCH FIRST ${Number(this._limit)} ROWS ${this._withTies ? "WITH TIES" : "ONLY"}`;
+        }
         const where = whereClause ? ` ${whereClause}` : "";
 
         // pageByRowid ($lateralJoin): Oracle returns wrong rows for a LATERAL /
