@@ -178,15 +178,19 @@ describe("unit/adapter: driver loading and Oracle client environment", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mira-env-"));
     fs.writeFileSync(path.join(dir, ".env"), "# comment\n\nNOEQUALS\nMIRA_COMPILED_PROBE = yes\nAPP_DB_USERNAME=should-not-override\n");
     const cwd = process.cwd();
+    const userBefore = process.env.APP_DB_USERNAME;
     process.chdir(dir);
     try {
       delete process.env.MIRA_COMPILED_PROBE;
+      // The existing value is whatever this machine set (.env locally, the job env in CI).
+      process.env.APP_DB_USERNAME = "existing-user";
       const a = await loadAdapter(makeDriver(), { compiled: true });
       expect(process.env.MIRA_COMPILED_PROBE).toBe("yes");
-      expect(process.env.APP_DB_USERNAME).toBe("mira");
+      expect(process.env.APP_DB_USERNAME).toBe("existing-user");
       await a.closeAll();
     } finally {
       process.chdir(cwd);
+      process.env.APP_DB_USERNAME = userBefore;
       delete process.env.MIRA_COMPILED_PROBE;
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -617,5 +621,67 @@ describe("unit/adapter: stats and shutdown", () => {
   it("main stub adapter shuts down cleanly", async () => {
     await A.closeAll();
     await expect(A.withConnection("s_tx", async () => 1)).rejects.toThrow(/shutting down/);
+  });
+});
+
+describe("unit/adapter: Thick-mode safety (2.1)", () => {
+  const captureWarnings = async (fn: () => Promise<void>) => {
+    const real = logger.warning;
+    const seen: string[] = [];
+    (logger as { warning: unknown }).warning = (msg: unknown) => void seen.push(String(msg));
+    try {
+      await fn();
+    } finally {
+      (logger as { warning: unknown }).warning = real;
+    }
+    return seen;
+  };
+  const withEnv = async (vars: Record<string, string | undefined>, fn: () => Promise<void>) => {
+    const before = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+    for (const [k, v] of Object.entries(vars)) v === undefined ? delete process.env[k] : (process.env[k] = v);
+    try {
+      await fn();
+    } finally {
+      for (const [k, v] of Object.entries(before)) v === undefined ? delete process.env[k] : (process.env[k] = v);
+    }
+  };
+
+  it("sets ORA_SDTZ=+00:00 before the client loads, unless it is already set", async () => {
+    await withEnv({ ORA_SDTZ: undefined }, async () => {
+      await loadAdapter(makeDriver());
+      expect(process.env.ORA_SDTZ).toBe("+00:00");
+    });
+    await withEnv({ ORA_SDTZ: "  " }, async () => {
+      await loadAdapter(makeDriver());
+      expect(process.env.ORA_SDTZ).toBe("+00:00");
+    });
+    await withEnv({ ORA_SDTZ: "-05:00" }, async () => {
+      await loadAdapter(makeDriver());
+      expect(process.env.ORA_SDTZ).toBe("-05:00");
+    });
+  });
+
+  it("warns when a Thick-mode pool can outgrow UV_THREADPOOL_SIZE; never in Thin mode", async () => {
+    const run = async (driver: unknown, uv: string | undefined) =>
+      captureWarnings(() =>
+        withEnv({ UV_THREADPOOL_SIZE: uv }, async () => {
+          const a = await loadAdapter(driver);
+          register("s_threads", { stats: { poolMax: 10 } });
+          await a.withConnection("s_threads", async () => 1);
+          await a.closeAll();
+        }),
+      );
+    const thick = () => makeDriver({ oracleClientVersion: 1906000000 });
+    const unset = await run(thick(), undefined);
+    expect(unset.filter((w) => w.includes("UV_THREADPOOL_SIZE"))).toEqual([
+      'Pool "s_threads" can open 10 connections, but Thick mode runs each call on one of 4 worker threads (UV_THREADPOOL_SIZE not set; Node\'s default is 4). Calls waiting on row locks can hold every thread and hang the process: set UV_THREADPOOL_SIZE=10 or more before the process starts.',
+    ]);
+    const small = await run(thick(), "6");
+    expect(small.filter((w) => w.includes("UV_THREADPOOL_SIZE"))).toEqual([
+      'Pool "s_threads" can open 10 connections, but Thick mode runs each call on one of 6 worker threads (UV_THREADPOOL_SIZE). Calls waiting on row locks can hold every thread and hang the process: set UV_THREADPOOL_SIZE=10 or more before the process starts.',
+    ]);
+    expect((await run(thick(), "10")).filter((w) => w.includes("UV_THREADPOOL_SIZE"))).toEqual([]);
+    expect((await run(thick(), "junk")).some((w) => w.includes("not set; Node's default is 4"))).toBe(true);
+    expect((await run(makeDriver(), undefined)).filter((w) => w.includes("UV_THREADPOOL_SIZE"))).toEqual([]);
   });
 });

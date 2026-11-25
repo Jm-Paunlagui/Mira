@@ -21,6 +21,13 @@ Oracle Database
 - [Setup](#setup)
     - [Prerequisites — Database Configuration](#prerequisites--database-configuration)
     - [Imports & Connection](#imports--connection)
+    - [Typed Tables (2.1)](#typed-tables-21)
+    - [Relations and include (2.1)](#relations-and-include-21)
+    - [JSON Columns (2.1)](#json-columns-21)
+    - [Timestamps, Soft Delete, Hooks and Validation (2.1)](#timestamps-soft-delete-hooks-and-validation-21)
+    - [Optimistic Locking (2.1)](#optimistic-locking-21)
+    - [Keyset Paging, Streaming, Raw SQL and Query Events (2.1)](#keyset-paging-streaming-raw-sql-and-query-events-21)
+    - [Migrations (2.1)](#migrations-21)
 - [Basic — Your First Queries](#-basic--your-first-queries)
 - [Medium — Filtering, Updating & Chaining](#-medium--filtering-updating--chaining)
 - [Hard — Aggregation, Transactions & Joins](#-hard--aggregation-transactions--joins)
@@ -33,9 +40,28 @@ Oracle Database
 
 ## Setup
 
+Mira runs on **Node.js 20+** and on **Bun 1.4+**. Install it from npm (it brings `oracledb`):
+
 ```bash
-bun add oracledb  # peer dependency — should already be in parent project
+npm install @jm-paunlagui/mira    # or: bun add @jm-paunlagui/mira
 ```
+
+```js
+const { createDb, OracleCollection } = require("@jm-paunlagui/mira"); // CommonJS
+// import { createDb, OracleCollection } from "@jm-paunlagui/mira";   // TypeScript / ESM
+```
+
+The package ships compiled JavaScript with `.d.ts` types, so editors and `tsc` type-check your calls.
+
+**Loading `.env`.** Bun reads `.env` by itself. Node does not: start it with `node --env-file=.env app.js` (Node 20.6+), or call `require("dotenv").config()` before you first use Mira. Mira reads `DB_*` / `APP_DB_*` from `process.env` when a pool is first created.
+
+**Thin or Thick mode.** Mira tries node-oracledb Thick mode first, from `ORACLE_INSTANT_CLIENT` or any Oracle Client on the system library path, and falls back to Thin mode. The startup log says which loaded. Both modes are tested in CI.
+
+> ⚠️ **Thick mode needs enough worker threads.** In Thick mode every database call runs on a native worker thread from a small pool (`UV_THREADPOOL_SIZE`; Node's default is 4, and Bun's depends on the machine: a 4-core GitHub runner hung where a 12-core PC did not). A call waiting on a row lock keeps its thread. If more calls wait at once than there are threads, the transaction holding the lock never gets a thread to commit, and the process hangs with no error. Set `UV_THREADPOOL_SIZE` to at least your largest `poolMax` (Mira's default `APP_POOL_MAX` is 20) **in the environment before the process starts**, e.g. `UV_THREADPOOL_SIZE=24 node app.js`. Setting it in code after startup has no effect. Thin mode does not use these threads. When Thick mode creates a pool whose `poolMax` is above the thread count, Mira logs a warning naming both numbers.
+
+**Session time zone.** Mira opens every session at UTC (`ORA_SDTZ=+00:00`, set before the Oracle client loads) in both modes. Thin mode does this by itself. In Thick mode the client used the operating system's zone, and a JS `Date` written to a `TIMESTAMP WITH TIME ZONE` or `TIMESTAMP WITH LOCAL TIME ZONE` column moved by that zone's offset. `CURRENT_TIMESTAMP` and `LOCALTIMESTAMP` in your own SQL are therefore UTC; `SYSTIMESTAMP` / `SYSDATE` (the database server's clock) are unchanged. To choose another session zone, set `ORA_SDTZ` yourself. Use a numeric offset such as `+08:00`: a region name such as `Asia/Manila` needs the client's time-zone file, and an older client on a newer server fails with `ORA-01805`.
+
+Working from a clone of this repository instead, `bun run build` writes the same package to `dist/`.
 
 ### Prerequisites — Database Configuration
 
@@ -173,13 +199,360 @@ const {
     withCTE,
     withRecursiveCTE,
     createPerformance,
-} = require("./oracle-mongo-wrapper");
+} = require("@jm-paunlagui/mira");
 
 // Connect to your database pool (configured in src/config/database.ts)
 const db = createDb("appDb");
 ```
 
 That's it. `db` is your gateway to everything.
+
+### Typed Tables (2.1)
+
+Describe a table once and TypeScript checks every query on it: filter keys and values, inserts, updates, sorts and projections. The row types follow what Mira really returns.
+
+```ts
+import { defineTable, t, createDb, Transaction } from "@jm-paunlagui/mira";
+
+export const Orders = defineTable("ORDERS", {
+    ID: t.id(),                                   // NUMBER identity PK: Oracle assigns it
+    CUSTOMER_ID: t.number().references("CUSTOMERS", "ID"),
+    TOTAL: t.money(),                             // NUMBER(19,4): read as an exact string
+    NOTE: t.text(400).nullable(),
+    STATUS: t.text(10).default("'open'"),
+    CREATED_AT: t.timestamp().default("SYSTIMESTAMP"),
+});
+export type Order = typeof Orders.$row;          // { ID: number; TOTAL: string; NOTE: string | null; … }
+
+const db = createDb("appDb");
+const orders = Orders.on(db);                    // a typed collection (the same OracleCollection underneath)
+
+await orders.insertOne({ CUSTOMER_ID: 7, TOTAL: 9.5 });      // ID, NOTE, STATUS, CREATED_AT may be left out
+const big = await orders.find({ TOTAL: { $gt: 100 }, NOTE: null })
+    .sort({ CREATED_AT: -1 })
+    .project({ ID: 1, TOTAL: 1 })                // → { ID: number; TOTAL: string }[]
+    .toArray();
+await orders.updateOne({ ID: 1 }, { $set: { STATUS: "paid" } });
+
+// orders.find({ TOTL: 1 })                      ✗ compile error: no column TOTL
+// orders.insertOne({ ID: 5, … })                ✗ compile error: ID is an identity column
+
+await new Transaction(db).withTransaction(async (session) => {
+    await Orders.on(session).insertOne({ CUSTOMER_ID: 7, TOTAL: "12.00" }); // typed inside a transaction too
+});
+
+await Orders.create(db);                         // CREATE TABLE from the definition (Orders.ddl() is the column spec)
+```
+
+**Column builders (`t`):**
+
+| Builder | Oracle type | Read as | Write takes |
+| --- | --- | --- | --- |
+| `t.id()` | `NUMBER` identity primary key | `number` | — (Oracle assigns it) |
+| `t.number()`, `t.number(p)` | `NUMBER`, `NUMBER(p)` | `number` | `number` |
+| `t.money()`, `t.decimal(p, s)`, `t.number(p, s)` with `s > 0` | `NUMBER(19,4)`, `NUMBER(p,s)` | exact `string` | `string \| number` |
+| `t.text(n)`, `t.text(n, "char")`, `t.char(n)` | `VARCHAR2(n [CHAR])`, `CHAR(n)` | `string` | `string` |
+| `t.clob()`, `t.blob()` | `CLOB`, `BLOB` | `string`, `Buffer` | same |
+| `t.date()`, `t.timestamp(p?)`, `t.timestampTz(p?)` | `DATE`, `TIMESTAMP`, `TIMESTAMP WITH TIME ZONE` | `Date` | `Date` |
+| `t.raw<T>("BINARY_DOUBLE")` | any type text | `T` | `T` |
+
+Modifiers: `.nullable()` (reads may be `null`, inserts may leave it out), `.default(sql)` (inserts may leave it out), `.primaryKey()`, `.check(sql)`, `.references(table, column)`, `.identity()` / `.identityByDefault()`. `default`, `check` and `raw` take SQL text: trusted code only, as with `createTable`. Oracle allows one identity column per table, and `defineTable` checks it.
+
+**The typed layer is compile-time only.** `on()` returns the ordinary `OracleCollection`, so every behaviour and error is exactly the untyped API's. Pipelines (`aggregate`) have their own output shape: name it, `orders.aggregate<{ STATUS: string; N: number }>([…])`. For anything the typed signatures do not cover, `.untyped` gives the 2.0 signatures: `orders.untyped.find({ … })`, `orders.find().untyped.project({ X: { $subquery: … } })`.
+
+**Generate definitions for existing tables** from Oracle's catalogue (column types, NOT NULL, defaults, identity columns, primary keys, single-column foreign keys):
+
+```bash
+npx mira generate types --out src/db/tables.ts                 # every table in the schema
+npx mira generate types --tables ORDERS,CUSTOMERS,SIM_%         # names, or LIKE patterns with %
+bun run mira generate types --import ../my-mira-path            # in this repository
+```
+
+The command reads `DB_*` / `APP_DB_*` from the environment or from `.env` (`--env <file>` to pick another), and writes one `defineTable()` and one `…Row` type per table. In code: `await generateTableTypes(db, { tables, importFrom })` returns the same source text. CHECK constraints and multi-column keys are not written; they do not change the row types.
+
+### Relations and include (2.1)
+
+Declare how typed tables relate, once every table exists, then fetch related rows **in the same statement**: no extra query per row.
+
+```ts
+import { defineTable, t, relations, hasMany, hasOne, belongsTo } from "@jm-paunlagui/mira";
+
+export const Customers = defineTable("CUSTOMERS", { ID: t.id(), NAME: t.text(60) });
+export const Orders = defineTable("ORDERS", { ID: t.id(), CUSTOMER_ID: t.number(), TOTAL: t.money() });
+
+export const CustomersR = relations(Customers, {
+    orders: hasMany(Orders, { foreignKey: "CUSTOMER_ID" }),   // ORDERS.CUSTOMER_ID = CUSTOMERS.ID
+    biggest: hasOne(Orders, { foreignKey: "CUSTOMER_ID" }),
+});
+export const OrdersR = relations(Orders, {
+    customer: belongsTo(Customers, { foreignKey: "CUSTOMER_ID" }), // ORDERS.CUSTOMER_ID = CUSTOMERS.ID
+});
+
+const rows = await CustomersR.on(db)
+    .find({ NAME: { $like: "A%" } })
+    .include("orders", { where: { TOTAL: { $gt: 100 } }, sort: { TOTAL: -1 }, limit: 5 })
+    .include("biggest", { sort: { TOTAL: -1 } })
+    .toArray();
+// rows[0].orders:  { ID: number; CUSTOMER_ID: number; TOTAL: string }[]
+// rows[0].biggest: { ID: number; CUSTOMER_ID: number; TOTAL: string } | null
+
+const o = await OrdersR.on(db).find({ ID: 7 }).project({ ID: 1 }).include("customer").next();
+// o.customer: { ID: number; NAME: string } | null
+```
+
+| Relation | Key | `include()` gives | Options |
+| --- | --- | --- | --- |
+| `hasMany(Target, { foreignKey, localKey? })` | `Target.foreignKey = this.localKey` (default: this table's primary key) | an array (`[]` when none) | `where`, `sort`, `limit` |
+| `hasOne(Target, { foreignKey, localKey? })` | same | the first row by `sort`, or `null` | `where`, `sort` |
+| `belongsTo(Target, { foreignKey, references? })` | `this.foreignKey = Target.references` (default: its primary key) | the row, or `null` | `where` |
+
+- **One statement.** Each included relation is a correlated subquery in the SELECT list, built with `JSON_ARRAYAGG` / `JSON_OBJECT`. `limit` keeps the first n related rows **per parent row**.
+- **Related rows keep Mira's types.** Money and decimals are the same exact text as at top level, `DATE` / `TIMESTAMP` columns are `Date`, and CLOB is a string. BLOB and RAW columns are left out, because JSON has no binary type. Read them with a separate query.
+- **It combines** with filters, `sort`, `skip`, `limit`, `project` (on the parent's columns), `forEach`, `next`, `await`, and `on(session)` in transactions.
+- `relations()` returns the same table with relations attached: `name`, `columns`, `ddl()`, `create()` and `on()` are unchanged. Declaring relations apart from the tables lets two tables point at each other, and keeps generated table files as they are.
+- Only one level of nesting is supported: an included row cannot include further relations yet.
+
+### JSON Columns (2.1)
+
+Store documents in Oracle and query them the MongoDB way: dotted paths, `$elemMatch`, `$push` / `$pull`.
+
+```ts
+type Prefs = { lounge: boolean; drinks: string[]; addr?: { city: string } };
+export const Members = defineTable("MEMBERS", {
+    ID: t.id(),
+    NAME: t.text(60),
+    PREFS: t.json<Prefs>(),                       // CLOB with an IS JSON check (Oracle 19c+)
+    // or t.json<Prefs>({ native: true })          // the JSON type (Oracle 23ai; Thin mode or Oracle Client 21c+)
+});
+const members = Members.on(db);
+
+await members.insertOne({ NAME: "Ana", PREFS: { lounge: true, drinks: ["tea"] } }); // written as JSON
+const vips = await members.find({ "PREFS.lounge": true, "PREFS.addr.city": { $in: ["Cebu", "Davao"] } }).toArray();
+vips[0].PREFS.drinks;                                                                 // read back as a document: string[]
+
+await members.find({ "PREFS.drinks": { $elemMatch: { $eq: "tea" } } });             // an element that matches
+await members.updateOne({ ID: 1 }, {
+    $set: { "PREFS.addr.city": "Cebu" },                                              // missing objects are created
+    $unset: { "PREFS.lounge": 1 },
+    $push: { "PREFS.drinks": { $each: ["water", "coffee"] } },
+});
+await members.updateOne({ ID: 1 }, { $pull: { "PREFS.drinks": { $in: ["coffee"] } } });
+
+// One row per array element, joined to its row
+await members.aggregate([
+    { $jsonTable: { column: "PREFS", path: "drinks", ordinality: "POS", columns: { DRINK: "$" } } },
+    { $group: { _id: "$DRINK", N: { $count: "*" } } },
+]);
+```
+
+**Filters on a path** (`"COL.a.b"`, `"COL.items.0.sku"`): `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$in` `$nin` `$between` `$exists`, `null` (missing or null), and `$elemMatch`.
+- A path compares as a number, a date or text depending on the value you give: `JSON_VALUE(… RETURNING NUMBER | TIMESTAMP WITH TIME ZONE | VARCHAR2)`.
+- `$elemMatch` takes element fields (`{ sku: "X", qty: { $gt: 2 } }`) or, for arrays of plain values, operators on the element itself (`{ $eq: "tea" }`). It becomes `JSON_EXISTS` with every value bound.
+
+**Updates on a path:**
+- `$set` and `$unset` on paths become one `JSON_MERGEPATCH` per column, and missing objects are created.
+- `$push` (a value, or `{ $each: [...] }`) and `$pull` (a value, or `{ $in: [...] }`) rebuild the array with `JSON_TABLE`; pulling every element leaves `[]`.
+- A key without a dot (`{ $push: { TAGS: "x" } }`) works on a column that holds an array.
+- `$set` of `null` on a path is refused: under merge-patch rules it would delete the key, so use `$unset`. Paths through an array index (`"COL.items.0.qty"`) can't be updated; replace the array, or `$push` / `$pull` it.
+
+**`$jsonTable`** `{ column, path, columns: { NAME: "path" | { path, type } }, ordinality?, outer? }`: one row per element of the array at `path`, joined to its source row.
+- `"$"` as a column's path is the element itself.
+- `type` is `NUMBER[(p[,s])]`, `VARCHAR2(n)` (the default is `VARCHAR2(4000)`), `DATE`, `TIMESTAMP[(n)] [WITH TIME ZONE]`, `CLOB` or `JSON`.
+- `outer: true` keeps rows whose array is empty or missing.
+
+**Typed tables:**
+- A `t.json<T>()` column is read and written as `T`: `find`, `findOne`, `next`, `forEach`, `await`, and inside `include()`.
+- Dotted paths must start with a known column (the rest of the path isn't checked), and `$elemMatch` is only accepted on JSON columns.
+- `mira generate types` writes `t.json()` for a CLOB with an `IS JSON` check, and `t.json({ native: true })` for the JSON type.
+
+**Notes:**
+- Filters and updates on paths also work through the untyped API.
+- The untyped API keeps returning JSON columns as the **stored text**, as in 2.0, so code written for 2.0 is unaffected.
+- All the SQL uses functions Oracle 19c has (no `JSON_TRANSFORM`), so it runs on 19c and 23ai, for JSON text and for the JSON type.
+- **The native JSON type needs Thin mode or Oracle Client 21c+.** A 19c client can't read it (`ORA-40569`), and a write can break the session (`ORA-03106`). `Table.on(db)` refuses a native column on a 19.x Thick client, and says so. The JSON type itself needs Oracle Database 21c+: on 19c, `create()` refuses it before Oracle answers `ORA-00902`.
+- A filter key containing a dot is now always a JSON path. A column whose name itself contains a dot can't be filtered by name.
+
+### Timestamps, Soft Delete, Hooks and Validation (2.1)
+
+A typed table can ask Mira to maintain timestamps, delete softly, run hooks around writes, and check writes against its columns:
+
+```ts
+import { defineTable, t, MiraValidationError } from "@jm-paunlagui/mira";
+
+const AuditLog = defineTable("AUDIT_LOG", { ID: t.id(), WHAT: t.text(200) });
+const Members = defineTable("MEMBERS", {
+  ID: t.number(10).primaryKey(),
+  NAME: t.text(40),
+  POINTS: t.number(9),
+  JOINED_AT: t.createdAt(),     // TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP
+  CHANGED_AT: t.updatedAt(),    // the same, and every update sets it
+  REMOVED_AT: t.deletedAt(),    // soft delete
+}, {
+  validate: true,
+  hooks: {
+    beforeInsert: (doc) => ({ ...doc, NAME: doc.NAME.trim() }),
+    afterDelete: async (result, filter, ctx) => {
+      await AuditLog.on(ctx).insertOne({ WHAT: `removed ${JSON.stringify(filter)}` }); // same transaction
+    },
+  },
+});
+
+const members = Members.on(db);
+await members.insertOne({ ID: 1, NAME: " Ana ", POINTS: 0 });   // NAME "Ana"; JOINED_AT and CHANGED_AT stamped by Oracle
+await members.updateOne({ ID: 1 }, { $inc: { POINTS: 10 } });     // CHANGED_AT = SYSTIMESTAMP
+await members.deleteOne({ ID: 1 });                               // sets REMOVED_AT; the row stays
+await members.find().toArray();                                   // skips removed members
+await members.withDeleted().find().toArray();                     // sees them
+await members.restore({ ID: 1 });                                 // clears REMOVED_AT
+await members.deleteOne({ ID: 1 }, { force: true });              // a real DELETE
+await members.insertOne({ ID: 2, NAME: "x".repeat(50), POINTS: 1.5 });
+// MiraValidationError: [MEMBERS] insert is not valid: NAME is 50 bytes long; VARCHAR2(40) allows 40; POINTS must be a whole number, got 1.5.
+```
+
+**Timestamps:** `t.createdAt()` and `t.updatedAt()` are `TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL`, so Oracle's clock stamps them and they read back as the exact instant. An insert may still give a value (an import, for example). Every update through the collection sets the `t.updatedAt()` column with `$currentDate`, unless the update sets that column itself.
+
+**Soft delete:** with a `t.deletedAt()` column (nullable, one per table):
+- `deleteOne`, `deleteMany` and `findOneAndDelete` set the column to `SYSTIMESTAMP`. `deletedCount` counts the rows marked, and a row already marked is not counted again.
+- `find`, `findOne`, `countDocuments`, `distinct`, `aggregate`, the updates and the deletes skip marked rows. A filter that names the column itself (`{ REMOVED_AT: { $ne: null } }`) is left as it is.
+- `include()` leaves out marked rows of a soft-deleting related table.
+- `withDeleted()` gives the same collection with marked rows visible. `restore(filter)` clears the mark; it is an update, so `updatedAt` and the update hooks apply.
+- `{ force: true }` on a delete removes rows for real. A soft `deleteMany` has no `limit`.
+
+**Hooks** run around writes through the collection: `beforeInsert`, `afterInsert`, `beforeUpdate`, `afterUpdate`, `beforeDelete`, `afterDelete`.
+- A before-hook may return a changed document or update (or nothing, to keep it) and may throw to stop the write. It runs before validation, so it can fill in a column.
+- The last argument, `ctx`, works like a transaction session: `Table.on(ctx)` or `ctx.collection(name)` is a table on the same connection, so inside `withTransaction` the hook's writes commit or roll back with the rest. `ctx.self` is the collection itself.
+- `insertMany` calls the insert hooks once per document. `bulkWrite` runs each operation through the wrapped methods, so their hooks run too.
+
+**Validation** (`validate: true`) checks every insert and update before any SQL and lists every problem in one `MiraValidationError` (`err.issues` is `{ column, message }[]`):
+- unknown columns, values for identity columns, required columns left out, `null` (or `$unset`) for a column that is not nullable
+- numbers for `NUMBER` (whole numbers when the scale is 0), a decimal string or number for money and decimals, and the digits before the decimal point within the precision
+- strings within `VARCHAR2(n)` / `CHAR(n)` in UTF-8 bytes, or in characters for `t.text(n, "char")`
+- `Date` for dates and timestamps, `Buffer` for BLOB and RAW
+- JSON documents and `t.raw()` types are left to Oracle.
+
+**Notes:**
+- `replaceOne` and `findOneAndReplace` on such a table become a `$set` of every given column except the primary key, so `updatedAt`, hooks and validation apply.
+- These behaviours belong to the collection's `find`, `findOne`, `countDocuments`, `distinct`, `aggregate`, inserts, updates, replaces, deletes and `findOneAnd*`. Statements that work on many rows at once or on other tables (`merge`, `mergeFrom`, `bulkUpdateByKeys`, `updateFromJoin`, `insertFromQuery`, `connectBy`, `pivot`, raw SQL) are 2.0's and do none of this.
+- A typed table without any of these features still gets a plain `OracleCollection` from `on()`.
+
+### Optimistic Locking (2.1)
+
+A `t.version()` column stops two people who read the same row from silently overwriting each other:
+
+```ts
+import { defineTable, t, MiraConcurrencyError } from "@jm-paunlagui/mira";
+
+const Docs = defineTable("DOCS", { ID: t.number(10).primaryKey(), TITLE: t.text(80), VERSION: t.version() });
+const docs = Docs.on(db);
+
+const doc = await docs.findOne({ ID: 1 });                        // { ID: 1, TITLE: "…", VERSION: 3 }
+try {
+  await docs.updateOne({ ID: doc.ID, VERSION: doc.VERSION }, { $set: { TITLE: "New title" } }); // VERSION becomes 4
+} catch (err) {
+  if (err instanceof MiraConcurrencyError) {
+    // Someone saved in between: err.expectedVersion 3, err.currentVersion 4. Re-read and try again.
+  }
+}
+```
+
+- `t.version()` is `NUMBER(10) DEFAULT 1 NOT NULL`. Every update through the collection adds 1 (`$inc`), unless the update sets the column itself. A replacement never sets it.
+- **The check:** `updateOne`, `findOneAndUpdate`, `replaceOne`, `findOneAndReplace`, `deleteOne` and `findOneAndDelete` with a filter that gives the version as a plain number. When such a write matches nothing but the row (the filter without the version) is still there, it changed since it was read, so Mira throws `MiraConcurrencyError` instead of returning a count of 0. When the row is gone, the result is the usual 0.
+- `updateMany` / `deleteMany` are not checked: they are not about one row read earlier.
+- `upsert` with a version in the filter is refused, since a stale version would insert a second row.
+
+**Errors in transactions:** `MiraConcurrencyError` and `MiraValidationError` are *operational* (`isOperational: true`, `statusCode` 409 and 422). Inside `withTransaction` they reach your code with their own class instead of being wrapped as a database failure, and they aren't logged as critical.
+
+### Keyset Paging, Streaming, Raw SQL and Query Events (2.1)
+
+**Keyset pagination: `after()`.** Continue after the previous page's last row, in the order of `sort()`. Unlike `skip()`, Oracle seeks straight to the page, and rows added or removed meanwhile don't shift it.
+
+```ts
+const page1 = await orders.find().sort({ TOTAL: -1, ID: 1 }).limit(20).toArray();
+const page2 = await orders.find().sort({ TOTAL: -1, ID: 1 }).after(page1.at(-1)).limit(20).toArray();
+// … WHERE ((t0."TOTAL" < :after_0) OR (t0."TOTAL" = :after_0 AND t0."ID" > :after_1)) ORDER BY … FETCH FIRST 20 ROWS ONLY
+```
+- The cursor is the last row, or just its sort-key values. Every sort key must be present and not null.
+- End the sort with a unique column (the primary key) so no two rows tie.
+- Without a `sort()` it throws, since there is no order to continue in.
+
+**Streaming: `for await`.** A query can be iterated directly. Rows are streamed (constant memory, like `forEach`) on one connection, which goes back to the pool when the loop ends, `break`s or throws. Inside a transaction, the session's connection is used.
+
+```ts
+for await (const order of orders.find({ STATUS: "open" }).sort({ ID: 1 })) {
+  if (!(await ship(order))) break;
+}
+```
+
+**Raw SQL: the ``sql`…` `` tag.** For the statement the API doesn't cover. Every interpolated value becomes a bind, so a value can never change the statement:
+
+```ts
+import { sql } from "@jm-paunlagui/mira";
+
+const rows = await sql`
+  SELECT STORE_ID, SUM(TOTAL) AS TOTAL FROM ${sql.ident("ORDERS")}
+   WHERE STORE_ID IN (${storeIds}) AND TOTAL >= ${min}
+   GROUP BY STORE_ID`.rows<{ STORE_ID: number; TOTAL: string }>(db);
+// … WHERE STORE_ID IN (:p0, :p1) AND TOTAL >= :p2 …
+
+const { rowsAffected } = await sql`UPDATE ORDERS SET STATUS = ${"closed"} WHERE ID = ${id}`.execute(session);
+```
+- An array becomes a list of binds (for `IN`). An empty array is refused, because `IN ()` is not SQL.
+- `sql.ident("T")` / `sql.ident("t", "COL")` splices a quoted identifier, after checking it is a plain name.
+- A nested ``sql`…` `` fragment is spliced from its parts and its binds join the statement. Its text is never re-parsed.
+- `undefined`, functions and plain objects are refused (pass `null` for SQL NULL).
+- `.rows(target)` returns the rows. `.execute(target)` returns `{ rows, rowsAffected }` and commits outside a transaction. `target` is the db handle, a transaction session, or a hook's `ctx`.
+
+**Query events: `onQuery()`.** A callback after every statement, for slow-query logs or metrics:
+
+```ts
+import { onQuery } from "@jm-paunlagui/mira";
+
+const stop = onQuery((e) => {
+  if (e.durationMs > 500) logger.warning(`slow ${e.operation} (${e.durationMs} ms, ${e.bindCount} binds): ${e.sql}`);
+});
+stop(); // unsubscribe
+```
+- It is built on node-oracledb's trace handler, so it sees every `execute` / `executeMany`: Mira's own statements, ``sql`…` ``, and your own `conn.execute()` calls.
+- Each event has `operation`, `sql`, `bindCount`, `batchSize` (executeMany), `durationMs`, `rowCount`, `rowsAffected` and `error`. **Bind values are never included**, since they may hold passwords or personal data.
+- oracledb allows one trace handler per process. If one is already installed (for example OpenTelemetry's oracledb instrumentation), Mira's handler passes every hook on to it, so spans keep working. When the last listener unsubscribes, the earlier handler is put back.
+- A listener that throws is ignored, so an event never breaks a query.
+
+### Migrations (2.1)
+
+Versioned schema changes, one file each, applied in name order and recorded in a history table.
+
+```bash
+npx mira migrate new create_orders      # → migrations/20261125070809_create_orders.ts
+npx mira migrate status                 # applied / pending / changed / missing
+npx mira migrate up --dry-run           # print the SQL each pending migration would run; change nothing
+npx mira migrate up                     # apply every pending migration (or --to <name>)
+npx mira migrate down                   # roll back the newest one (--steps n, --to <name>, --all)
+```
+
+```ts
+// migrations/20261125070809_create_orders.ts
+import type { MigrationContext } from "@jm-paunlagui/mira";
+import { Orders } from "../src/db/tables";        // a defineTable() definition
+
+export async function up({ createTable, collection, schema, execute }: MigrationContext) {
+    await createTable(Orders);
+    await collection("ORDERS").createIndex({ CUSTOMER_ID: 1 });
+}
+
+export async function down({ schema }: MigrationContext) {
+    await schema.dropTable("ORDERS");
+}
+```
+
+The context gives `schema` (an `OracleSchema`: `createTable`, `alterTable`, `dropTable`, `createView`, `createSequence` …), `collection(name)` (indexes, seed data), `createTable(definition)`, `execute(sql, binds)` for anything else, `db`, and `dryRun`.
+
+- **History.** Each applied migration is a row in `MIRA_MIGRATIONS`: name, SHA-256 checksum of the file, batch (one per `up` run), applied-at time and duration. If an applied file **changes** or is **deleted**, `status` reports it (and exits 1) and `up` refuses to run. The code no longer describes the database, so restore the file or fix the history by hand.
+- **Order.** Pending migrations run in name order, which is why file names start with a UTC timestamp. One merged from another branch that sorts before already-applied ones still runs.
+- **Lock.** A run holds a row lock on `MIRA_MIGRATIONS_LOCK` for its whole length, so a second deployment migrating at the same time fails at once with "another migration run holds the lock". Oracle frees the lock if the process dies; no extra grant is needed.
+- **⚠️ Oracle DDL is not transactional.** Every DDL statement commits by itself, so a migration that fails halfway cannot be undone automatically. Its history row is written only when it succeeds, and the error names it and says so. Fix the schema by hand, then run `up` again. Keep each migration small.
+- **Dry run.** `--dry-run` runs every migration against a recording connection: the SQL is printed and nothing reaches the database (reads inside a migration see no rows).
+- **In code.** `createMigrator(db, { dir: "migrations" })` (or `{ migrations: [{ name, up, down }] }`) returns `{ up, down, status, list }`; `{ table }` renames the history table.
+- **Node.** `.ts` migration files load under Bun, and under Node where it strips types (22.18+, 23.6+). Otherwise write them as `.js` / `.mjs`. Migrations live in your repository, so the command reads them from `--dir` (default `./migrations`).
 
 ---
 
@@ -368,7 +741,9 @@ const results = await users
     .toArray(); // Execute and return rows
 ```
 
-**Sort direction:** `1` = ascending (A→Z, 0→9), `-1` = descending (Z→A, 9→0)
+**Sort direction:** `1` = ascending (A→Z, 0→9), `-1` = descending (Z→A, 9→0). To place NULLs, give an object: `{ city: { order: 1, nulls: "first" } }` → `ORDER BY "city" ASC NULLS FIRST` (`nulls`: `"first"` or `"last"`). The same form works in a pipeline `$sort`, a window's `orderBy` and an accumulator's `orderBy`.
+
+**Ties:** `.sort({ score: -1 }).limit(3, { withTies: true })` → `FETCH FIRST 3 ROWS WITH TIES`: rows tied with the third on the sort keys are kept too. It needs a `sort()`; without one Oracle would silently return exactly 3 rows, so Mira throws.
 
 **Projection:** `{ name: 1, email: 1 }` = include only name and email. `{ password: 0 }` = exclude password, include everything else.
 
@@ -500,7 +875,7 @@ const report = await orders.aggregate([
 | `$project`   | `SELECT col1, col2`       | Pick/rename/compute columns             |
 | `$addFields` | `SELECT *, newCol`        | Add new columns, keep existing ones     |
 | `$sort`      | `ORDER BY`                | Sort results                            |
-| `$limit`     | `FETCH FIRST N ROWS ONLY` | Limit row count                         |
+| `$limit`     | `FETCH FIRST N ROWS ONLY` | Limit row count. `{ $limit: { n: 3, withTies: true } }` right after a `$sort` keeps ties (`WITH TIES`) |
 | `$skip`      | `OFFSET N ROWS`           | Skip rows                               |
 | `$count`     | `SELECT COUNT(*) AS name` | Count rows                              |
 | `$lookup`    | `JOIN`                    | Join another table                      |
@@ -528,6 +903,32 @@ await orders.aggregate([
     { $sort: { totalSpent: -1 } },
 ]);
 ```
+
+**Statistics and lists (2.1).** Each takes a column (`"$amount"`), an expression, or an options object with `input`:
+
+```js
+await orders.aggregate([
+    {
+        $group: {
+            _id: "$region",
+            customers: { $countDistinct: "$customerId" }, // COUNT(DISTINCT customerId)
+            medianTicket: { $median: "$amount" }, // MEDIAN(amount)
+            spread: { $stdDevSamp: "$amount" }, // STDDEV_SAMP (also $stdDevPop)
+            p90: { $percentile: { input: "$amount", p: 0.9 } }, // PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY amount)
+            p10p90: { $percentile: { input: "$amount", p: [0.1, 0.9] } }, // a list of p → a JS array [p10, p90]
+            p90disc: { $percentile: { input: "$amount", p: 0.9, method: "discrete" } }, // PERCENTILE_DISC
+            receipts: { $push: { input: "$receiptNo", orderBy: { receiptNo: 1 } } }, // JS array, NULLs kept
+            products: { $addToSet: "$product" }, // JS array, each value once
+            productList: { $listAgg: { input: "$product", separator: ", ", distinct: true } }, // one string (LISTAGG)
+        },
+    },
+]);
+```
+
+- `$push` / `$addToSet` are built with `JSON_ARRAYAGG(… RETURNING CLOB)` and come back from `aggregate()` as **JS arrays**, like MongoDB. `$push` keeps NULLs; `$addToSet` keeps the first of each value (19c's `JSON_ARRAYAGG` has no `DISTINCT`). Numbers in them are JS numbers, so money in an array is not the exact string a money column gives.
+- The arrays are parsed for the pipeline's final output. A later stage that renames or recomputes the column gets the JSON text.
+- `$listAgg` options: `separator` (default `","`, bound), `distinct`, `orderBy` (default: the value). The result is one string, limited by Oracle's VARCHAR2 size (4000 bytes unless `MAX_STRING_SIZE = EXTENDED`).
+- `$percentile`: `p` is a number from 0 to 1 or a list of them; `method` is `"continuous"` (default, interpolated) or `"discrete"` (an actual value).
 
 ### $having — Filter After Grouping
 
@@ -816,15 +1217,30 @@ await orders.aggregate([
 | `LAST_VALUE`                    | Last value in the window             |
 | `NTH_VALUE`                     | Nth value in the window              |
 | `SUM`/`AVG`/`COUNT`/`MIN`/`MAX` | Running aggregates                   |
+| `RATIO_TO_REPORT`               | A value's share of its partition total (`partitionBy` only, no `orderBy` or `frame`) |
+| `CUME_DIST` / `PERCENT_RANK`    | Cumulative distribution / percent rank |
 
-**Parameters:** `fn`, `field`, `partitionBy`, `orderBy`, `offset` (for LAG/LEAD), `n` (for NTILE/NTH_VALUE), `frame`
+**Parameters:** `fn`, `field`, `partitionBy`, `orderBy`, `offset` (for LAG/LEAD), `n` (for NTILE/NTH_VALUE), `frame`, and (2.1):
+
+- `default` (LAG / LEAD): the value for rows whose offset falls outside the partition, instead of NULL. Numbers and `null` are written as literals; strings and dates are bound.
+- `ignoreNulls: true` (LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE): skip NULL values.
+- `orderBy` takes `{ col: { order, nulls } }` for NULLS FIRST / LAST.
+
+```js
+// Previous month's revenue, 0 for the first month; next customer with a known city
+{ $addFields: {
+    prevRev: { $window: { fn: "LAG", field: "rev", orderBy: { month: 1 }, default: 0 } },
+    nextCity: { $window: { fn: "LEAD", field: "city", orderBy: { id: 1 }, ignoreNulls: true, default: "-" } },
+    share: { $window: { fn: "RATIO_TO_REPORT", field: "rev", partitionBy: "region" } },
+} }
+```
 
 ### CTEs (Common Table Expressions)
 
 Name a query, then reference it — like SQL variables.
 
 ```js
-const { withCTE } = require("./oracle-mongo-wrapper");
+const { withCTE } = require("@jm-paunlagui/mira");
 
 const result = await withCTE(db, {
     activeUsers: users.find({ status: "active" }).project({ id: 1, name: 1 }),
@@ -847,7 +1263,7 @@ const result = await withCTE(db, {
 For parent-child hierarchical data (org charts, categories, file trees):
 
 ```js
-const { withRecursiveCTE } = require("./oracle-mongo-wrapper");
+const { withRecursiveCTE } = require("@jm-paunlagui/mira");
 
 const orgChart = await withRecursiveCTE(db, "org", {
     anchor: employees.find({ managerId: null }), // Start: employees with no manager (root nodes)
@@ -892,7 +1308,7 @@ await withRecursiveCTE(db, "a", {
 `series(db, { start, end, step?, unit?, as? })` gives one row per value from `start` to `end` inclusive: numbers, or dates by `day` / `week` / `month` / `quarter` / `year`. Use `.toArray()` or `.aggregate(pipeline)`:
 
 ```js
-const { series } = require("./oracle-mongo-wrapper");
+const { series } = require("@jm-paunlagui/mira");
 
 // Month-ends of 2026 (a depreciation schedule)
 await series(db, { start: new Date(2026, 0, 1), end: new Date(2026, 11, 1), unit: "month", as: "m" })
@@ -1233,6 +1649,13 @@ console.log(sql);
 | `$count`        | `COUNT(*)`                            | `{ total: { $count: '*' } }`                                |
 | `$first`        | `MIN(col)` (first in group)           | `{ first: { $first: '$name' } }`                            |
 | `$last`         | `MAX(col)` (last in group)            | `{ last: { $last: '$name' } }`                              |
+| `$countDistinct` | `COUNT(DISTINCT col)`                | `{ n: { $countDistinct: '$customerId' } }`                  |
+| `$median`       | `MEDIAN(col)`                         | `{ med: { $median: '$amount' } }`                           |
+| `$stdDevPop` / `$stdDevSamp` | `STDDEV_POP` / `STDDEV_SAMP` | `{ sd: { $stdDevSamp: '$amount' } }`                        |
+| `$percentile`   | `PERCENTILE_CONT` / `PERCENTILE_DISC` | `{ p90: { $percentile: { input: '$amount', p: 0.9 } } }`    |
+| `$push`         | `JSON_ARRAYAGG` → JS array            | `{ ids: { $push: { input: '$id', orderBy: { id: 1 } } } }`  |
+| `$addToSet`     | `JSON_ARRAYAGG` → JS array, de-duplicated | `{ tags: { $addToSet: '$tag' } }`                       |
+| `$listAgg`      | `LISTAGG(col, sep) WITHIN GROUP (…)`  | `{ names: { $listAgg: { input: '$name', separator: ', ' } } }` |
 | `$concat`       | `col1 \|\| col2`                      | `{ full: { $concat: ['$first', '$last'] } }`                |
 | `$toUpper`      | `UPPER(col)`                          | `{ name: { $toUpper: '$name' } }`                           |
 | `$toLower`      | `LOWER(col)`                          | `{ name: { $toLower: '$name' } }`                           |
@@ -1343,6 +1766,13 @@ bun run test:unit       # or :integration / :performance / :chaos / :security / 
 **Database prerequisites.** The schema user needs `CREATE TABLE`, `CREATE VIEW`, `CREATE SEQUENCE`, `CREATE SYNONYM`, `CREATE MATERIALIZED VIEW` and a tablespace quota (`ALTER USER <user> QUOTA UNLIMITED ON USERS;`). Every suite creates its own `MIRA_<suite>_*` tables and drops them afterwards.
 
 **Results.** The runner prints a scorecard per category. Tests named `DEFECT:` / `SECURITY:` assert the *fixed* behaviour of a known open issue and are reported separately from unexpected failures. Each run is stored under one `RUN_ID` in two tables that are kept between runs: `MIRA_TEST_RESULTS` (one row per test) and `MIRA_TEST_METRICS` (latencies, throughput, counts). Set `MIRA_SKIP_PERSIST=1` to skip writing them; performance budgets can be tightened with `MIRA_PERF_*` env vars (see `test/performance/perf.test.ts`).
+
+**Continuous integration.** `.github/workflows/ci.yml` runs on every push and pull request:
+- **Build:** type-check, `bun run build`, and `npm pack --dry-run`.
+- **Live tests:** against an Oracle Database Free 23ai container (`gvenzl/oracle-free`), once in **Thin** mode and once in **Thick** mode (Instant Client installed on the runner). Each run does the full suite with coverage, the simulation, and `test/node/smoke.cjs`, which loads the built package under plain Node.
+- **Setup:** the job creates the `MIRA` and `MIRA_SIM` schemas with `.github/oracle/setup-users.sql`.
+
+To run the Node smoke test yourself: `bun run build && node --env-file=.env test/node/smoke.cjs`.
 
 ## Simulation
 

@@ -73,8 +73,10 @@ describe("chaos: pool exhaustion and slow calls", () => {
     const shed = res.filter((r) => r.status === "rejected" && /NJS-076/.test(String((r as PromiseRejectedResult).reason)));
     m("burst 8 on pool(2)+queue(2): served", ok, "count");
     m("burst 8 on pool(2)+queue(2): shed NJS-076", shed.length, "count");
-    expect(ok).toBe(4);
-    expect(shed).toHaveLength(4);
+    // 2 connections + 2 queue slots serve 4; the rest are shed at once. The pool health
+    // monitor's 30 s ping can hold a queue slot at that instant: then 3 are served, 5 shed.
+    expect(ok + shed.length).toBe(8);
+    expect(ok === 4 || ok === 3).toBe(true);
   }, 30000);
 
   it("DEFECT: queueTimeout is a hard bound — NJS-040 must surface, not be retried into a longer wait", async () => {
@@ -84,15 +86,20 @@ describe("chaos: pool exhaustion and slow calls", () => {
     const res = await Promise.allSettled(
       Array.from({ length: 4 }, () => hold(2.5).then(() => Date.now() - started, (e: Error) => { throw Object.assign(e, { at: Date.now() - started }); })),
     );
-    const timedOut = res.filter((r) => r.status === "rejected" && /NJS-040/.test(String((r as PromiseRejectedResult).reason)));
+    const rejectedWith = (code: string) => res.filter((r) => r.status === "rejected" && new RegExp(code).test(String((r as PromiseRejectedResult).reason))) as PromiseRejectedResult[];
+    const timedOut = rejectedWith("NJS-040");
+    const shed = rejectedWith("NJS-076");
     const slowest = Math.max(...res.map((r) => (r.status === "fulfilled" ? r.value : (r.reason as { at: number }).at)));
     m("queued caller worst wait (queueTimeout=1500ms)", slowest, "ms");
-    // The bound itself, not an exact count: how many callers queue depends on how many of the
-    // two pooled connections are ready at that instant (Thick mode may be replacing one).
-    // Every outcome is a served call or an NJS-040; each NJS-040 lands near queueTimeout, never ~3x.
-    expect(timedOut.length).toBeGreaterThanOrEqual(2);
-    expect(res.filter((r) => r.status === "fulfilled").length + timedOut.length).toBe(4);
-    for (const r of timedOut) expect(((r as PromiseRejectedResult).reason as { at: number }).at).toBeLessThan(1500 + 1000);
+    // The bound itself, not exact counts. Two callers get the two connections; the other two
+    // queue and time out with NJS-040 near queueTimeout, never ~3x (no retry). The pool health
+    // monitor's 30 s ping can be queued at that instant and take a queue slot: then one caller
+    // is shed at once with NJS-076 (queue full) instead of queueing — seen 1 run in ~10.
+    expect(res.filter((r) => r.status === "fulfilled")).toHaveLength(2);
+    expect(timedOut.length + shed.length).toBe(2);
+    expect(timedOut.length).toBeGreaterThanOrEqual(1);
+    for (const r of timedOut) expect((r.reason as { at: number }).at).toBeLessThan(1500 + 1000);
+    for (const r of shed) expect((r.reason as { at: number }).at).toBeLessThan(500);
   }, 30000);
 
   it("pool recovers after saturation", async () => {
@@ -141,7 +148,10 @@ describe("chaos: pool exhaustion and slow calls", () => {
     expect((err as Error).message).toMatch(/NJS-003|invalid connection/i);
     expect(await appDbInUse()).toBe(0);
     await appDbAlive();
-  });
+    // 30 s like the rest of this block (it had bun's 5 s default): right after the
+    // conn.break() test the pool can still be recovering the cancelled session, and in
+    // Thick mode this test then ran just past 5 s (1 run in 3 locally). Alone it takes ~1 ms.
+  }, 30000);
 
   it("an open breaker on a healthy pool fails fast and closes on a successful probe", async () => {
     await config.withConnection("chaos_cb", async () => 1);

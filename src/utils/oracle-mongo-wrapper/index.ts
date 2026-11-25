@@ -59,7 +59,30 @@ import { buildConnectBy, buildPivot, buildUnpivot } from "./advanced/oracleAdvan
 // ─── Performance & DBA utilities ─────────────────────────────────
 import { createPerformance } from "./advanced/performanceUtils"; // EXPLAIN PLAN, ANALYZE, etc.
 
+// ─── Typed tables (2.1): defineTable, column builders, type generator ─
+import { defineTable, TypedTable } from "./typed/table";
+import { t } from "./typed/columns";
+import { generateTableTypes } from "./typed/generate";
+import { MiraValidationError } from "./typed/validate";
+import { ModelCollection, MiraConcurrencyError } from "./typed/model";
+import { sql, SqlStatement } from "./sql";
+import { onQuery } from "./events";
+import { relations, hasMany, hasOne, belongsTo } from "./typed/relations";
+
+// ─── Migrations (2.1): versioned schema changes with history, lock and dry run ─
+import { createMigrator } from "./migrate/migrator";
+
 // ─── Shared utility functions ────────────────────────────────────
 import { quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection } from "./utils";
 
-export { createDb, OracleCollection, OracleSchema, OracleDCL, QueryBuilder, Transaction, parseFilter, parseUpdate, buildAggregateSQL, buildWindowExpr, buildJoinSQL, SetResultBuilder, withCTE, withRecursiveCTE, series, buildScalarSubquery, buildExistsSubquery, buildNotExistsSubquery, buildCorrelatedSubquery, buildInSelectSubquery, buildAnyAllSubquery, buildConnectBy, buildPivot, buildUnpivot, createPerformance, quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection };
+export { createDb, OracleCollection, OracleSchema, OracleDCL, QueryBuilder, Transaction, parseFilter, parseUpdate, buildAggregateSQL, buildWindowExpr, buildJoinSQL, SetResultBuilder, withCTE, withRecursiveCTE, series, buildScalarSubquery, buildExistsSubquery, buildNotExistsSubquery, buildCorrelatedSubquery, buildInSelectSubquery, buildAnyAllSubquery, buildConnectBy, buildPivot, buildUnpivot, createPerformance, quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection, defineTable, TypedTable, t, generateTableTypes, createMigrator, relations, hasMany, hasOne, belongsTo, MiraValidationError, ModelCollection, MiraConcurrencyError, sql, SqlStatement, onQuery };
+export type { RowOf, InsertOf, Filter, Update, Sort, Projection, Projected, TypedCollection, TypedQuery, TableTarget, IncludeOptionsOf, TableOptions, TableHooks, SoftDeleteMethods, CollectionOf } from "./typed/table";
+export type { HookContext } from "./typed/model";
+export type { SqlTarget } from "./sql";
+export type { QueryEvent, QueryListener } from "./events";
+export type { ValidationIssue } from "./typed/validate";
+export type { Relation, NestedRow } from "./typed/relations";
+export type { IncludeOptions } from "./typed/include";
+export type { Column, ColumnMeta } from "./typed/columns";
+export type { GenerateOptions } from "./typed/generate";
+export type { Migration, MigrationContext, MigratorOptions, MigrationStatus, MigrationState, MigrationRun, Migrator } from "./migrate/migrator";

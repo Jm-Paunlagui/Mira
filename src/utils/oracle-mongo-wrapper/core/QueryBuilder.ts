@@ -68,6 +68,7 @@
 import type { DbConnection } from "../db";
 import { quoteIdentifier, bindSafe, buildOrderBy, buildProjection } from "../utils";
 import { parseFilter } from "../parsers/filterParser";
+import { buildIncludeSQL, decodeIncluded, type IncludeOptions, type RelationSpec } from "../typed/include";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /** A `{ $subquery }` projection value: a correlated scalar subquery column. */
@@ -132,8 +133,16 @@ class QueryBuilder {
     declare _projection: Record<string, unknown> | null;
     declare _skip: unknown;
     declare _limit: unknown;
+    declare _withTies: boolean;
     declare _sort: Record<string, unknown> | null;
+    /** after(): the sort-key values of the last row of the previous page (keyset pagination). */
+    declare _after: Record<string, unknown> | null;
     declare _conn: import("../db").DbConnection | null;
+    /** The relations include() can fetch (from a typed table with relations). */
+    declare _relations?: Readonly<Record<string, RelationSpec>>;
+    declare _includes: Array<{ name: string; spec: RelationSpec; options: IncludeOptions }>;
+    /** t.json() columns of a typed table (see OracleCollection._json). */
+    declare _json?: { encode: readonly string[]; decode: readonly string[] };
     declare db: import("../db").WrapperDb;
     declare filter: Record<string, unknown>;
     declare tableName: string;
@@ -159,6 +168,8 @@ class QueryBuilder {
         this._sample = options.sample || null;
         this._asOf = options.asOf || null;
         this._terminated = false; // Prevents chaining after a terminal method
+        this._includes = [];
+        this._after = null;
     }
 
     /**
@@ -173,7 +184,29 @@ class QueryBuilder {
         }
     }
 
+    /** This query itself, with 2.0's untyped signatures (see OracleCollection.untyped). */
+    get untyped(): QueryBuilder {
+        return this;
+    }
+
     // ─── Chain Methods (return the same QueryBuilder for chaining) ───
+
+    /**
+     * Fetch a declared relation in the same statement: each row gets the related
+     * rows (hasMany: an array) or row (belongsTo / hasOne: an object or null)
+     * under the relation's name. Declare relations with relations() on typed tables.
+     * @param {string} name - Relation name
+     * @param {Object} [options] - { where, sort, limit } on the related rows (limit: hasMany only)
+     * @returns {QueryBuilder} this (for chaining)
+     */
+    include(name: string, options: IncludeOptions = {}): QueryBuilder {
+        this._checkTerminated();
+        const spec = this._relations?.[name];
+        if (!spec) throw new Error(MSG.INCLUDE_UNKNOWN_RELATION(this.tableName, name, Object.keys(this._relations ?? {})));
+        if (this._includes.some((i) => i.name === name)) throw new Error(MSG.INCLUDE_TWICE(name));
+        this._includes.push({ name, spec, options });
+        return this;
+    }
 
     /**
      * Set the sort order.
@@ -187,13 +220,57 @@ class QueryBuilder {
     }
 
     /**
-     * Limit the number of rows returned.
-     * @param {number} n - Maximum number of rows
+     * Keyset pagination: continue after the row whose sort-key values are given,
+     * in the order of sort(). Give the last row of the previous page (or just its
+     * sort keys). Unlike skip(), the database seeks straight to the next page, and
+     * rows inserted or deleted meanwhile do not shift it.
+     *
+     *   const page1 = await orders.find().sort({ TOTAL: -1, ID: 1 }).limit(20).toArray();
+     *   const page2 = await orders.find().sort({ TOTAL: -1, ID: 1 }).after(page1.at(-1)).limit(20).toArray();
+     *
+     * End the sort with a unique column (the primary key) so no two rows tie.
+     * The sort keys must not be NULL in the cursor.
+     * @param {Object} cursor - The previous page's last row, or its sort-key values
      * @returns {QueryBuilder} this (for chaining)
      */
-    limit(n: number): QueryBuilder {
+    after(cursor: Record<string, unknown>): QueryBuilder {
+        this._checkTerminated();
+        if (!cursor || typeof cursor !== "object" || Array.isArray(cursor)) throw new Error(MSG.AFTER_INVALID_CURSOR(JSON.stringify(cursor)));
+        this._after = cursor;
+        return this;
+    }
+
+    /** The keyset predicate for after(): (a > :a) OR (a = :a AND b > :b) …, in sort order. */
+    _afterClause(binds: Record<string, unknown>): string {
+        const cursor = this._after as Record<string, unknown>;
+        if (!this._sort || Object.keys(this._sort).length === 0) throw new Error(MSG.AFTER_NEEDS_SORT(this.tableName));
+        const keys = Object.keys(this._sort);
+        // The cursor may be a whole row: only the sort keys are used, and each must be there.
+        for (const k of keys) if (cursor[k] === null || cursor[k] === undefined) throw new Error(MSG.AFTER_NULL_VALUE(k));
+        const terms = keys.map((k, i) => {
+            const spec = (this._sort as Record<string, unknown>)[k];
+            const order = spec && typeof spec === "object" ? ((spec as { order?: unknown }).order ?? 1) : spec;
+            const name = `after_${i}`;
+            binds[name] = cursor[k];
+            const op = Number(order) === -1 ? "<" : ">";
+            const equal = keys.slice(0, i).map((p, j) => `t0.${quoteIdentifier(p)} = :after_${j}`);
+            return `(${[...equal, `t0.${quoteIdentifier(k)} ${op} :${name}`].join(" AND ")})`;
+        });
+        return `(${terms.join(" OR ")})`;
+    }
+
+    /**
+     * Limit the number of rows returned.
+     * @param {number} n - Maximum number of rows
+     * @param {Object} [options]
+     * @param {boolean} [options.withTies] - FETCH FIRST n ROWS WITH TIES: also keep every row
+     *   tied with the n-th on the sort keys. Needs a sort().
+     * @returns {QueryBuilder} this (for chaining)
+     */
+    limit(n: number, options: { withTies?: boolean } = {}): QueryBuilder {
         this._checkTerminated();
         this._limit = _rowCount("QueryBuilder.limit", "limit", n);
+        this._withTies = options.withTies === true;
         return this;
     }
 
@@ -278,7 +355,13 @@ class QueryBuilder {
      * @returns {{ sql: string, binds: Object }} The SQL string and bind variables
      */
     _buildSQL(opts: { pageByRowid?: boolean } = {}): { sql: string; binds: Record<string, unknown>; maxRows?: number } {
-        const { whereClause, binds } = parseFilter(this.filter, "t0");
+        const parsed = parseFilter(this.filter, "t0");
+        const binds = parsed.binds;
+        let whereClause = parsed.whereClause;
+        if (this._after) {
+            const keyset = this._afterClause(binds);
+            whereClause = whereClause ? `${whereClause} AND ${keyset}` : `WHERE ${keyset}`;
+        }
 
         // Projection
         const proj = buildProjection(this._projection);
@@ -348,6 +431,17 @@ class QueryBuilder {
             // We'll post-process exclusions after query, or use approach below
         }
 
+        // Included relations: one correlated subquery each, in the select list.
+        if (this._includes.length > 0) {
+            if (selectCols === "*") selectCols = "t0.*"; // "*" cannot share a select list
+            const parts = this._includes.map((inc, i) => {
+                const built = buildIncludeSQL(inc.spec, inc.name, inc.options, "t0", `inc${i}_`);
+                Object.assign(binds, built.binds);
+                return built.sql;
+            });
+            selectCols = `${selectCols}, ${parts.join(", ")}`;
+        }
+
         // Table reference
         let tableRef = `${quoteIdentifier(this.tableName)} t0`;
 
@@ -375,7 +469,11 @@ class QueryBuilder {
         const orderBy = this._sort ? ` ${buildOrderBy(this._sort)}` : "";
         let paging = "";
         if (this._skip != null) paging += ` OFFSET ${Number(this._skip)} ROWS`;
-        if (this._limit != null) paging += ` FETCH FIRST ${Number(this._limit)} ROWS ONLY`;
+        if (this._limit != null) {
+            // WITH TIES without ORDER BY silently returns exactly n rows: refuse it.
+            if (this._withTies && !orderBy) throw new Error(MSG.WITH_TIES_NEEDS_SORT("QueryBuilder.limit"));
+            paging += ` FETCH FIRST ${Number(this._limit)} ROWS ${this._withTies ? "WITH TIES" : "ONLY"}`;
+        }
         const where = whereClause ? ` ${whereClause}` : "";
 
         // pageByRowid ($lateralJoin): Oracle returns wrong rows for a LATERAL /
@@ -499,6 +597,7 @@ class QueryBuilder {
                         return doc;
                     });
                 }
+                if (this._includes.length > 0 || this._json) rows = rows.map((row: Record<string, unknown>) => this._decodeRow(row));
 
                 return rows;
             } catch (err) {
@@ -512,6 +611,13 @@ class QueryBuilder {
             return fn(this._conn);
         }
         return this.db.withConnection(fn);
+    }
+
+    /** Included relations and t.json() columns from JSON text into JS values, in place. */
+    _decodeRow(row: Record<string, unknown>): Record<string, unknown> {
+        for (const inc of this._includes) row[inc.name] = decodeIncluded(inc.spec, row[inc.name]);
+        for (const c of this._json?.decode ?? []) if (typeof row[c] === "string") row[c] = JSON.parse(row[c] as string);
+        return row;
     }
 
     // ─── Terminal Methods ─────────────────────────────────────────
@@ -578,7 +684,8 @@ class QueryBuilder {
                     }
                     let out: unknown;
                     try {
-                        out = fn(row);
+                        // Included relations are decoded first; a failure there stops the stream like a callback error.
+                        out = fn(this._includes.length > 0 || this._json ? this._decodeRow(row) : row);
                     } catch (err) {
                         fail(err);
                         return;
@@ -604,6 +711,61 @@ class QueryBuilder {
             return run(this._conn);
         }
         return this.db.withConnection(run);
+    }
+
+    /**
+     * TERMINAL: iterate the rows with `for await`, streamed (O(1) memory) like forEach().
+     * One connection is held while iterating and released when the loop ends, breaks
+     * or throws; inside a transaction the session's connection is used.
+     *
+     * @example
+     *   for await (const order of orders.find({ STATUS: "open" }).sort({ ID: 1 })) {
+     *     if (await ship(order)) break;
+     *   }
+     */
+    async *[Symbol.asyncIterator](): AsyncGenerator<Record<string, unknown>, void, undefined> {
+        this._terminated = true;
+        await this._resolveFilterPromises();
+        const { sql, binds } = this._buildSQL();
+        const proj = buildProjection(this._projection);
+        const decode = this._includes.length > 0 || !!this._json;
+        const rows = async function* (this: QueryBuilder, conn: DbConnection) {
+            const stream = conn.queryStream(sql, binds, { outFormat: this.db.oracledb.OUT_FORMAT_OBJECT });
+            try {
+                for await (const row of stream as AsyncIterable<Record<string, unknown>>) {
+                    if (proj.isExclusion) for (const col of proj.excludedCols) delete row[col];
+                    yield decode ? this._decodeRow(row) : row;
+                }
+            } catch (err) {
+                throw new Error(MSG.wrapError("QueryBuilder[Symbol.asyncIterator]", err, sql, binds));
+            } finally {
+                stream.destroy();
+            }
+        }.bind(this);
+
+        if (this._conn) {
+            yield* rows(this._conn);
+            return;
+        }
+        // Hold a pooled connection for the loop's lifetime: withConnection's callback
+        // waits until the loop is done, then the connection goes back as usual.
+        let release: (() => void) | undefined;
+        let borrowed!: Promise<unknown>;
+        const conn = await new Promise<DbConnection>((resolve, reject) => {
+            borrowed = this.db.withConnection((c: DbConnection) => {
+                resolve(c);
+                return new Promise<void>((done) => {
+                    release = done;
+                });
+            });
+            borrowed.catch(reject);
+        });
+        try {
+            yield* rows(conn);
+        } finally {
+            release?.();
+            await borrowed;
+        }
     }
 
     /**

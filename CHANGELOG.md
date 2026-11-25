@@ -1,5 +1,290 @@
 # Changelog
 
+## [2.1.0] — 2026-11-26
+
+Theme: Oracle-first, MongoDB-shaped, typed. Everything adds to 2.0; nothing breaks. Built step by step on `feature/2.1.0` (see `docs/ROADMAP-2.1.md`).
+
+### Added — statistics (roadmap step 1)
+
+- **`$group` accumulators.** Each takes a column, an expression, or `{ input, … }`.
+  - `$countDistinct` → `COUNT(DISTINCT …)`
+  - `$median` → `MEDIAN`
+  - `$stdDevPop` / `$stdDevSamp` → `STDDEV_POP` / `STDDEV_SAMP`
+  - `$percentile: { input, p, method }` → `PERCENTILE_CONT` (default) or `PERCENTILE_DISC`. `p` is a number from 0 to 1 or a list of them; a list returns a JS array.
+  - `$push` / `$addToSet` → `JSON_ARRAYAGG(… NULL ON NULL RETURNING CLOB)`, returned by `aggregate()` as JS arrays, with an optional `orderBy`. `$push` keeps NULLs; `$addToSet` keeps each value once.
+  - `$listAgg: { input, separator, distinct, orderBy }` → `LISTAGG(…) WITHIN GROUP (…)`, one string. The separator is bound.
+- **Window options** in `$window`:
+  - `default` for LAG / LEAD.
+  - `ignoreNulls` for LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE.
+  - `RATIO_TO_REPORT`.
+- **NULLS FIRST / LAST** wherever a sort is given: `{ col: { order: 1 | -1, nulls: "first" | "last" } }` in `sort()`, `$sort`, a window's `orderBy`, an accumulator's `orderBy`, set operations, `withCTE`, `withRecursiveCTE` and `connectBy`'s `orderSiblings`. `1` / `-1` still work as before.
+- **`FETCH … WITH TIES`:** `limit(n, { withTies: true })` on a sorted `find()`, and `{ $limit: { n, withTies: true } }` directly after a `$sort`. Without a sort Mira throws: Oracle would silently return exactly n rows.
+- `buildAggregateSQL` also returns `arrays` (the output columns holding a JSON array) when there are any; `buildWindowExpr` takes an optional bind function, used for a non-number `default`.
+
+### Changed
+
+- A pipeline `$limit` must be a non-negative integer (or `{ n, withTies }`); anything else throws instead of reaching Oracle as `FETCH FIRST NaN ROWS`.
+
+### Tests and simulation
+
+- New `test/unit/statistics.test.ts` (SQL shape and argument checks) and `test/integration/statistics.test.ts`. The live tests compute every expected value from the fixture, including Oracle's percentile interpolation.
+- The `unknown expression operator` test used `$stdDevPop` as its example of an unknown operator; it now uses `$kurtosis`.
+- The simulation's reports stage adds the branch KPIs: distinct customers, median, standard deviation, P10/P90 and discrete P90 of the ticket, receipts (`$push`), quarters traded (`$addToSet`, `$listAgg`), each branch's revenue share (`RATIO_TO_REPORT`) with the previous branch's revenue (`LAG` default 0), the next customer with a known city (`LEAD` IGNORE NULLS), customers by city with NULLs first, and ties at the top (`WITH TIES` in `find()` and in a pipeline). 55 queries through Mira, 0 gaps.
+
+### Added — usable from Node, and CI on a live Oracle (roadmap step 1)
+
+- **npm package `@jm-paunlagui/mira`.**
+  - `bun run build` compiles `src/` to CommonJS JavaScript with `.d.ts` types (and source maps) in `dist/`.
+  - `package.json` gets `main`, `types`, an `exports` map and a `files` list. `npm pack` / `prepack` rebuild first.
+  - Runs on Node.js 20+ as well as Bun 1.4+.
+- **`@types/oracledb` is now a runtime dependency.** The public types refer to `oracledb`'s types, so a consumer without it failed to type-check (TS7016).
+- **CI (`.github/workflows/ci.yml`).** Runs on every push and pull request.
+  - A build job: type-check, build, and `npm pack --dry-run`.
+  - A live job against Oracle Database Free 23ai (`gvenzl/oracle-free:23-slim-faststart`), run once in **Thin** and once in **Thick** mode: full suite with coverage, the simulation, and a Node smoke test of the built package.
+  - The job creates the `MIRA` and `MIRA_SIM` schemas with `.github/oracle/setup-users.sql`. It lets the listener accept `FREEPDB1` as a SID, because Mira connects with `(SID=…)`.
+- `test/node/smoke.cjs`: loads the package by name under plain Node, then does a live round trip that checks money, CLOB and aggregate values.
+- README: install from npm, and how `.env` is loaded under Node (`node --env-file=.env`; Bun reads it by itself).
+
+### Tests fixed on the CI database
+
+Two tests failed only on the CI database:
+- **`unit/adapter` "existing keys win"** expected `APP_DB_USERNAME` to be `mira`, the value in one developer's `.env`. It now sets its own value.
+- **`appDbInUse()`**, used by the leak checks, could catch the pool health monitor's 30-second `ping()` in flight and report 1 connection checked out (2 runs in 3 on the CI image). It now re-reads the count for up to 2 s and returns the lowest value seen, so a real leak, which never returns to 0, still fails the test.
+
+### Found by CI: Thick mode can hang when there are too few worker threads
+
+- **The hang:** on the 4-core GitHub runner, the Thick-mode job hung in "concurrent transfers keep the ledger balanced". That test runs 8 transactions that wait on each other's row locks.
+- **The cause:** in Thick mode each database call runs on a native worker thread (`UV_THREADPOOL_SIZE`), and a call waiting on a lock keeps its thread. With too few threads, the transaction holding the lock never gets one to commit. The database is fine, and Thin mode is unaffected.
+- **Reproduced locally:** `UV_THREADPOOL_SIZE=2` hangs and `16` passes.
+- **What changed:**
+  - CI sets `UV_THREADPOOL_SIZE=32`.
+  - The README warns Thick-mode users to set it to at least their largest `poolMax` before the process starts.
+  - When Thick mode creates a pool whose `poolMax` is above `UV_THREADPOOL_SIZE` (Node's default 4 when it is not set), Mira logs a warning naming the pool, both numbers and the setting to use.
+
+### Fixed — Thick mode moved `TIMESTAMP WITH (LOCAL) TIME ZONE` values by the client's UTC offset
+
+- **The defect:** Thin mode opens every session at UTC, but Thick mode opened it in the operating system's zone. A JS `Date` written to a `TIMESTAMP WITH TIME ZONE` or `TIMESTAMP WITH LOCAL TIME ZONE` column was stored that zone's offset off: −8 h on a UTC+8 machine, through `insertOne`, `insertMany` and raw SQL alike. Filters compared consistently, so reads in Mira looked right. `TIMESTAMP` and `DATE` columns were not affected.
+- **Why it went unseen:** `bun test` runs with `TZ=UTC`, but on Windows the Oracle client takes its zone from the system, not from `TZ`.
+- **The fix:** the adapter sets `ORA_SDTZ=+00:00` before the Oracle client loads, unless `ORA_SDTZ` is already set. Thick mode now behaves as Thin mode does.
+  - It uses a numeric offset because the region name `UTC` makes a 19.x client on a 23ai server fail with `ORA-01805` (time-zone file mismatch).
+- **Behaviour change (Thick mode only):** `SESSIONTIMEZONE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP` and `CURRENT_DATE` in your own SQL are now UTC, as they already were in Thin mode. `SYSTIMESTAMP` and `SYSDATE` are unchanged, and so is `$now`, which uses database time. To keep another zone, set `ORA_SDTZ` yourself.
+- **Tests:**
+  - `test/integration/timeZones.test.ts`: every date column type keeps a Date's instant, written by `insertOne`, `insertMany` or raw SQL, and the session zone is `+00:00`. Before the fix these failed in Thick mode, with `TZ=UTC` and with `TZ=Asia/Manila`.
+  - Adapter unit tests: `ORA_SDTZ` is set when missing or blank and kept when given; the thread-pool warning is checked with no setting, a small setting, a large enough setting, an invalid setting, and in Thin mode.
+
+### Added — typed tables (roadmap step 2)
+
+- **`defineTable(name, columns)` with column builders `t.*`.** A definition needs no database: `Table.on(db)` or `Table.on(session)` binds it.
+  - Builders: `t.id()`, `t.number(p?, s?)`, `t.money()`, `t.decimal(p, s)`, `t.text(n, "char"?)`, `t.char(n)`, `t.clob()`, `t.blob()`, `t.date()`, `t.timestamp(p?)`, `t.timestampTz(p?)`, `t.raw<T>(type)`.
+  - Modifiers: `.nullable()`, `.default()`, `.primaryKey()`, `.check()`, `.references()`, `.identity()`, `.identityByDefault()`.
+  - Each column's type matches what Mira returns: scaled NUMBER is a `string`, CLOB a `string`, BLOB a `Buffer`, dates a `Date`, and nullable columns add `null`.
+- **Type checking.** Filters (known columns, value types, operators by column type), inserts (identity columns refused; nullable, defaulted and BY DEFAULT identity columns optional), `$set` / `$inc` / `$currentDate` updates, sorts, and projections (the result type narrows) are all checked. `typeof Table.$row` and `typeof Table.$insert` name the types.
+- **Compile-time only.** `on()` returns the plain `OracleCollection`, so behaviour is unchanged. New `.untyped` getters on `OracleCollection` and `QueryBuilder` return the object itself with the 2.0 signatures.
+- `Table.ddl()` returns the `createTable()` column spec; `Table.create(db)` runs it. `defineTable` refuses a second identity column, because Oracle allows one (ORA-30669).
+- **`mira generate types`** (package `bin`) and **`generateTableTypes(db, { tables, importFrom })`**: read `USER_TAB_COLUMNS`, identity columns, primary keys and single-column foreign keys, and write one `defineTable()` and one `…Row` type per table.
+  - `--tables` takes exact names or `%` patterns; `--out`, `--import`, `--env` and `--verbose` are also available.
+  - Log lines stay off stdout unless `--verbose`.
+- Exported types: `RowOf`, `InsertOf`, `Filter`, `Update`, `Sort`, `Projection`, `Projected`, `TypedCollection`, `TypedQuery`, `TableTarget`, `Column`, `ColumnMeta`, `GenerateOptions`.
+
+### Fixed — insertMany (found while testing typed tables)
+
+- **Columns only later documents had were silently dropped.** `insertMany` took its column list from the first document, so with `[{ A }, { A, B }]` every `B` was lost with no error.
+  - Documents are now split into consecutive runs with the same column set, with one `executeMany` per run in the same transaction.
+  - Rows are still inserted in the caller's order (identity values follow it), and an omitted column keeps its DEFAULT.
+  - `insertedIds`, `returning` and `batchErrors` offsets refer to the caller's positions.
+- **A `Buffer` value failed with `NJS-011`.** Buffers are now bound as binary, and as a BLOB past 32 KB. Text past 32 KB is bound as a CLOB.
+
+### Tests and simulation (typed tables)
+
+- `test/types/typedTables.types.ts`, checked by `bun run typecheck`: exact inferred row and insert types, plus 16 misuses that must not compile (`@ts-expect-error`).
+- `test/unit/typedTables.test.ts`: builders, `ddl()`, validation, `on()`, and the generator against a stub catalogue covering every Oracle type branch.
+- `test/integration/typedTables.test.ts`: typed CRUD on a live table, `on(session)` rollback, the foreign key from `references()`, and the CLI.
+  - Also a round trip: definition → `create()` → catalogue → generated code → imported → the same `ddl()`.
+- `test/integration/defects.test.ts`: the two `insertMany` defects, batch-error offsets across groups, and CLOB text past 32 KB.
+- Simulation, reports stage:
+  - generates definitions for `SIM_CUSTOMERS` / `SIM_ORDERS` and checks them against 01-schema,
+  - queries `SIM_ORDERS` through a hand-written typed definition,
+  - creates `SIM_LOYALTY` from a definition and fills it in one transaction with documents of two shapes.
+  - Result: 58 queries, 0 gaps, 124 of 124 public functions.
+
+### Added — migrations (roadmap step 2)
+
+- **`mira migrate new <name> | status | up | down`** and **`createMigrator(db, { dir | migrations, table })`** → `{ up, down, status, list }`.
+  - Migration files (`.ts`, `.js`, `.cjs`, `.mjs`; named or default exports of `up` / `down`) run in name order. `migrate new` names them `<UTC timestamp>_<name>.ts`.
+  - `up({ to })` applies up to a named migration. `down({ steps })` (default 1) rolls back the newest; `down({ to })` rolls back everything after a migration; `down({ to: null })` / `--all` rolls back all of them.
+  - The context offers `schema`, `collection(name)`, `createTable(definition)` (typed tables), `execute(sql, binds)`, `db` and `dryRun`.
+- **History.** `MIRA_MIGRATIONS` stores name, SHA-256 checksum, batch, applied-at time and duration. A **changed** or **missing** applied migration shows in `status` (the CLI exits 1), and `up` refuses to run.
+- **Lock.** A row lock (`SELECT … FOR UPDATE NOWAIT`) on `MIRA_MIGRATIONS_LOCK` is held on a connection of its own for the whole run, so a concurrent run fails at once. No `DBMS_LOCK` grant is needed, and Oracle releases the lock if the process dies.
+- **Dry run.** Each migration runs against a recording connection; the SQL is returned (and printed by `--dry-run`), and nothing is applied or recorded.
+- **Failures.** Oracle DDL is not transactional, so a failed migration is not recorded. Its error names it and says the statements before the failure stay applied.
+  - Migrator errors pass through `withConnection` unwrapped (`isOperational`), so `err.migration` and the message are kept.
+- Exported types: `Migration`, `MigrationContext`, `MigratorOptions`, `MigrationStatus`, `MigrationState`, `MigrationRun`, `Migrator`.
+
+### Tests and simulation (migrations)
+
+- `test/integration/migrations.test.ts` (14 tests, live):
+  - order and batches, `to` / `steps` / `all`, a pending migration that sorts before applied ones, changed and missing migrations
+  - argument checks, no `down()`, a failing migration, dry runs with their exact SQL
+  - **two runs racing for the lock**
+  - files on disk (`.ts` with typed tables, `.js`, `.mjs` default export, `.d.ts` skipped, checksum of the file)
+  - the whole `mira migrate` command line
+- `test/unit/migrations.test.ts`: errors other than "already exists" / "lock busy", a dry run never touching the real connection, and the new-file helpers.
+- Simulation, schema stage: a supplier table, its seed and a view arrive as three migrations. The stage checks `list`, a dry run, `up`, a repeat `up`, `down`, `status` by batch, a second `up`, and a refused `up` after a migration's code changed. Result: 307 checks, 129 of 129 public functions.
+
+### Added — relations and include (roadmap step 3)
+
+- **`relations(table, { name: hasMany(…) | hasOne(…) | belongsTo(…) })`** attaches relations to a typed table. They are declared apart from the tables, so two tables can point at each other and generated table files stay as they are.
+  - `hasMany(Target, { foreignKey, localKey? })` and `hasOne(...)`: `Target.foreignKey = this.localKey`, by default this table's primary key.
+  - `belongsTo(Target, { foreignKey, references? })`: `this.foreignKey = Target.references`, by default the target's primary key.
+  - Names, columns and keys are checked when relations are declared.
+- **`find().include(name, { where, sort, limit })`** fetches related rows in the **same statement**. Each relation is a correlated subquery in the SELECT list.
+  - `hasMany` uses `JSON_ARRAYAGG(JSON_OBJECT …)` and gives an array, `[]` when there are none. `limit` keeps the first n rows per parent row, numbered with `ROW_NUMBER` (not `FETCH FIRST`; see 2.0.1's LATERAL row-limit bug).
+  - `hasOne` / `belongsTo` use `JSON_OBJECT` and give an object or `null`.
+  - It works with filters, `sort`, `skip`, `limit`, `project`, `forEach`, `next`, `await` and sessions.
+- **Related rows keep Mira's types.** Scaled NUMBER columns are written with `TO_CHAR`, the same exact text as a top-level money column. DATE / TIMESTAMP columns become `Date`, CLOB text stays text, and BLOB / RAW columns are left out because JSON has no binary type.
+- **Typed.** `include()` adds `orders: Order[]` or `customer: Customer | null` to the row type. The `where` and `sort` options are checked against the related table, and `limit` is accepted only for `hasMany`. A relation can't be projected as a column, and a table without relations has nothing to include.
+- Exported: `relations`, `hasMany`, `hasOne`, `belongsTo`; types `Relation`, `NestedRow`, `IncludeOptions`, `IncludeOptionsOf`. `TypedQuery` gains its relation parameters, and existing `TypedQuery<R>` uses still compile.
+
+### Fixed — insertMany with a column given as a number and as a numeric string
+
+- A typed money column accepts `string | number`. `insertMany` chose one bind type per column from the first value, so `[{ AMT: "10.5" }, { AMT: 99 }]` failed with `NJS-011`.
+- A column that mixes the two is now bound as text, with numbers sent as their decimal text, which Oracle converts exactly, as it does for a money string in `insertOne`. Proven first by a `DEFECT:` test.
+
+### Tests and simulation (relations)
+
+- `test/integration/relations.test.ts` (11 tests, live):
+  - one statement per query
+  - nested values equal to a direct read (money, decimals, dates, TIMESTAMP WITH TIME ZONE, a 6,000-character CLOB, BLOB left out)
+  - per-parent `where` / `sort` / `limit`, `hasOne`, `belongsTo` with a projection, several includes with filters, `next` / `forEach` / `await`, a rolled-back session
+  - every error, and the checks made when relations are declared
+- `test/types/relations.types.ts`: exact nested types, plus 8 misuses that must not compile.
+- Simulation, reports stage, each checked against the model:
+  - each VIP's three biggest tickets (`hasMany` with `where` / `sort` / `limit`)
+  - the customer behind every ticket of 300.00 or more (`belongsTo`)
+  - each customer's first receipt (`hasOne`)
+  - Result: 310 checks, 61 queries, 134 of 134 public functions.
+
+### Added — JSON columns (roadmap step 3)
+
+- **`t.json<T>()`** declares a JSON document column. It is a CLOB with an `IS JSON` check (Oracle 19c+), added by `ddl()` / `create()`. **`t.json<T>({ native: true })`** uses the 23ai JSON type.
+- **A typed table reads and writes JSON columns as `T`:** in `insertOne`, `insertMany`, `replaceOne`, whole-column `$set`, `find`, `findOne`, `next`, `forEach`, `await`, and in `include()`, where a related row's JSON column is embedded as a document.
+- **Paths in filters:** `"COL.a.b"` and `"COL.items.0.sku"`.
+  - Operators: `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$in` `$nin` `$between` `$exists` and `null`, via `JSON_VALUE(… RETURNING NUMBER | TIMESTAMP WITH TIME ZONE | VARCHAR2)` chosen from the value's type, and `JSON_EXISTS`.
+  - **`$elemMatch`**, on element fields or on plain values, becomes `JSON_EXISTS(… '$.items[*]?(…)' PASSING …)` with every value bound.
+- **Paths in updates:**
+  - `$set` / `$unset` on paths become one `JSON_MERGEPATCH` per column.
+  - **`$push`** (a value, or `$each`) and **`$pull`** (a value, or `$in`) rebuild the array with `JSON_TABLE` + `JSON_ARRAYAGG`. They also work on a column that holds an array.
+  - Refused with a clear error: `$set` of null on a path (merge patch would delete the key; use `$unset`), paths through an array index, two updates of one path, overlapping paths, and a column set both whole and by path.
+- **`$jsonTable`** pipeline stage: one row per array element, with typed columns (`NUMBER`, `VARCHAR2`, `DATE`, `TIMESTAMP`, `CLOB`, `JSON`; checked), `"$"` for the element itself, `ordinality`, and `outer`.
+- **`mira generate types`** writes `t.json()` for a CLOB with `IS JSON` (from `USER_JSON_COLUMNS`), and `t.json({ native: true })` for the JSON type.
+- **Typed:**
+  - dotted paths must start with a known column
+  - `$elemMatch` is only accepted on JSON columns
+  - `$push` / `$pull` are typed
+  - `t.json()` with no type argument is `unknown`, never `any` (`NoInfer`)
+- **Same SQL on 19c and 23ai.** Only functions 19c has are used (no `JSON_TRANSFORM`). Path updates merge into `JSON_SERIALIZE(col RETURNING CLOB)`: merging into the 23ai JSON type directly made 23.26 store binary OSON version 2, which node-oracledb 7 can't read (`NJS-126`).
+
+### Behaviour notes (JSON)
+
+- **The untyped API is unchanged:** a JSON column is returned as its stored text, as in 2.0. Only typed tables decode it.
+- **A filter key with a dot is now a JSON path.** Before, it was quoted as one column name; no Mira code used that.
+- **The native JSON type needs Thin mode or Oracle Client 21c+.** With the 19.6 client against 23ai, reading it fails with `ORA-40569` and a write broke the session (`ORA-03106`). `Table.on(db)` refuses a native column on a 19.x Thick client with a clear message.
+- **The native JSON type needs Oracle Database 21c+.** On 19c, `createTable()` (and so `create()` and migrations) refuses a `JSON` column with a clear message instead of `ORA-00902`.
+
+### Found on Oracle 19c (JSON)
+
+CI runs Oracle 23ai, so these were found by running the suite on the 19c container. Each was shown failing on 19c first.
+
+- **`$push` / `$pull` lost every scalar element.** 19c's `JSON_TABLE` returns NULL for a scalar in a `FORMAT JSON` column (23ai returns it), and `JSON_ARRAYAGG` dropped the NULLs: `["a", {"z":1}]` plus `"c"` became `[{"z":1}]`. Elements are now read `WITH WRAPPER` and unwrapped.
+- **`$elemMatch` with `$nin` or `$exists: false` matched nothing.** 19c never treats a negated path-filter condition (`!(…)`, `!exists(…)`) as true. A negation is now `NOT JSON_EXISTS` on each element (`EXISTS` over `JSON_TABLE`); `TO_CLOB` on the element stops 19c rewriting it into `ORA-31013`. `$elemMatch` without a negation keeps the single `JSON_EXISTS`.
+- **`t.json({ native: true })` on 19c** failed with `ORA-00902`; it is now refused up front (above).
+
+### Tests and simulation (JSON)
+
+- `test/integration/jsonColumns.test.ts` (18 tests, Thick and Thin):
+  - the `IS JSON` check; typed reads in every path; the untyped API returning text; `include()`
+  - every path operator, `$elemMatch` form and update form, and each refusal
+  - `$jsonTable` (inner, outer, ordinality, `"$"`, JSON / VARCHAR2 columns, with `$group`)
+  - the generator round trip
+  - native JSON: works in Thin; refused up front on a 19.x Thick client
+- `test/types/jsonColumns.types.ts`: exact row and insert types, plus 4 misuses that must not compile.
+- `test/unit/typedTables.test.ts`: the generator maps CLOB + `IS JSON` and the JSON type.
+- Simulation, reports stage: the loyalty table gets a `PREFS` document per VIP. The stage checks a path filter, `$elemMatch`, `$push` + `$set` on paths for every VIP, `$pull`, and `$jsonTable` + `$group` of the resulting drinks menu, all against the model. Result: 313 checks, 66 queries, 134 of 134 public functions.
+
+### Added — timestamps, soft delete, hooks and validation (roadmap step 4)
+
+- **`t.createdAt()` / `t.updatedAt()`:** `TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL`. Oracle stamps both on insert; every update through the table's collection sets the `updatedAt` column (`$currentDate`), unless the update sets it itself. A zoned type, so the value is an exact instant whatever the server's time zone.
+- **`t.deletedAt()`: soft delete.**
+  - `deleteOne` / `deleteMany` / `findOneAndDelete` mark rows instead of deleting them.
+  - Reads (`find`, `findOne`, `countDocuments`, `distinct`, `aggregate`), updates and deletes skip marked rows, and so does `include()` of a soft-deleting related table.
+  - `withDeleted()` sees marked rows; `restore(filter)` clears the mark; `{ force: true }` deletes for real.
+  - Typed: `withDeleted()` and `restore()` exist only on a table with a `t.deletedAt()` column.
+- **Hooks:** `defineTable(name, columns, { hooks })` with `beforeInsert`, `afterInsert`, `beforeUpdate`, `afterUpdate`, `beforeDelete`, `afterDelete`. A before-hook may return a changed document or update, or throw to stop the write. The hook context works like a session (`Table.on(ctx)`), so a hook's own writes join the transaction.
+- **Validation:** `{ validate: true }` checks inserts and updates against the columns before any SQL: unknown, generated, required and not-nullable columns; number, money, text, date and binary values; the size of numbers and of `VARCHAR2` / `CHAR` text (UTF-8 bytes or characters). Every problem is listed in one `MiraValidationError` (`issues: { column, message }[]`).
+- `replaceOne` / `findOneAndReplace` on such a table become a `$set` of every given column except the primary key, so the above apply.
+- New exports: `MiraValidationError`, `ModelCollection`, and the types `TableOptions`, `TableHooks`, `HookContext`, `SoftDeleteMethods`, `CollectionOf`, `ValidationIssue`.
+
+### Behaviour notes (model tables)
+
+- `on()` returns a `ModelCollection` (a subclass of `OracleCollection`) only for a table that uses one of these features; every other typed table keeps the plain collection.
+- `merge`, `mergeFrom`, `bulkUpdateByKeys`, `updateFromJoin`, `insertFromQuery`, `connectBy`, `pivot` and raw SQL are 2.0's and do none of this.
+
+### Fixed — bulkWrite lost a typed table's settings
+
+- Outside a transaction, `bulkWrite` ran its operations on a new plain `OracleCollection`, so a typed table's JSON columns were not encoded there. It now runs them on the same kind of collection (`_onConnection`), which keeps JSON columns, relations and model behaviour.
+
+### Tests and simulation (model tables)
+
+- `test/integration/model.test.ts` (19 tests): timestamps; soft delete through every wrapped method, `withDeleted()`, `restore()`, `{ force: true }`, upsert, `include()`; every hook, a hook that throws, hooks inside a rolled-back transaction, `bulkWrite`; validation before any SQL and hooks filling a column.
+- `test/unit/validate.test.ts` (7 tests): every column kind, size rule and update operator.
+- `test/types/model.types.ts`: row and insert types, typed hooks, `withDeleted()` / `restore()` only on soft-deleting tables, and misuses that must not compile.
+- Simulation, new stage 15 "members": a loyalty-member register on a model table. Sign-ups through hooks, validation refusing a bad web-form row, points and tier changes, soft removal, a protected founding member, a mistaken removal restored, an erasure with `{ force: true }`, the audit trail the hooks wrote, and a rolled-back sign-up. Result: 333 checks, 86 queries, 151 of 151 public functions.
+
+### Added — optimistic locking (roadmap step 4)
+
+- **`t.version()`:** `NUMBER(10) DEFAULT 1 NOT NULL`, raised by 1 on every update through the table's collection (unless the update sets it; a replacement never does).
+- **`MiraConcurrencyError`:** `updateOne`, `findOneAndUpdate`, `replaceOne`, `findOneAndReplace`, `deleteOne` and `findOneAndDelete` whose filter pins the version (`{ ID: 1, VERSION: 3 }`) and match nothing while the row is still there now throw, instead of silently returning 0. `expectedVersion` and `currentVersion` say what happened. A gone row still returns 0; `updateMany` / `deleteMany` are not checked; `upsert` with a pinned version is refused.
+
+### Fixed — Mira's own errors lost their class inside a transaction
+
+- The adapter wraps every error thrown inside `withTransaction` as a generic `DB op failed` error, unless it is `isOperational`. `MiraValidationError` (422) and `MiraConcurrencyError` (409) are now operational, so `instanceof` works inside transactions and they aren't logged as critical database failures. Found by the optimistic-locking transaction test.
+
+### Tests and simulation (optimistic locking)
+
+- `test/integration/optimisticLocking.test.ts` (9 tests):
+  - the version bump; two editors where the second is refused, then re-reads and succeeds
+  - no conflict for a gone row, a version-only filter, `updateMany` or a non-pinned version
+  - every checked method, soft and forced deletes, refused upserts
+  - inside a transaction; both error classes surviving `withTransaction`
+- `test/types/model.types.ts`: `t.version()` read and insert types.
+- Simulation, stage 15: two desk clerks edit the same member. The stale save is refused, then re-read and applied on top. Result: 337 checks, 151 of 151 public functions.
+
+### Added — keyset paging, streaming, raw SQL and query events (roadmap step 4)
+
+- **`find().sort(…).after(cursor)`:** keyset pagination. It continues after the previous page's last row in the sort order, with one bound comparison per sort key (`(a < :a) OR (a = :a AND b > :b)`, direction by key). It refuses: no sort, a null or missing key, a cursor that is not an object. Typed: the cursor takes the row's types.
+- **`for await (const row of find())`:** a query is an async iterable. Rows are streamed on one held connection, released when the loop ends, breaks or throws. Inside a transaction the session's connection is used. Typed rows.
+- **``sql`…` ``:** raw SQL whose interpolated values are always binds.
+  - Arrays become bind lists. `sql.ident()` splices checked, quoted identifiers.
+  - Nested fragments are rendered from their parts (never re-parsed). `undefined`, functions, symbols, plain objects and empty arrays are refused.
+  - `.rows(target)` and `.execute(target)` run on the db handle, a session or a hook context.
+- **`onQuery(listener)`:** an event after every `execute` / `executeMany` (SQL, bind count, batch size, duration, rows, error; never bind values). It uses node-oracledb's trace handler, chains to one already installed (e.g. OpenTelemetry) and restores it on unsubscribe. A throwing listener is ignored.
+- New exports: `sql`, `SqlStatement`, `onQuery`, and the types `SqlTarget`, `QueryEvent`, `QueryListener`.
+
+### Tests and simulation (query tools)
+
+- `test/integration/queryTools.test.ts` (15 tests):
+  - full keyset paging equal to the sorted table; mixed directions and the `{ order }` form; refusals
+  - streaming with JSON decoding and exclusion projection; `break` / `throw` / query errors / a failing pool releasing the connection; reading inside a transaction
+  - `sql` binds of every kind, fragments with a `':p0'` literal, DML commit and rollback, refusals
+  - query events for find / insertMany / delete / errors; listeners that throw; chaining to a stand-in OpenTelemetry handler, a disabled one, and one replaced meanwhile
+- `test/types/queryTools.types.ts`: typed cursors, typed rows in `for await`, `sql` and `onQuery` types.
+- Simulation, new stage 16 "exports":
+  - the sales export keyset-paged in pages of 7, every sale once, biggest first
+  - a streamed pass over every sale, and an early stop at the first big ticket
+  - a store report in raw SQL with an `IN` list
+  - `onQuery` counting the export's statements without leaking bind values
+  - all checked against the model. Result: 345 checks, 96 queries, 154 of 154 public functions.
+
 ## [2.0.1] — 2026-11-25
 
 Patch release: Mira now behaves the same in node-oracledb Thin and Thick mode. 2.0.0 was only tested in Thin mode. On a machine with an Oracle Client on the system PATH, the adapter loads Thick mode even when `ORACLE_INSTANT_CLIENT` is blank, and two things broke.

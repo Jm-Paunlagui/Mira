@@ -36,7 +36,7 @@
 
 import type { DbConnection } from "../db";
 import type { QueryBuilder } from "../core/QueryBuilder";
-import { quoteIdentifier } from "../utils";
+import { sortTerm } from "../utils";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
 /**
@@ -147,8 +147,7 @@ class SetResultBuilder {
     if (this._sort) {
       const orderBy = Object.entries(this._sort)
         .map(
-          ([col, dir]) =>
-            `${quoteIdentifier(col)} ${dir === -1 ? "DESC" : "ASC"}`,
+          ([col, dir]) => sortTerm(col, dir),
         )
         .join(", ");
       sql += ` ORDER BY ${orderBy}`;

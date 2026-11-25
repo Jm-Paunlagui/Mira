@@ -1,6 +1,6 @@
 {
-  "name": "mira",
-  "version": "2.0.1",
+  "name": "@jm-paunlagui/mira",
+  "version": "2.1.0",
   "description": "A production-grade OracleDB wrapper that mirrors MongoDB's core API while leveraging the full power of Oracle SQL.",
   "keywords": [
     "MongoDB",
@@ -20,9 +20,32 @@
   "license": "Apache-2.0",
   "author": "John Moises Paunlagui",
   "type": "commonjs",
-  "main": "src/utils/oracle-mongo-wrapper/index.ts",
+  "main": "dist/utils/oracle-mongo-wrapper/index.js",
+  "types": "dist/utils/oracle-mongo-wrapper/index.d.ts",
+  "bin": {
+    "mira": "dist/cli/mira.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/utils/oracle-mongo-wrapper/index.d.ts",
+      "default": "./dist/utils/oracle-mongo-wrapper/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    ".env.example"
+  ],
   "scripts": {
     "typecheck": "tsc -p .",
+    "build": "bun run clean && tsc -p tsconfig.build.json",
+    "clean": "bun -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
+    "prepack": "bun run build",
+    "smoke:node": "node test/node/smoke.cjs",
     "test": "bun test/run.ts",
     "test:coverage": "bun test/run.ts --coverage",
     "test:unit": "bun test/run.ts test/unit",
@@ -31,20 +54,22 @@
     "test:chaos": "bun test/run.ts test/chaos",
     "test:security": "bun test/run.ts test/security",
     "test:reliability": "bun test/run.ts test/reliability",
-    "sim": "bun sim/run.ts"
+    "sim": "bun sim/run.ts",
+    "mira": "bun src/cli/mira.ts"
   },
   "dependencies": {
+    "@types/oracledb": "^26.0.1",
     "dotenv": "^17.4.2",
     "oracledb": "^7.0.0"
   },
   "engines": {
+    "node": ">=20",
     "bun": ">=1.4"
   },
   "devDependencies": {
     "@types/bun": "^1.4.5",
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.6",
-    "@types/oracledb": "^26.0.1",
     "typescript": "~6.0"
   },
   "packageManager": "bun@1.4.5"

@@ -30,7 +30,7 @@
  * ============================================================================
  */
 
-import { quoteIdentifier } from "../utils";
+import { quoteIdentifier, sortTerm } from "../utils";
 import { parseFilter } from "../parsers/filterParser";
 import { oracleMongoWrapperMessages as MSG } from "../../../constants/messages";
 
@@ -126,7 +126,7 @@ function buildConnectBy(tableName: string, spec: { startWith?: Record<string, un
   let orderSiblingsClause = "";
   if (orderSiblings) {
     const parts = Object.entries(orderSiblings).map(
-      ([col, dir]) => `${quoteIdentifier(col)} ${dir === -1 ? "DESC" : "ASC"}`,
+      ([col, dir]) => sortTerm(col, dir),
     );
     orderSiblingsClause = `ORDER SIBLINGS BY ${parts.join(", ")}`;
   }

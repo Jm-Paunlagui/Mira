@@ -170,6 +170,228 @@ export async function reportsStage(sim: Sim, ctx: Ctx, state: State) {
   const q3 = model.orders.filter((o) => o.quarter === "Q3");
   sim.eq("aggregate $out: Q3 receipts copied", (await raw<{ R: number }>(`SELECT RECEIPT_NO AS R FROM "${T.ORDERS_OUT}" ORDER BY 1`)).map((r) => Number(r.R)), q3.map((o) => o.receipt));
 
+  // ── 2.1 statistics: branch KPIs, revenue share, ties and NULL ordering ──────
+  // Money is compared in units rounded to 6 places: MEDIAN / STDDEV / PERCENTILE return
+  // unscaled NUMBERs, so they arrive as JS numbers, not as the exact money strings.
+  const sold = { STATUS: { $in: ["paid", "settled"] } };
+  const r6 = (x: unknown) => (x == null ? null : Math.round(Number(x) * 1e6) / 1e6);
+  const units = (cs: number[]) => cs.map((c) => c / 100).sort((a, b) => a - b);
+  const pctCont = (xs: number[], p: number) => {
+    const rn = p * (xs.length - 1), lo = Math.floor(rn), hi = Math.ceil(rn);
+    return xs[lo] + (rn - lo) * (xs[hi] - xs[lo]);
+  };
+  const pctDisc = (xs: number[], p: number) => xs[Math.max(0, Math.ceil(p * xs.length) - 1)];
+  const stdev = (xs: number[], sample: boolean) => {
+    if (sample && xs.length < 2) return null; // STDDEV_SAMP of one row is NULL
+    const m = sum(xs) / xs.length;
+    return Math.sqrt(sum(xs.map((x) => (x - m) ** 2)) / (xs.length - (sample ? 1 : 0)));
+  };
+  const storeIds = [...new Set(model.orders.map((o) => o.storeId))].sort((a, b) => a - b);
+  const ofStore = (s: number) => model.orders.filter((o) => o.storeId === s);
+  const kpi = await sim.mira(() =>
+    orders.aggregate([
+      { $match: sold },
+      {
+        $group: {
+          _id: "$STORE_ID",
+          CUSTOMERS: { $countDistinct: "$CUSTOMER_ID" },
+          MED: { $median: "$TOTAL" },
+          SD: { $stdDevSamp: "$TOTAL" },
+          SDP: { $stdDevPop: "$TOTAL" },
+          P: { $percentile: { input: "$TOTAL", p: [0.1, 0.9] } },
+          P90D: { $percentile: { input: "$TOTAL", p: 0.9, method: "discrete" } },
+          RECEIPTS: { $push: { input: "$RECEIPT_NO", orderBy: { RECEIPT_NO: 1 } } },
+          QUARTERS: { $addToSet: { input: "$QUARTER", orderBy: { QUARTER: 1 } } },
+          QLIST: { $listAgg: { input: "$QUARTER", separator: "/", distinct: true, orderBy: { QUARTER: 1 } } },
+        },
+      },
+      { $sort: { STORE_ID: 1 } },
+    ]),
+  );
+  sim.eq(
+    "branch KPIs: distinct customers, median / spread / P10-P90 / discrete P90 of the ticket",
+    kpi.map((r) => [Number(r.STORE_ID), Number(r.CUSTOMERS), r6(r.MED), r6(r.SD), r6(r.SDP), (r.P as number[]).map(r6), r6(r.P90D)]),
+    storeIds.map((s) => {
+      const t = units(ofStore(s).map((o) => o.total));
+      return [s, new Set(ofStore(s).map((o) => o.customerId)).size, r6(pctCont(t, 0.5)), r6(stdev(t, true)), r6(stdev(t, false)), [r6(pctCont(t, 0.1)), r6(pctCont(t, 0.9))], r6(pctDisc(t, 0.9))];
+    }),
+  );
+  sim.eq(
+    "branch KPIs: receipts ($push, in order), quarters traded ($addToSet, $listAgg)",
+    kpi.map((r) => [Number(r.STORE_ID), r.RECEIPTS, r.QUARTERS, r.QLIST]),
+    storeIds.map((s) => {
+      const qs = [...new Set(ofStore(s).map((o) => o.quarter))].sort();
+      return [s, ofStore(s).map((o) => o.receipt).sort((a, b) => a - b), qs, qs.join("/")];
+    }),
+  );
+  const share = await sim.mira(() =>
+    orders.aggregate([
+      { $match: sold },
+      { $group: { _id: "$STORE_ID", REV: { $sum: "$TOTAL" } } },
+      { $addFields: { SHARE: { $window: { fn: "RATIO_TO_REPORT", field: "REV" } }, PREV_REV: { $window: { fn: "LAG", field: "REV", orderBy: { STORE_ID: 1 }, default: 0 } } } },
+      { $sort: { STORE_ID: 1 } },
+    ]),
+  );
+  const revOfStore = (s: number) => sum(ofStore(s).map((o) => o.total));
+  const allRev = sum(model.orders.map((o) => o.total));
+  sim.eq(
+    "revenue share per branch (RATIO_TO_REPORT) and the previous branch's revenue (LAG, default 0)",
+    share.map((r) => [Number(r.STORE_ID), r6(r.SHARE), cents(r.PREV_REV)]),
+    storeIds.map((s, i) => [s, r6(revOfStore(s) / allRev), i ? revOfStore(storeIds[i - 1]) : 0]),
+  );
+  const nextCity = await sim.mira(() =>
+    customers.aggregate([{ $project: { ID: 1, NEXT_CITY: { $window: { fn: "LEAD", field: "CITY", orderBy: { ID: 1 }, ignoreNulls: true, default: "-" } } } }, { $sort: { ID: 1 } }]),
+  );
+  sim.eq(
+    "next customer's city, skipping customers with none (LEAD IGNORE NULLS, default '-')",
+    nextCity.map((r) => r.NEXT_CITY),
+    custRows.map((_, i) => custRows.slice(i + 1).find((c) => c.CITY != null)?.CITY ?? "-"),
+  );
+  const nullsFirst = (await customers.find({}).sort({ CITY: { order: 1, nulls: "first" }, ID: 1 }).project({ CITY: 1 }).toArray()) as { CITY: string | null }[];
+  sim.eq(
+    "customers by city, those without a city first (NULLS FIRST)",
+    nullsFirst.map((r) => r.CITY),
+    [...custRows.filter((c) => c.CITY == null), ...custRows.filter((c) => c.CITY != null).sort((a, b) => ((a.CITY as string) < (b.CITY as string) ? -1 : (a.CITY as string) > (b.CITY as string) ? 1 : a.ID - b.ID))].map((c) => c.CITY),
+  );
+  // Every ticket total is distinct, so ties are shown on the branch: "limit 1" of the
+  // orders by branch, WITH TIES, is all of the first branch's orders.
+  const firstBranch = (await sim.mira(() => orders.find(sold).sort({ STORE_ID: 1 }).limit(1, { withTies: true }).project({ RECEIPT_NO: 1 }).toArray())) as { RECEIPT_NO: number }[];
+  sim.eq("first branch's receipts: limit 1 WITH TIES keeps every order tied on the branch", firstBranch.map((r) => Number(r.RECEIPT_NO)).sort((a, b) => a - b), ofStore(storeIds[0]).map((o) => o.receipt).sort((a, b) => a - b));
+  const regulars = await sim.mira(() =>
+    orders.aggregate([{ $match: sold }, { $group: { _id: "$CUSTOMER_ID", N: { $count: "*" } } }, { $sort: { N: -1 } }, { $limit: { n: 1, withTies: true } }]),
+  );
+  const visits = new Map<number, number>();
+  for (const o of model.orders) visits.set(o.customerId, (visits.get(o.customerId) ?? 0) + 1);
+  const most = Math.max(...visits.values());
+  sim.eq(
+    "most frequent customers, every one tied at the top ($limit WITH TIES)",
+    regulars.map((r) => Number(r.CUSTOMER_ID)).sort((a, b) => a - b),
+    [...visits].filter(([, n]) => n === most).map(([id]) => id).sort((a, b) => a - b),
+  );
+
+  // ── 2.1 typed tables: generated from the catalogue, hand-written, created ───
+  const { t } = api;
+  const generated = await sim.mira(() => api.generateTableTypes(db, { tables: [T.CUSTOMERS, T.ORDERS] }));
+  const wanted = [
+    `export const SimCustomers = defineTable("${T.CUSTOMERS}", {`,
+    "  ID: t.id(),",
+    "  NAME: t.text(60),",
+    `  TIER: t.text(10).default("'regular'").nullable(),`,
+    `  CREDIT: t.decimal(12, 2).default("0").nullable(),`,
+    "  UPDATED_AT: t.timestamp().nullable(),",
+    `export const SimOrders = defineTable("${T.ORDERS}", {`,
+    `  CUSTOMER_ID: t.number().nullable().references("${T.CUSTOMERS}", "ID"),`,
+    "export type SimOrdersRow = typeof SimOrders.$row;",
+  ];
+  sim.eq("generateTableTypes: a typed definition per table, each column as 01-schema created it", wanted.filter((l) => !generated.split("\n").includes(l)), []);
+
+  // SIM_ORDERS as a typed table, written by hand to match 01-schema.
+  const TypedOrders = api.defineTable(T.ORDERS, {
+    ID: t.id(),
+    RECEIPT_NO: t.number(),
+    CUSTOMER_ID: t.number().nullable(),
+    STORE_ID: t.number().nullable(),
+    QUARTER: t.text(2).nullable(),
+    STATUS: t.text(10).default("'open'").nullable(),
+    TOTAL: t.decimal(12, 2).default(0).nullable(),
+    CREATED_AT: t.timestamp().nullable(),
+  });
+  const typedBig = await sim.mira(() => TypedOrders.on(db).find({ ...sold, TOTAL: { $gte: 300 } }).sort({ RECEIPT_NO: 1 }).project({ RECEIPT_NO: 1, TOTAL: 1 }).toArray());
+  sim.eq(
+    "typed find: tickets of 300.00 or more, projected to receipt and total",
+    typedBig.map((r) => [r.RECEIPT_NO, cents(r.TOTAL)]),
+    model.orders.filter((o) => o.total >= 30000).sort((a, b) => a.receipt - b.receipt).map((o) => [o.receipt, o.total]),
+  );
+
+  // Relations between the typed tables: nested rows in one statement per query.
+  const TypedCustomers = api.defineTable(T.CUSTOMERS, {
+    ID: t.id(),
+    NAME: t.text(60),
+    EMAIL: t.text(80),
+    TIER: t.text(10).default("'regular'").nullable(),
+    CITY: t.text(30).nullable(),
+    CREDIT: t.decimal(12, 2).default(0).nullable(),
+    UPDATED_AT: t.timestamp().nullable(),
+  });
+  const CustomersR = api.relations(TypedCustomers, {
+    orders: api.hasMany(TypedOrders, { foreignKey: "CUSTOMER_ID" }),
+    firstOrder: api.hasOne(TypedOrders, { foreignKey: "CUSTOMER_ID" }),
+  });
+  const OrdersR = api.relations(TypedOrders, { customer: api.belongsTo(TypedCustomers, { foreignKey: "CUSTOMER_ID" }) });
+  const soldOf = (id: number) => model.orders.filter((o) => o.customerId === id);
+  const vips = await sim.mira(() =>
+    CustomersR.on(db).find({ TIER: "vip" }).sort({ ID: 1 }).project({ ID: 1, NAME: 1 }).include("orders", { where: sold, sort: { TOTAL: -1, RECEIPT_NO: 1 }, limit: 3 }).toArray(),
+  );
+  sim.eq(
+    "include hasMany: each VIP's three biggest tickets, nested, in one statement",
+    vips.map((c) => [c.NAME, c.orders.map((o) => [o.RECEIPT_NO, cents(o.TOTAL)])]),
+    custRows.filter((c) => c.TIER === "vip").map((c) => [c.NAME, soldOf(c.ID).sort((a, b) => b.total - a.total || a.receipt - b.receipt).slice(0, 3).map((o) => [o.receipt, o.total])]),
+  );
+  const bigTickets = await sim.mira(() => OrdersR.on(db).find({ ...sold, TOTAL: { $gte: 300 } }).sort({ RECEIPT_NO: 1 }).project({ RECEIPT_NO: 1 }).include("customer").toArray());
+  sim.eq(
+    "include belongsTo: the customer behind every ticket of 300.00 or more",
+    bigTickets.map((o) => [o.RECEIPT_NO, o.customer?.NAME ?? null]),
+    model.orders.filter((o) => o.total >= 30000).sort((a, b) => a.receipt - b.receipt).map((o) => [o.receipt, byId.get(o.customerId)?.NAME ?? null]),
+  );
+  const firsts = await sim.mira(() => CustomersR.on(db).find().sort({ ID: 1 }).project({ ID: 1 }).include("firstOrder", { where: sold, sort: { RECEIPT_NO: 1 } }).toArray());
+  sim.eq(
+    "include hasOne: each customer's first receipt, null for a customer who never bought",
+    firsts.map((c) => [c.ID, c.firstOrder?.RECEIPT_NO ?? null]),
+    custRows.map((c) => [c.ID, soldOf(c.ID).map((o) => o.receipt).sort((a, b) => a - b)[0] ?? null]),
+  );
+
+  // A loyalty table created from its definition, filled in one transaction. VIP
+  // members get a note, others do not: documents of two shapes in one insertMany.
+  const Loyalty = api.defineTable(T.LOYALTY, {
+    ID: t.id(),
+    CUSTOMER_ID: t.number().references(T.CUSTOMERS, "ID"),
+    POINTS: t.number(),
+    LEVEL_NAME: t.text(10).default("'bronze'"),
+    NOTE: t.text(60).nullable(),
+    // VIP preferences as a JSON document (CLOB IS JSON).
+    PREFS: t.json<{ lounge: boolean; drinks: string[]; reviewed?: boolean }>().nullable(),
+  });
+  await Loyalty.create(db);
+  sim.eq("TypedTable.ddl(): the identity key and the defaulted column as createTable takes them", [Loyalty.ddl().ID, Loyalty.ddl().LEVEL_NAME], [{ type: "NUMBER", autoIncrement: true, primaryKey: true }, { type: "VARCHAR2(10)", notNull: true, default: "'bronze'" }]);
+  const spent = new Map<number, number>();
+  for (const o of model.orders) spent.set(o.customerId, (spent.get(o.customerId) ?? 0) + o.total);
+  const drinksOf = (id: number) => (id % 2 === 0 ? ["coffee", "calamansi"] : ["tea"]);
+  const members = [...spent].sort((a, b) => a[0] - b[0]).map(([id, c]) => ({ id, points: Math.floor(c / 1000), vip: byId.get(id)?.TIER === "vip" })); // 1 point per 10.00
+  await new api.Transaction(db).withTransaction(async (session) => {
+    await Loyalty.on(session).insertMany(members.map((m) => (m.vip ? { CUSTOMER_ID: m.id, POINTS: m.points, NOTE: "vip lounge", PREFS: { lounge: true, drinks: drinksOf(m.id) } } : { CUSTOMER_ID: m.id, POINTS: m.points })));
+  });
+  const board = await sim.mira(() => Loyalty.on(db).find({ POINTS: { $gt: 0 } }).sort({ POINTS: -1, CUSTOMER_ID: 1 }).toArray());
+  sim.eq(
+    "typed table from create(): points per customer, default level filled in, notes only for VIPs",
+    board.map((r) => [r.CUSTOMER_ID, r.POINTS, r.LEVEL_NAME, r.NOTE]),
+    members.filter((m) => m.points > 0).sort((a, b) => b.points - a.points || a.id - b.id).map((m) => [m.id, m.points, "bronze", m.vip ? "vip lounge" : null]),
+  );
+  // JSON column: path filters, $elemMatch, $push / $pull / $set on paths, $jsonTable.
+  const loyalty = Loyalty.on(db);
+  const loungeIds = members.filter((m) => m.vip).map((m) => m.id);
+  const lounge = await sim.mira(() => loyalty.find({ "PREFS.lounge": true }).sort({ CUSTOMER_ID: 1 }).project({ CUSTOMER_ID: 1, PREFS: 1 }).toArray());
+  sim.eq("JSON path filter: VIPs with lounge access, preferences read back as documents", lounge.map((r) => [r.CUSTOMER_ID, r.PREFS?.drinks]), loungeIds.map((id) => [id, drinksOf(id)]));
+  const teaDrinkers = await sim.mira(() => loyalty.find({ "PREFS.drinks": { $elemMatch: { $eq: "tea" } } }).sort({ CUSTOMER_ID: 1 }).project({ CUSTOMER_ID: 1 }).toArray());
+  sim.eq("$elemMatch: members whose drinks include tea", teaDrinkers.map((r) => r.CUSTOMER_ID), loungeIds.filter((id) => drinksOf(id).includes("tea")));
+  // Water is added for every VIP and calamansi leaves the menu; each reviewed member is marked.
+  await sim.mira(() => loyalty.updateMany({ "PREFS.lounge": true }, { $push: { "PREFS.drinks": "water" }, $set: { "PREFS.reviewed": true } }));
+  await sim.mira(() => loyalty.updateMany({ "PREFS.drinks": { $elemMatch: { $eq: "calamansi" } } }, { $pull: { "PREFS.drinks": "calamansi" } }));
+  const menu = await sim.mira(() =>
+    loyalty.aggregate<{ DRINK: string; N: number }>([
+      { $match: { "PREFS.reviewed": true } },
+      { $jsonTable: { column: "PREFS", path: "drinks", columns: { DRINK: { path: "$", type: "VARCHAR2(20)" } } } },
+      { $group: { _id: "$DRINK", N: { $count: "*" } } },
+      { $sort: { DRINK: 1 } },
+    ]),
+  );
+  const wantMenu = new Map<string, number>();
+  for (const id of loungeIds) for (const d of [...drinksOf(id).filter((x) => x !== "calamansi"), "water"]) wantMenu.set(d, (wantMenu.get(d) ?? 0) + 1);
+  sim.eq(
+    "$jsonTable + $group: drinks across reviewed VIPs after $push water / $pull calamansi",
+    menu.map((r) => [r.DRINK, Number(r.N)]),
+    [...wantMenu].sort((a, b) => (a[0] < b[0] ? -1 : 1)),
+  );
+
   // ── Set operations ───────────────────────────────────────────────────────
   const vip = () => customers.find({ TIER: "vip" }).project({ NAME: 1 });
   const cebu = () => customers.find({ CITY: "Cebu" }).project({ NAME: 1 });

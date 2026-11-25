@@ -27,7 +27,9 @@
  *  13 finance      FX at the rate in force, loan and depreciation schedules vs
  *                  the ledger, CUBE / GROUPING SETS, allocation to the cent
  *  14 audit        Benford, orphan journals, split payments
- *  15 operations   pool stats, health, shutdown
+ *  15 members      a typed model table: timestamps, soft delete, hooks, validation
+ *  16 exports      keyset paging, for await, sql`…`, onQuery
+ *  17 operations   pool stats, health, shutdown
  *
  * Queries Mira's API cannot express run as hand-written SQL through an
  * untracked handle, are still checked against the model, and are listed as
@@ -60,6 +62,8 @@ import { inventoryStage } from "./stages/11-inventory";
 import { kitchenStage } from "./stages/12-kitchen";
 import { financeStage } from "./stages/13-finance";
 import { auditStage } from "./stages/14-audit";
+import { membersStage } from "./stages/15-members";
+import { exportsStage } from "./stages/16-exports";
 
 const t0 = performance.now();
 const ctx = await buildContext();
@@ -105,7 +109,9 @@ await sim.stage("11 inventory", () => inventoryStage(sim, ctx, state));
 await sim.stage("12 kitchen", () => kitchenStage(sim, ctx, state));
 await sim.stage("13 finance", () => financeStage(sim, ctx, state));
 await sim.stage("14 audit", () => auditStage(sim, ctx, state));
-await sim.stage("15 operations", async () => {
+await sim.stage("15 members", () => membersStage(sim, ctx));
+await sim.stage("16 exports", () => exportsStage(sim, ctx, state));
+await sim.stage("17 operations", async () => {
   sim.eq("isHealthy: the pool is up", ctx.db.isHealthy(), true);
   const stats = (await ctx.db.getPoolStats()) as { pools?: Record<string, unknown> | unknown[] };
   sim.ok("getPoolStats: reports the appDb pool", JSON.stringify(stats).includes("appDb"), stats);

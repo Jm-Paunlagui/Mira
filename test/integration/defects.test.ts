@@ -263,3 +263,88 @@ describe("integration: defects that failed loudly", () => {
     expect(rows.map((r) => r.CITY).sort()).toEqual([...totals].filter(([, t]) => t > 150).map(([c]) => c).sort());
   });
 });
+
+// Found while testing typed tables (2.1): optional columns make documents with
+// different keys common, and typed inserts pass Buffers and Dates through insertMany.
+describe("integration: insertMany with documents that differ", () => {
+  const M = "MIRA_SD_MIXED";
+  beforeAll(async () => {
+    await dropIfExists(M);
+    await schema.createTable(M, {
+      ID: { type: "NUMBER", primaryKey: true, autoIncrement: true },
+      A: { type: "VARCHAR2(20)" },
+      B: { type: "VARCHAR2(20)" },
+      STATUS: { type: "VARCHAR2(10)", default: "'open'", notNull: true },
+      AT: { type: "TIMESTAMP(3)" },
+      BIN: { type: "BLOB" },
+    });
+  });
+  afterAll(() => dropIfExists(M));
+
+  it("DEFECT: insertMany keeps the columns only later documents have, and the defaults of omitted ones", async () => {
+    const res = await coll(M).insertMany([{ A: "a1" }, { A: "a2", B: "b2" }, { B: "b3", STATUS: "paid" }, { A: "a4" }]);
+    const rows = await coll(M).find({}).sort({ ID: 1 }).project({ ID: 1, A: 1, B: 1, STATUS: 1 }).toArray<{ ID: number; A: string | null; B: string | null; STATUS: string }>();
+    expect(rows.map((r) => [r.A, r.B, r.STATUS])).toEqual([["a1", null, "open"], ["a2", "b2", "open"], [null, "b3", "paid"], ["a4", null, "open"]]);
+    expect(res.insertedCount).toBe(4);
+    // insertedIds stay in the caller's order
+    expect(res.insertedIds).toEqual(rows.map((r) => r.ID));
+  });
+
+  it("DEFECT: insertMany binds a Buffer to a BLOB column, small or large", async () => {
+    await rawExec(`DELETE FROM "${M}"`);
+    const small = Buffer.from([0, 1, 2, 255]);
+    const large = Buffer.from(Array.from({ length: 70_000 }, (_, i) => i % 256));
+    await coll(M).insertMany([{ A: "s", BIN: small }, { A: "l", BIN: large }]);
+    const rows = await coll(M).find({}).sort({ A: -1 }).project({ BIN: 1 }).toArray<{ BIN: Buffer }>();
+    expect(rows[0].BIN.equals(small)).toBe(true);
+    expect(rows[1].BIN.equals(large)).toBe(true);
+  });
+
+  it("batchErrors offsets point at the caller's documents across column-set groups", async () => {
+    await rawExec(`DELETE FROM "${M}"`);
+    const tooLong = "x".repeat(21); // VARCHAR2(20): ORA-12899
+    const res = await coll(M).insertMany([{ A: "ok0" }, { A: tooLong }, { A: "ok2", B: "b" }, { A: "ok3", B: tooLong }, { B: "ok4" }], { returning: [], batchErrors: true });
+    expect(res.insertedCount).toBe(3);
+    expect(res.batchErrors?.map((e) => e.offset)).toEqual([1, 3]);
+    expect(res.batchErrors?.every((e) => /ORA-12899/.test(e.message))).toBe(true);
+  });
+
+  it("insertMany binds text over 32 KB to a CLOB column", async () => {
+    const C2 = "MIRA_SD_CLOBS";
+    await dropIfExists(C2);
+    await schema.createTable(C2, { ID: { type: "NUMBER" }, DOC: { type: "CLOB" } });
+    try {
+      const big = "é".repeat(20_000); // 40,000 bytes
+      await coll(C2).insertMany([{ ID: 1, DOC: big }, { ID: 2, DOC: "short" }], { returning: [] });
+      const rows = await coll(C2).find({}).sort({ ID: 1 }).toArray<{ DOC: string }>();
+      expect(rows.map((r) => r.DOC)).toEqual([big, "short"]);
+    } finally {
+      await dropIfExists(C2);
+    }
+  });
+
+  it("DEFECT: insertMany takes a column given as a number in one document and a numeric string in another", async () => {
+    // Typed money columns accept string | number; one bind type per column came from the
+    // first value, so ["10.5", 99] failed with NJS-011.
+    const N = "MIRA_SD_NUMS";
+    await dropIfExists(N);
+    await schema.createTable(N, { K: { type: "NUMBER" }, AMT: { type: "NUMBER(19,4)" } });
+    try {
+      await coll(N).insertMany([{ K: 1, AMT: "10.5" }, { K: 2, AMT: 99 }, { K: 3, AMT: null }, { K: 4, AMT: "0.0001" }], { returning: [] });
+      await coll(N).insertMany([{ K: 5, AMT: 7 }, { K: 6, AMT: "8.25" }], { returning: [] });
+      const rows = await coll(N).find({}).sort({ K: 1 }).toArray<{ AMT: string | null }>();
+      expect(rows.map((r) => r.AMT)).toEqual(["10.5", "99", null, ".0001", "7", "8.25"]);
+    } finally {
+      await dropIfExists(N);
+    }
+  });
+
+  it("insertMany keeps a Date's milliseconds, as insertOne does", async () => {
+    await rawExec(`DELETE FROM "${M}"`);
+    const at = new Date("2026-05-06T07:08:09.123Z");
+    await coll(M).insertMany([{ A: "many", AT: at }]);
+    await coll(M).insertOne({ A: "one", AT: at });
+    const rows = await coll(M).find({}).sort({ A: 1 }).project({ A: 1, AT: 1 }).toArray<{ A: string; AT: Date }>();
+    expect(rows.map((r) => [r.A, r.AT.getTime()])).toEqual([["many", at.getTime()], ["one", at.getTime()]]);
+  });
+});

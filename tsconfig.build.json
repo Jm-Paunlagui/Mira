@@ -1,0 +1,18 @@
+{
+    // Emit the npm build: CommonJS JavaScript plus .d.ts type files in dist/.
+    // Bun runs src/**/*.ts directly; this build is for Node (and Bun users who
+    // install the package). Run: bun run build
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "module": "nodenext",
+        "moduleResolution": "nodenext",
+        "noEmit": false,
+        "outDir": "dist",
+        "rootDir": "src",
+        "declaration": true,
+        "declarationMap": true,
+        "sourceMap": true,
+        "types": ["node", "bun"]
+    },
+    "include": ["src/**/*.ts"]
+}
