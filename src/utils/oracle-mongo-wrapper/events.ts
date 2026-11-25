@@ -97,7 +97,7 @@ function install(): void {
   // Every hook the driver may call: passed on to the earlier handler when it is enabled.
   const forward = (name: string) =>
     function (this: unknown, ...a: unknown[]) {
-      if (prev?.isEnabled?.()) prev[name]?.apply(prev, a);
+      if (prev?.isEnabled?.()) prev[name]?.call(prev, ...a);
     };
   class MiraTraceHandler extends t.TraceHandlerBase {
     isEnabled() {

@@ -41,6 +41,8 @@ import type { AnyRelation, Relation } from "./relations";
 
 type Columns = Record<string, AnyColumn>;
 type Simplify<T> = { [K in keyof T]: T[K] } & {};
+/** No extra members: the type of an empty object literal. */
+type Empty = Record<never, never>;
 
 /** The value a column reads back: its R type, or null when it is nullable. */
 type ReadOf<C> = C extends AnyColumn ? (C["$nullable"] extends true ? C["$read"] | null : C["$read"]) : never;
@@ -85,9 +87,9 @@ export type FieldOperators<V, IsString extends boolean> = {
   // Subquery forms build their own SQL; their arguments are not typed here.
   $inSelect?: unknown;
   $subquery?: unknown;
-} & (IsString extends true ? { $like?: string; $regex?: string; $options?: string } : {})
+} & (IsString extends true ? { $like?: string; $regex?: string; $options?: string } : Empty)
   // A JSON column holding an array: an element matching every condition (JSON_EXISTS).
-  & (Scalar<V> extends object ? (Scalar<V> extends Date | Buffer ? {} : { $elemMatch?: Record<string, unknown> }) : {});
+  & (Scalar<V> extends object ? (Scalar<V> extends Date | Buffer ? Empty : { $elemMatch?: Record<string, unknown> }) : Empty);
 
 /** "COL.a.b": a path into a JSON column. Known column first; the rest of the path is not checked. */
 export type JsonPath<W> = `${string & keyof W}.${string}`;
@@ -140,14 +142,14 @@ type ForUpdateMode = Parameters<QueryBuilder["forUpdate"]>[0];
 
 /** include() options for one relation: a filter and order on the related table; limit for hasMany. */
 export type IncludeOptionsOf<Rel> = Rel extends Relation<infer Kind, infer TC>
-  ? { where?: Filter<WriteRowOf<TC>>; sort?: Sort<RowOf<TC>> } & (Kind extends "hasMany" ? { limit?: number } : {})
+  ? { where?: Filter<WriteRowOf<TC>>; sort?: Sort<RowOf<TC>> } & (Kind extends "hasMany" ? { limit?: number } : Empty)
   : never;
 
 /**
  * A find() chain on a typed table. B is the row (narrowed by project()), Rel the
  * table's relations, Inc what include() has added so far. Rows are B & Inc.
  */
-export interface TypedQuery<B, Rel = {}, Inc = {}> extends PromiseLike<Array<Simplify<B & Inc>>> {
+export interface TypedQuery<B, Rel = Empty, Inc = Empty> extends PromiseLike<Array<Simplify<B & Inc>>> {
   sort(spec: Sort<B>): TypedQuery<B, Rel, Inc>;
   limit(n: number, options?: LimitOptions): TypedQuery<B, Rel, Inc>;
   skip(n: number): TypedQuery<B, Rel, Inc>;
@@ -173,7 +175,7 @@ type Out<M extends keyof OracleCollection> = OracleCollection[M] extends (...a: 
 type Arg<M extends keyof OracleCollection, I extends number> = OracleCollection[M] extends (...a: infer A) => unknown ? A[I] : never;
 
 /** A collection on a typed table. Same object and behaviour as OracleCollection; typed signatures. */
-export interface TypedCollection<R, I, W, Rel = {}> {
+export interface TypedCollection<R, I, W, Rel = Empty> {
   readonly tableName: string;
   find(filter?: Filter<W>, options?: Arg<"find", 1>): TypedQuery<R, Rel>;
   findOne(filter: Filter<W>): Promise<R | null>;
@@ -207,7 +209,7 @@ type HasSoftDelete<C extends Columns> = { [K in keyof C]: C[K] extends { $softDe
 
 /** The collection on() returns for a table. */
 export type CollectionOf<C extends Columns, Rel> = TypedCollection<RowOf<C>, InsertOf<C>, WriteRowOf<C>, Rel> &
-  (HasSoftDelete<C> extends true ? SoftDeleteMethods<RowOf<C>, InsertOf<C>, WriteRowOf<C>, Rel> : {});
+  (HasSoftDelete<C> extends true ? SoftDeleteMethods<RowOf<C>, InsertOf<C>, WriteRowOf<C>, Rel> : Empty);
 
 /**
  * Hooks run around writes through the table's collection. A before-hook may return a new
@@ -240,7 +242,7 @@ export type TableTarget = WrapperDb | { collection(tableName: string): OracleCol
 type ColumnSpec = Parameters<OracleSchema["createTable"]>[1][string];
 
 /** A table definition. Build one with defineTable(); bind it to a db or session with on(). */
-export class TypedTable<C extends Columns, Rel extends Record<string, AnyRelation> = {}> {
+export class TypedTable<C extends Columns, Rel extends Record<string, AnyRelation> = Empty> {
   /** Type-only: one row as Mira returns it (`typeof Orders.$row`). */
   declare readonly $row: RowOf<C>;
   /** Type-only: the document insertOne() accepts. */
