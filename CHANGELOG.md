@@ -189,6 +189,15 @@ Two tests failed only on the CI database:
 - **The untyped API is unchanged:** a JSON column is returned as its stored text, as in 2.0. Only typed tables decode it.
 - **A filter key with a dot is now a JSON path.** Before, it was quoted as one column name; no Mira code used that.
 - **The native JSON type needs Thin mode or Oracle Client 21c+.** With the 19.6 client against 23ai, reading it fails with `ORA-40569` and a write broke the session (`ORA-03106`). `Table.on(db)` refuses a native column on a 19.x Thick client with a clear message.
+- **The native JSON type needs Oracle Database 21c+.** On 19c, `createTable()` (and so `create()` and migrations) refuses a `JSON` column with a clear message instead of `ORA-00902`.
+
+### Found on Oracle 19c (JSON)
+
+CI runs Oracle 23ai, so these were found by running the suite on the 19c container. Each was shown failing on 19c first.
+
+- **`$push` / `$pull` lost every scalar element.** 19c's `JSON_TABLE` returns NULL for a scalar in a `FORMAT JSON` column (23ai returns it), and `JSON_ARRAYAGG` dropped the NULLs: `["a", {"z":1}]` plus `"c"` became `[{"z":1}]`. Elements are now read `WITH WRAPPER` and unwrapped.
+- **`$elemMatch` with `$nin` or `$exists: false` matched nothing.** 19c never treats a negated path-filter condition (`!(…)`, `!exists(…)`) as true. A negation is now `NOT JSON_EXISTS` on each element (`EXISTS` over `JSON_TABLE`); `TO_CLOB` on the element stops 19c rewriting it into `ORA-31013`. `$elemMatch` without a negation keeps the single `JSON_EXISTS`.
+- **`t.json({ native: true })` on 19c** failed with `ORA-00902`; it is now refused up front (above).
 
 ### Tests and simulation (JSON)
 

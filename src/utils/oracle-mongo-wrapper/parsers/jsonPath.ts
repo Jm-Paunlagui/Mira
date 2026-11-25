@@ -128,23 +128,24 @@ function elemMatch(col: string, path: string, field: string, cond: unknown, bind
     passing.push(`:${name} AS "${variable}"`);
     return `$${variable}`;
   };
-  const onTarget = (target: string, spec: unknown): string[] => {
+  // A term is a filter condition, or the negation of one ($nin, $exists: false).
+  type Term = { text: string; negated: boolean };
+  const onTarget = (target: string, spec: unknown): Term[] => {
     if (!isOperators(spec)) {
       if (spec !== null && typeof spec === "object" && !(spec instanceof Date)) fail(`${field}: $elemMatch on a nested object needs dotted names ("a.b": …)`);
-      return [`${target} == ${literal(spec)}`];
+      return [{ text: `${target} == ${literal(spec)}`, negated: false }];
     }
     return Object.entries(spec).map(([op, v]) => {
-      if (op in PATH_COMPARE) return `${target} ${PATH_COMPARE[op]} ${literal(v)}`;
+      if (op in PATH_COMPARE) return { text: `${target} ${PATH_COMPARE[op]} ${literal(v)}`, negated: false };
       if (op === "$in" || op === "$nin") {
         if (!Array.isArray(v) || v.length === 0) fail(`${field}: ${op} needs a non-empty list`);
-        const any = `(${(v as unknown[]).map((x) => `${target} == ${literal(x)}`).join(" || ")})`;
-        return op === "$in" ? any : `!${any}`;
+        return { text: `(${(v as unknown[]).map((x) => `${target} == ${literal(x)}`).join(" || ")})`, negated: op === "$nin" };
       }
-      if (op === "$exists") return v ? `exists(${target})` : `!exists(${target})`;
+      if (op === "$exists") return { text: `exists(${target})`, negated: !v };
       return fail(`${field}: ${op} is not supported in $elemMatch (use $eq $ne $gt $gte $lt $lte $in $nin $exists)`);
     });
   };
-  const terms: string[] = [];
+  const terms: Term[] = [];
   for (const [k, v] of Object.entries(cond as Record<string, unknown>)) {
     if (k.startsWith("$")) {
       terms.push(...onTarget("@", { [k]: v }));
@@ -154,7 +155,19 @@ function elemMatch(col: string, path: string, field: string, cond: unknown, bind
     for (const s of segs) if (!KEY.test(s) && !INDEX.test(s)) fail(`${field}: $elemMatch field "${k}" must be names or indexes joined by dots`);
     terms.push(...onTarget(`@${pathText(segs).slice(1)}`, v));
   }
-  return `JSON_EXISTS(${col}, '${path}[*]?(${terms.join(" && ")})'${passing.length ? ` PASSING ${passing.join(", ")}` : ""})`;
+  const pass = passing.length ? ` PASSING ${passing.join(", ")}` : "";
+  const positive = terms.filter((x) => !x.negated).map((x) => x.text);
+  const negated = terms.filter((x) => x.negated).map((x) => x.text);
+  if (negated.length === 0) return `JSON_EXISTS(${col}, '${path}[*]?(${positive.join(" && ")})'${pass})`;
+  // 19c never treats a negated filter condition (`!(…)`, `!exists(…)`) as true, so a negation
+  // becomes NOT JSON_EXISTS on one element at a time: each element is read wrapped ("[elem]"),
+  // and `$[*]` is that element. TO_CLOB stops 19c rewriting JSON_EXISTS over a JSON_TABLE
+  // column, which fails with ORA-31013. The same SQL runs on 19c and 23ai.
+  const checks = [
+    ...(positive.length > 0 ? [`JSON_EXISTS(TO_CLOB(e."E"), '$[*]?(${positive.join(" && ")})'${pass})`] : []),
+    ...negated.map((n) => `NOT JSON_EXISTS(TO_CLOB(e."E"), '$[*]?(${n})'${pass})`),
+  ];
+  return `EXISTS (SELECT 1 FROM JSON_TABLE(${col}, '${path}[*]' COLUMNS ("E" CLOB FORMAT JSON WITH WRAPPER PATH '$')) e WHERE ${checks.join(" AND ")})`;
 }
 
 // ─── Updates ────────────────────────────────────────────────────────────────
@@ -249,10 +262,12 @@ class JsonUpdates {
       if (Object.keys(u.patch).length > 0) expr = `JSON_MERGEPATCH(${expr}, ${bind(JSON.stringify(u.patch))} RETURNING CLOB)`;
       for (const a of u.arrays) {
         // Rebuild the array from the stored one (the row's value before this UPDATE).
-        const elements = `JSON_TABLE(${col}, '${pathText(a.segments)}[*]' COLUMNS ("O" FOR ORDINALITY, "V" CLOB FORMAT JSON PATH '$', "S" VARCHAR2(4000) PATH '$')) j`;
+        // Each element as JSON text. 19c returns NULL for a scalar element in a FORMAT JSON column
+        // (JSON_ARRAYAGG then drops it), so read it wrapped ("[\"a\"]") and strip the brackets.
+        const elements = `JSON_TABLE(${col}, '${pathText(a.segments)}[*]' COLUMNS ("O" FOR ORDINALITY, "W" CLOB FORMAT JSON WITH WRAPPER PATH '$', "S" VARCHAR2(4000) PATH '$')) j`;
         const keep = a.pull ? ` WHERE j."S" IS NULL OR j."S" NOT IN (${a.pull.map((v) => bind(v === null ? null : String(v))).join(", ")})` : "";
         const added = (a.push ?? []).map((v, i) => ` UNION ALL SELECT TO_CLOB(${bind(JSON.stringify(v instanceof Date ? v.toISOString() : v))}), ${1e15 + i} FROM DUAL`).join("");
-        const rebuilt = `NVL((SELECT JSON_ARRAYAGG(x."V" FORMAT JSON ORDER BY x."O" RETURNING CLOB) FROM (SELECT j."V", j."O" FROM ${elements}${keep}${added}) x), TO_CLOB('[]'))`;
+        const rebuilt = `NVL((SELECT JSON_ARRAYAGG(x."V" FORMAT JSON ORDER BY x."O" RETURNING CLOB) FROM (SELECT SUBSTR(j."W", 2, LENGTH(j."W") - 2) "V", j."O" FROM ${elements}${keep}${added}) x), TO_CLOB('[]'))`;
         // Wrap it in objects up to the column: {"a":{"tags":[…]}} as a merge patch.
         const patch = a.segments.reduceRight((inner, s, i) => `JSON_OBJECT('${s}' VALUE ${inner} FORMAT JSON RETURNING CLOB)`, rebuilt);
         expr = a.segments.length === 0 ? rebuilt : `JSON_MERGEPATCH(${expr}, ${patch} RETURNING CLOB)`;

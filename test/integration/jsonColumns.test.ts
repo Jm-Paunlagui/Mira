@@ -10,6 +10,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { defineTable, t, relations, hasMany, generateTableTypes, OracleCollection, type TypedTable } from "../../src/utils/oracle-mongo-wrapper";
 import { db, coll, dropIfExists, rawExec } from "../helpers/db";
+import type { DbConnection } from "../../src/utils/oracle-mongo-wrapper/db";
 
 type Doc = { city: string; total: number; vip?: boolean; at?: string; tags: Array<string | number>; items: Array<{ sku: string; qty: number }>; addr?: { zip: number } };
 const P = "MIRA_JS_PEOPLE";
@@ -224,12 +225,20 @@ describe("JSON columns: generator and native JSON", () => {
     expect(mod.MiraJsDocs.ddl()).toEqual(Docs.ddl());
   });
 
-  it("t.json({ native: true }): the JSON type in Thin mode; refused up front with a 19.x Thick client", async () => {
+  it("t.json({ native: true }): the JSON type in Thin mode; refused up front with a 19.x Thick client or a 19c database", async () => {
     const Native = defineTable("MIRA_JS_NATIVE", { ID: t.number(), DOC: t.json<{ a: number[] }>({ native: true }) });
     expect(Native.ddl().DOC).toEqual({ type: "JSON", notNull: true });
     const client = db.oracledb.oracleClientVersion;
     if (client && client < 2100000000) {
       expect(() => Native.on(db)).toThrow(/use the native JSON type, which needs Thin mode or Oracle Client 21c\+/);
+      return;
+    }
+    const server = await db.withConnection(async (conn: DbConnection) => conn.oracleServerVersion);
+    if (server < 2100000000) {
+      // Thin mode binds fine; the JSON type itself arrived in 21c, so CREATE TABLE is
+      // refused before Oracle answers ORA-00902.
+      expect(Native.on(db)).toBeInstanceOf(OracleCollection);
+      await expect(Native.create(db)).rejects.toThrow(/MIRA_JS_NATIVE: DOC use the JSON type, which needs Oracle Database 21c or later \(this is 19\./);
       return;
     }
     await dropIfExists(Native.name);

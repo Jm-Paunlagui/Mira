@@ -366,7 +366,7 @@ await members.aggregate([
 - Filters and updates on paths also work through the untyped API.
 - The untyped API keeps returning JSON columns as the **stored text**, as in 2.0, so code written for 2.0 is unaffected.
 - All the SQL uses functions Oracle 19c has (no `JSON_TRANSFORM`), so it runs on 19c and 23ai, for JSON text and for the JSON type.
-- **The native JSON type needs Thin mode or Oracle Client 21c+.** A 19c client can't read it (`ORA-40569`), and a write can break the session (`ORA-03106`). `Table.on(db)` refuses a native column on a 19.x Thick client, and says so.
+- **The native JSON type needs Thin mode or Oracle Client 21c+.** A 19c client can't read it (`ORA-40569`), and a write can break the session (`ORA-03106`). `Table.on(db)` refuses a native column on a 19.x Thick client, and says so. The JSON type itself needs Oracle Database 21c+: on 19c, `create()` refuses it before Oracle answers `ORA-00902`.
 - A filter key containing a dot is now always a JSON path. A column whose name itself contains a dot can't be filtered by name.
 
 ### Migrations (2.1)
