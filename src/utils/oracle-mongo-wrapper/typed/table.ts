@@ -18,10 +18,12 @@
  * A definition needs no database: it can live at module scope, be written by
  * `mira generate types`, and be read by migrations. on() binds it.
  *
- * THE TYPED LAYER IS COMPILE-TIME ONLY. on() returns the ordinary
- * OracleCollection (its QueryBuilders are ordinary too), so every behaviour,
- * check and error is exactly 2.0's; only the TypeScript signatures are
- * narrowed. Anything the typed signatures do not cover is one `.untyped` away.
+ * THE TYPED LAYER IS COMPILE-TIME ONLY, with one opt-in exception. on()
+ * returns the ordinary OracleCollection (its QueryBuilders are ordinary too),
+ * so every behaviour, check and error is exactly 2.0's; only the TypeScript
+ * signatures are narrowed. Anything the typed signatures do not cover is one
+ * `.untyped` away. The exception: a table with t.updatedAt() / t.deletedAt()
+ * columns, hooks or { validate: true } gets a ModelCollection (see model.ts).
  * ============================================================================
  */
 
@@ -30,6 +32,7 @@ import type { QueryBuilder } from "../core/QueryBuilder";
 import { OracleSchema } from "../schema/OracleSchema";
 import type { WrapperDb } from "../db";
 import type { AnyColumn, ColumnMeta } from "./columns";
+import { ModelCollection, type HookContext, type ModelHooks, type ModelSpec } from "./model";
 import { quoteIdentifier } from "../utils";
 import type { RelationSpec } from "./include";
 import type { AnyRelation, Relation } from "./relations";
@@ -177,12 +180,51 @@ export interface TypedCollection<R, I, W, Rel = {}> {
   updateOne(filter: Filter<W>, update: Update<W, R>, options?: Arg<"updateOne", 2>): Out<"updateOne">;
   updateMany(filter: Filter<W>, update: Update<W, R>, options?: Arg<"updateMany", 2>): Out<"updateMany">;
   replaceOne(filter: Filter<W>, replacement: I): Out<"replaceOne">;
-  deleteOne(filter: Filter<W>, options?: Arg<"deleteOne", 1>): Out<"deleteOne">;
-  deleteMany(filter: Filter<W>, options?: Arg<"deleteMany", 1>): Out<"deleteMany">;
+  /** On a soft-deleting table (t.deletedAt()) this marks the row; { force: true } deletes it for real. */
+  deleteOne(filter: Filter<W>, options?: Arg<"deleteOne", 1> & { force?: boolean }): Out<"deleteOne">;
+  /** On a soft-deleting table (t.deletedAt()) this marks the rows; { force: true } deletes them for real. */
+  deleteMany(filter: Filter<W>, options?: Arg<"deleteMany", 1> & { force?: boolean }): Out<"deleteMany">;
   /** Pipeline output has its own shape: name it, or get untyped rows. */
   aggregate<T = Record<string, unknown>>(pipeline: unknown[]): Promise<T[]>;
   /** The same collection with 2.0's untyped signatures, for everything else. */
   readonly untyped: OracleCollection;
+}
+
+/** Extra methods on a soft-deleting table's collection (one with a t.deletedAt() column). */
+export interface SoftDeleteMethods<R, I, W, Rel> {
+  /** The same collection, with soft-deleted rows visible to reads, updates and deletes. */
+  withDeleted(): TypedCollection<R, I, W, Rel> & SoftDeleteMethods<R, I, W, Rel>;
+  /** Clear the deleted mark of the soft-deleted rows matching the filter. */
+  restore(filter?: Filter<W>): Out<"updateMany">;
+}
+
+/** True when a table has a t.deletedAt() column. */
+type HasSoftDelete<C extends Columns> = { [K in keyof C]: C[K] extends { $softDelete: true } ? K : never }[keyof C] extends never ? false : true;
+
+/** The collection on() returns for a table. */
+export type CollectionOf<C extends Columns, Rel> = TypedCollection<RowOf<C>, InsertOf<C>, WriteRowOf<C>, Rel> &
+  (HasSoftDelete<C> extends true ? SoftDeleteMethods<RowOf<C>, InsertOf<C>, WriteRowOf<C>, Rel> : {});
+
+/**
+ * Hooks run around writes through the table's collection. A before-hook may return a new
+ * document / update (or nothing, to keep it) and may throw to stop the write; it runs
+ * before validation. `ctx.collection` is the collection on the same connection, so a hook
+ * inside a transaction is part of it.
+ */
+export interface TableHooks<C extends Columns> {
+  beforeInsert?(doc: InsertOf<C>, ctx: HookContext): InsertOf<C> | void | Promise<InsertOf<C> | void>;
+  afterInsert?(doc: InsertOf<C>, insertedId: unknown, ctx: HookContext): void | Promise<void>;
+  beforeUpdate?(update: Update<WriteRowOf<C>, RowOf<C>>, filter: Filter<WriteRowOf<C>>, ctx: HookContext): Update<WriteRowOf<C>, RowOf<C>> | void | Promise<Update<WriteRowOf<C>, RowOf<C>> | void>;
+  afterUpdate?(result: { matchedCount: number; modifiedCount: number }, filter: Filter<WriteRowOf<C>>, update: Update<WriteRowOf<C>, RowOf<C>>, ctx: HookContext): void | Promise<void>;
+  beforeDelete?(filter: Filter<WriteRowOf<C>>, ctx: HookContext): void | Promise<void>;
+  afterDelete?(result: { deletedCount: number; soft: boolean }, filter: Filter<WriteRowOf<C>>, ctx: HookContext): void | Promise<void>;
+}
+
+/** defineTable()'s third argument. */
+export interface TableOptions<C extends Columns> {
+  /** Check every insert and update against the column definitions before any SQL (MiraValidationError). */
+  validate?: boolean;
+  hooks?: TableHooks<C>;
 }
 
 /** What on() accepts: the db handle from createDb(), or a transaction session. */
@@ -204,8 +246,12 @@ export class TypedTable<C extends Columns, Rel extends Record<string, AnyRelatio
   readonly columns: C;
   /** Relations attached with relations(): what include() can fetch. */
   readonly relations: Readonly<Record<string, RelationSpec>>;
+  /** validate and hooks, as given to defineTable(). */
+  readonly options: Readonly<TableOptions<C>>;
+  /** The model settings on() hands to the collection, or undefined for a plain typed table. */
+  private readonly model?: ModelSpec;
 
-  constructor(name: string, columns: C, relationSpecs: Record<string, RelationSpec> = {}) {
+  constructor(name: string, columns: C, relationSpecs: Record<string, RelationSpec> = {}, options: TableOptions<C> = {}) {
     if (typeof name !== "string" || name.trim() === "") throw new TypeError("[defineTable] the table name must be a non-empty string.");
     const entries = Object.entries(columns ?? {});
     if (entries.length === 0) throw new TypeError(`[defineTable] ${name}: define at least one column.`);
@@ -217,12 +263,36 @@ export class TypedTable<C extends Columns, Rel extends Record<string, AnyRelatio
     this.name = name;
     this.columns = Object.freeze({ ...columns });
     this.relations = Object.freeze({ ...relationSpecs });
+    this.options = Object.freeze({ ...options });
+    const roles = (role: NonNullable<ColumnMeta["role"]>) => entries.filter(([, c]) => c.meta.role === role).map(([k]) => k);
+    for (const role of ["createdAt", "updatedAt", "deletedAt"] as const) {
+      if (roles(role).length > 1) throw new TypeError(`[defineTable] ${name}: one t.${role}() column per table, got ${roles(role).join(", ")}.`);
+    }
+    const hooks = (options.hooks ?? {}) as ModelHooks;
+    for (const [k, v] of Object.entries(hooks)) {
+      if (!["beforeInsert", "afterInsert", "beforeUpdate", "afterUpdate", "beforeDelete", "afterDelete"].includes(k)) throw new TypeError(`[defineTable] ${name}: unknown hook ${k}.`);
+      if (typeof v !== "function") throw new TypeError(`[defineTable] ${name}: hook ${k} must be a function.`);
+    }
+    const [updatedAt] = roles("updatedAt");
+    const [deletedAt] = roles("deletedAt");
+    if (options.validate || Object.keys(hooks).length > 0 || updatedAt || deletedAt) {
+      this.model = Object.freeze({
+        columns: this.columns,
+        primaryKey: Object.freeze(entries.filter(([, c]) => c.meta.primaryKey).map(([k]) => k)),
+        updatedAt,
+        deletedAt,
+        validate: options.validate === true,
+        hooks: Object.freeze({ ...hooks }),
+      });
+    }
   }
 
   /** The table as a typed collection on a db handle, or inside a transaction session. */
-  on(target: TableTarget): TypedCollection<RowOf<C>, InsertOf<C>, WriteRowOf<C>, Rel> {
+  on(target: TableTarget): CollectionOf<C, Rel> {
     const t = target as { collection?: unknown };
-    const coll = typeof t.collection === "function" ? (t as { collection(n: string): OracleCollection }).collection(this.name) : new OracleCollection(this.name, target as WrapperDb);
+    let coll = typeof t.collection === "function" ? (t as { collection(n: string): OracleCollection }).collection(this.name) : new OracleCollection(this.name, target as WrapperDb);
+    // Timestamps, soft delete, hooks or validation: the model subclass, on the same connection.
+    if (this.model) coll = new ModelCollection(this.name, coll.db, coll._conn, this.model);
     // The collection hands the relations to every find(), where include() reads them.
     if (Object.keys(this.relations).length > 0) coll._relations = this.relations;
     // JSON columns: values written as JSON text, JSON text read back as JS values.
@@ -235,7 +305,7 @@ export class TypedTable<C extends Columns, Rel extends Record<string, AnyRelatio
       if (native.length > 0 && client && client < 2100000000) throw new Error(`[defineTable] ${this.name}: ${native.join(", ")} use the native JSON type, which needs Thin mode or Oracle Client 21c+ (this is ${coll.db.oracledb.oracleClientVersionString}). Use t.json() without { native: true } for JSON text.`);
       coll._json = { encode: json.map(([k]) => k), decode: json.filter(([, c]) => c.meta.json === "text").map(([k]) => k) };
     }
-    return coll as unknown as TypedCollection<RowOf<C>, InsertOf<C>, WriteRowOf<C>, Rel>;
+    return coll as unknown as CollectionOf<C, Rel>;
   }
 
   /** The column specs createTable() takes (also what migrations compare). */
@@ -265,9 +335,12 @@ function toColumnSpec(name: string, m: Readonly<ColumnMeta>): ColumnSpec {
   return spec;
 }
 
-/** Define a typed table. Needs no database; bind it with `.on(db)`. */
-function defineTable<C extends Columns>(name: string, columns: C): TypedTable<C> {
-  return new TypedTable(name, columns);
+/**
+ * Define a typed table. Needs no database; bind it with `.on(db)`.
+ * `options`: { validate: true } checks writes against the columns; `hooks` run around writes.
+ */
+function defineTable<C extends Columns>(name: string, columns: C, options: TableOptions<C> = {}): TypedTable<C> {
+  return new TypedTable(name, columns, {}, options);
 }
 
 export { defineTable };

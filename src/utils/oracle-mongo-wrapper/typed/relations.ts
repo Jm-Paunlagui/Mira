@@ -91,7 +91,7 @@ function relations<C extends Columns, Rel extends Record<string, AnyRelation>>(t
     if (!(key in keyTable.columns)) throw new TypeError(`[relations] ${where}: ${keyTable.name} has no column ${key}.`);
     specs[name] = { kind: r.kind, target: { name: target.name, columns: target.columns }, foreignKey: r.foreignKey, key };
   }
-  return new TypedTable<C, Rel>(table.name, table.columns, specs);
+  return new TypedTable<C, Rel>(table.name, table.columns, specs, table.options);
 }
 
 export { hasMany, hasOne, belongsTo, relations };

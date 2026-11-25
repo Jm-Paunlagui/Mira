@@ -24,6 +24,7 @@ Oracle Database
     - [Typed Tables (2.1)](#typed-tables-21)
     - [Relations and include (2.1)](#relations-and-include-21)
     - [JSON Columns (2.1)](#json-columns-21)
+    - [Timestamps, Soft Delete, Hooks and Validation (2.1)](#timestamps-soft-delete-hooks-and-validation-21)
     - [Migrations (2.1)](#migrations-21)
 - [Basic — Your First Queries](#-basic--your-first-queries)
 - [Medium — Filtering, Updating & Chaining](#-medium--filtering-updating--chaining)
@@ -368,6 +369,69 @@ await members.aggregate([
 - All the SQL uses functions Oracle 19c has (no `JSON_TRANSFORM`), so it runs on 19c and 23ai, for JSON text and for the JSON type.
 - **The native JSON type needs Thin mode or Oracle Client 21c+.** A 19c client can't read it (`ORA-40569`), and a write can break the session (`ORA-03106`). `Table.on(db)` refuses a native column on a 19.x Thick client, and says so. The JSON type itself needs Oracle Database 21c+: on 19c, `create()` refuses it before Oracle answers `ORA-00902`.
 - A filter key containing a dot is now always a JSON path. A column whose name itself contains a dot can't be filtered by name.
+
+### Timestamps, Soft Delete, Hooks and Validation (2.1)
+
+A typed table can ask Mira to maintain timestamps, delete softly, run hooks around writes, and check writes against its columns:
+
+```ts
+import { defineTable, t, MiraValidationError } from "@jm-paunlagui/mira";
+
+const AuditLog = defineTable("AUDIT_LOG", { ID: t.id(), WHAT: t.text(200) });
+const Members = defineTable("MEMBERS", {
+  ID: t.number(10).primaryKey(),
+  NAME: t.text(40),
+  POINTS: t.number(9),
+  JOINED_AT: t.createdAt(),     // TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP
+  CHANGED_AT: t.updatedAt(),    // the same, and every update sets it
+  REMOVED_AT: t.deletedAt(),    // soft delete
+}, {
+  validate: true,
+  hooks: {
+    beforeInsert: (doc) => ({ ...doc, NAME: doc.NAME.trim() }),
+    afterDelete: async (result, filter, ctx) => {
+      await AuditLog.on(ctx).insertOne({ WHAT: `removed ${JSON.stringify(filter)}` }); // same transaction
+    },
+  },
+});
+
+const members = Members.on(db);
+await members.insertOne({ ID: 1, NAME: " Ana ", POINTS: 0 });   // NAME "Ana"; JOINED_AT and CHANGED_AT stamped by Oracle
+await members.updateOne({ ID: 1 }, { $inc: { POINTS: 10 } });     // CHANGED_AT = SYSTIMESTAMP
+await members.deleteOne({ ID: 1 });                               // sets REMOVED_AT; the row stays
+await members.find().toArray();                                   // skips removed members
+await members.withDeleted().find().toArray();                     // sees them
+await members.restore({ ID: 1 });                                 // clears REMOVED_AT
+await members.deleteOne({ ID: 1 }, { force: true });              // a real DELETE
+await members.insertOne({ ID: 2, NAME: "x".repeat(50), POINTS: 1.5 });
+// MiraValidationError: [MEMBERS] insert is not valid: NAME is 50 bytes long; VARCHAR2(40) allows 40; POINTS must be a whole number, got 1.5.
+```
+
+**Timestamps:** `t.createdAt()` and `t.updatedAt()` are `TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL`, so Oracle's clock stamps them and they read back as the exact instant. An insert may still give a value (an import, for example). Every update through the collection sets the `t.updatedAt()` column with `$currentDate`, unless the update sets that column itself.
+
+**Soft delete:** with a `t.deletedAt()` column (nullable, one per table):
+- `deleteOne`, `deleteMany` and `findOneAndDelete` set the column to `SYSTIMESTAMP`. `deletedCount` counts the rows marked, and a row already marked is not counted again.
+- `find`, `findOne`, `countDocuments`, `distinct`, `aggregate`, the updates and the deletes skip marked rows. A filter that names the column itself (`{ REMOVED_AT: { $ne: null } }`) is left as it is.
+- `include()` leaves out marked rows of a soft-deleting related table.
+- `withDeleted()` gives the same collection with marked rows visible. `restore(filter)` clears the mark; it is an update, so `updatedAt` and the update hooks apply.
+- `{ force: true }` on a delete removes rows for real. A soft `deleteMany` has no `limit`.
+
+**Hooks** run around writes through the collection: `beforeInsert`, `afterInsert`, `beforeUpdate`, `afterUpdate`, `beforeDelete`, `afterDelete`.
+- A before-hook may return a changed document or update (or nothing, to keep it) and may throw to stop the write. It runs before validation, so it can fill in a column.
+- The last argument, `ctx`, works like a transaction session: `Table.on(ctx)` or `ctx.collection(name)` is a table on the same connection, so inside `withTransaction` the hook's writes commit or roll back with the rest. `ctx.self` is the collection itself.
+- `insertMany` calls the insert hooks once per document. `bulkWrite` runs each operation through the wrapped methods, so their hooks run too.
+
+**Validation** (`validate: true`) checks every insert and update before any SQL and lists every problem in one `MiraValidationError` (`err.issues` is `{ column, message }[]`):
+- unknown columns, values for identity columns, required columns left out, `null` (or `$unset`) for a column that is not nullable
+- numbers for `NUMBER` (whole numbers when the scale is 0), a decimal string or number for money and decimals, and the digits before the decimal point within the precision
+- strings within `VARCHAR2(n)` / `CHAR(n)` in UTF-8 bytes, or in characters for `t.text(n, "char")`
+- `Date` for dates and timestamps, `Buffer` for BLOB and RAW
+- JSON documents and `t.raw()` types are left to Oracle.
+
+**Notes:**
+- `replaceOne` and `findOneAndReplace` on such a table become a `$set` of every given column except the primary key, so `updatedAt`, hooks and validation apply.
+- These behaviours belong to the collection's `find`, `findOne`, `countDocuments`, `distinct`, `aggregate`, inserts, updates, replaces, deletes and `findOneAnd*`. Statements that work on many rows at once or on other tables (`merge`, `mergeFrom`, `bulkUpdateByKeys`, `updateFromJoin`, `insertFromQuery`, `connectBy`, `pivot`, raw SQL) are 2.0's and do none of this.
+- A typed table without any of these features still gets a plain `OracleCollection` from `on()`.
 
 ### Migrations (2.1)
 

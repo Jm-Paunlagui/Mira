@@ -233,6 +233,17 @@ class OracleCollection {
         return this;
     }
 
+    /**
+     * This collection on another connection, keeping what a typed table set on it
+     * (JSON columns, relations; a model table's subclass keeps its model too).
+     */
+    _onConnection(conn: DbConnection): OracleCollection {
+        const c = new OracleCollection(this.tableName, this.db, conn);
+        if (this._json) c._json = this._json;
+        if (this._relations) c._relations = this._relations;
+        return c;
+    }
+
     /** A document's t.json() values as JSON text, ready to bind (typed tables only). */
     _encodeJson<T extends Record<string, unknown>>(doc: T): T {
         if (!this._json || !doc || typeof doc !== "object") return doc;
@@ -1430,7 +1441,7 @@ class OracleCollection {
             return { acknowledged: true, results };
         };
         if (this._conn) return run(this);
-        return this.db.withTransaction((conn: DbConnection) => run(new OracleCollection(this.tableName, this.db, conn)));
+        return this.db.withTransaction((conn: DbConnection) => run(this._onConnection(conn)));
     }
 
     // ─── Delete Operations ───────────────────────────────────────
