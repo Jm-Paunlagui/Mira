@@ -22,6 +22,7 @@ Oracle Database
     - [Prerequisites — Database Configuration](#prerequisites--database-configuration)
     - [Imports & Connection](#imports--connection)
     - [Typed Tables (2.1)](#typed-tables-21)
+    - [Migrations (2.1)](#migrations-21)
 - [Basic — Your First Queries](#-basic--your-first-queries)
 - [Medium — Filtering, Updating & Chaining](#-medium--filtering-updating--chaining)
 - [Hard — Aggregation, Transactions & Joins](#-hard--aggregation-transactions--joins)
@@ -261,6 +262,43 @@ bun run mira generate types --import ../my-mira-path            # in this reposi
 ```
 
 The command reads `DB_*` / `APP_DB_*` from the environment or from `.env` (`--env <file>` to pick another), and writes one `defineTable()` and one `…Row` type per table. In code: `await generateTableTypes(db, { tables, importFrom })` returns the same source text. CHECK constraints and multi-column keys are not written; they do not change the row types.
+
+### Migrations (2.1)
+
+Versioned schema changes, one file each, applied in name order and recorded in a history table.
+
+```bash
+npx mira migrate new create_orders      # → migrations/20261125070809_create_orders.ts
+npx mira migrate status                 # applied / pending / changed / missing
+npx mira migrate up --dry-run           # print the SQL each pending migration would run; change nothing
+npx mira migrate up                     # apply every pending migration (or --to <name>)
+npx mira migrate down                   # roll back the newest one (--steps n, --to <name>, --all)
+```
+
+```ts
+// migrations/20261125070809_create_orders.ts
+import type { MigrationContext } from "@jm-paunlagui/mira";
+import { Orders } from "../src/db/tables";        // a defineTable() definition
+
+export async function up({ createTable, collection, schema, execute }: MigrationContext) {
+    await createTable(Orders);
+    await collection("ORDERS").createIndex({ CUSTOMER_ID: 1 });
+}
+
+export async function down({ schema }: MigrationContext) {
+    await schema.dropTable("ORDERS");
+}
+```
+
+The context gives `schema` (an `OracleSchema`: `createTable`, `alterTable`, `dropTable`, `createView`, `createSequence` …), `collection(name)` (indexes, seed data), `createTable(definition)`, `execute(sql, binds)` for anything else, `db`, and `dryRun`.
+
+- **History.** Each applied migration is a row in `MIRA_MIGRATIONS`: name, SHA-256 checksum of the file, batch (one per `up` run), applied-at time and duration. If an applied file **changes** or is **deleted**, `status` reports it (and exits 1) and `up` refuses to run. The code no longer describes the database, so restore the file or fix the history by hand.
+- **Order.** Pending migrations run in name order, which is why file names start with a UTC timestamp. One merged from another branch that sorts before already-applied ones still runs.
+- **Lock.** A run holds a row lock on `MIRA_MIGRATIONS_LOCK` for its whole length, so a second deployment migrating at the same time fails at once with "another migration run holds the lock". Oracle frees the lock if the process dies; no extra grant is needed.
+- **⚠️ Oracle DDL is not transactional.** Every DDL statement commits by itself, so a migration that fails halfway cannot be undone automatically. Its history row is written only when it succeeds, and the error names it and says so. Fix the schema by hand, then run `up` again. Keep each migration small.
+- **Dry run.** `--dry-run` runs every migration against a recording connection: the SQL is printed and nothing reaches the database (reads inside a migration see no rows).
+- **In code.** `createMigrator(db, { dir: "migrations" })` (or `{ migrations: [{ name, up, down }] }`) returns `{ up, down, status, list }`; `{ table }` renames the history table.
+- **Node.** `.ts` migration files load under Bun, and under Node where it strips types (22.18+, 23.6+). Otherwise write them as `.js` / `.mjs`. Migrations live in your repository, so the command reads them from `--dir` (default `./migrations`).
 
 ---
 

@@ -95,6 +95,30 @@ Two tests failed only on the CI database:
   - creates `SIM_LOYALTY` from a definition and fills it in one transaction with documents of two shapes.
   - Result: 58 queries, 0 gaps, 124 of 124 public functions.
 
+### Added — migrations (roadmap step 2)
+
+- **`mira migrate new <name> | status | up | down`** and **`createMigrator(db, { dir | migrations, table })`** → `{ up, down, status, list }`.
+  - Migration files (`.ts`, `.js`, `.cjs`, `.mjs`; named or default exports of `up` / `down`) run in name order. `migrate new` names them `<UTC timestamp>_<name>.ts`.
+  - `up({ to })` applies up to a named migration. `down({ steps })` (default 1) rolls back the newest; `down({ to })` rolls back everything after a migration; `down({ to: null })` / `--all` rolls back all of them.
+  - The context offers `schema`, `collection(name)`, `createTable(definition)` (typed tables), `execute(sql, binds)`, `db` and `dryRun`.
+- **History.** `MIRA_MIGRATIONS` stores name, SHA-256 checksum, batch, applied-at time and duration. A **changed** or **missing** applied migration shows in `status` (the CLI exits 1), and `up` refuses to run.
+- **Lock.** A row lock (`SELECT … FOR UPDATE NOWAIT`) on `MIRA_MIGRATIONS_LOCK` is held on a connection of its own for the whole run, so a concurrent run fails at once. No `DBMS_LOCK` grant is needed, and Oracle releases the lock if the process dies.
+- **Dry run.** Each migration runs against a recording connection; the SQL is returned (and printed by `--dry-run`), and nothing is applied or recorded.
+- **Failures.** Oracle DDL is not transactional, so a failed migration is not recorded. Its error names it and says the statements before the failure stay applied.
+  - Migrator errors pass through `withConnection` unwrapped (`isOperational`), so `err.migration` and the message are kept.
+- Exported types: `Migration`, `MigrationContext`, `MigratorOptions`, `MigrationStatus`, `MigrationState`, `MigrationRun`, `Migrator`.
+
+### Tests and simulation (migrations)
+
+- `test/integration/migrations.test.ts` (14 tests, live):
+  - order and batches, `to` / `steps` / `all`, a pending migration that sorts before applied ones, changed and missing migrations
+  - argument checks, no `down()`, a failing migration, dry runs with their exact SQL
+  - **two runs racing for the lock**
+  - files on disk (`.ts` with typed tables, `.js`, `.mjs` default export, `.d.ts` skipped, checksum of the file)
+  - the whole `mira migrate` command line
+- `test/unit/migrations.test.ts`: errors other than "already exists" / "lock busy", a dry run never touching the real connection, and the new-file helpers.
+- Simulation, schema stage: a supplier table, its seed and a view arrive as three migrations. The stage checks `list`, a dry run, `up`, a repeat `up`, `down`, `status` by batch, a second `up`, and a refused `up` after a migration's code changed. Result: 307 checks, 129 of 129 public functions.
+
 ## [2.0.1] — 2026-11-25
 
 Patch release: Mira now behaves the same in node-oracledb Thin and Thick mode. 2.0.0 was only tested in Thin mode. On a machine with an Oracle Client on the system PATH, the adapter loads Thick mode even when `ORACLE_INSTANT_CLIENT` is blank, and two things broke.

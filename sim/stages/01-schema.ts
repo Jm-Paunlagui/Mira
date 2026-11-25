@@ -6,6 +6,7 @@
 import type { Ctx } from "../lib/context";
 import type { Sim } from "../lib/harness";
 import { T, type State } from "../lib/data";
+import type { Migration } from "../../src/utils/oracle-mongo-wrapper";
 
 export async function schemaStage(sim: Sim, ctx: Ctx, state: State) {
   const { api, db, raw, schemaUser } = ctx;
@@ -130,4 +131,35 @@ export async function schemaStage(sim: Sim, ctx: Ctx, state: State) {
   await dcl.revoke(["SELECT"], T.PRODUCTS, grantee);
   sim.eq("revoke: no privileges left", await grants(), []);
   await sim.rejects("grant of an unknown privilege is refused", dcl.grant(["TELEPORT"], T.PRODUCTS, grantee), /OracleDCL\.grant/);
+
+  // ── Migrations (2.1): the supplier schema arrives as versioned changes ────
+  // The history table is SIM_MIGRATIONS (+ _LOCK), so the teardown drops it with the rest.
+  const { t } = api;
+  const Suppliers = api.defineTable(T.SUPPLIERS, { ID: t.id(), NAME: t.text(40), TERMS_DAYS: t.number().default(30) });
+  const supplierMigrations: Migration[] = [
+    { name: "20261101_0001_create_suppliers", up: ({ createTable }) => createTable(Suppliers), down: ({ schema: s }) => s.dropTable(T.SUPPLIERS) },
+    {
+      name: "20261101_0002_seed_suppliers",
+      up: ({ collection }) => collection(T.SUPPLIERS).insertMany([{ NAME: "FreshFarm" }, { NAME: "BeanCo", TERMS_DAYS: 15 }, { NAME: "Paper&Co", TERMS_DAYS: 60 }], { returning: [] }),
+      down: ({ execute }) => execute(`DELETE FROM "${T.SUPPLIERS}"`),
+    },
+    {
+      name: "20261101_0003_supplier_view",
+      up: ({ schema: s }) => s.createView(T.VIEW_SUPPLIERS, `SELECT "NAME", "TERMS_DAYS" FROM "${T.SUPPLIERS}" WHERE "TERMS_DAYS" <= 30`),
+      down: ({ schema: s }) => s.dropView(T.VIEW_SUPPLIERS),
+    },
+  ];
+  const migrator = api.createMigrator(db, { table: T.MIGRATIONS, migrations: supplierMigrations });
+  sim.eq("migrator.list: three migrations in name order", (await migrator.list()).map((m) => m.name), ["20261101_0001_create_suppliers", "20261101_0002_seed_suppliers", "20261101_0003_supplier_view"]);
+  const plan = await migrator.up({ dryRun: true });
+  sim.eq("migrate up --dry-run: the SQL of each migration, nothing applied", [plan.map((r) => r.sql.length > 0), (await migrator.status()).map((s) => s.state)], [[true, true, true], ["pending", "pending", "pending"]]);
+  sim.eq("migrate up: all three applied in one batch", (await migrator.up()).map((r) => r.name).length, 3);
+  sim.eq("migrate up again: nothing pending", await migrator.up(), []);
+  const viewRows = await raw<{ NAME: string }>(`SELECT NAME FROM "${T.VIEW_SUPPLIERS}" ORDER BY NAME`);
+  sim.eq("the migrated view: suppliers paid within 30 days", viewRows.map((r) => r.NAME), ["BeanCo", "FreshFarm"]);
+  sim.eq("migrate down: the newest migration (the view) rolled back", (await migrator.down()).map((r) => r.name), ["20261101_0003_supplier_view"]);
+  sim.eq("migrate status: two applied, the view pending again", (await migrator.status()).map((s) => [s.state, s.batch]), [["applied", 1], ["applied", 1], ["pending", null]]);
+  await migrator.up();
+  sim.eq("migrate up: the view back, in batch 2", (await migrator.status()).map((s) => s.batch), [1, 1, 2]);
+  await sim.rejects("migrate up refuses when an applied migration's code changed", api.createMigrator(db, { table: T.MIGRATIONS, migrations: supplierMigrations.map((m, i) => (i === 1 ? { ...m, checksum: "edited" } : m)) }).up(), /no longer match their files/);
 }

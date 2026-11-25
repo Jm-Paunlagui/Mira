@@ -84,15 +84,20 @@ describe("chaos: pool exhaustion and slow calls", () => {
     const res = await Promise.allSettled(
       Array.from({ length: 4 }, () => hold(2.5).then(() => Date.now() - started, (e: Error) => { throw Object.assign(e, { at: Date.now() - started }); })),
     );
-    const timedOut = res.filter((r) => r.status === "rejected" && /NJS-040/.test(String((r as PromiseRejectedResult).reason)));
+    const rejectedWith = (code: string) => res.filter((r) => r.status === "rejected" && new RegExp(code).test(String((r as PromiseRejectedResult).reason))) as PromiseRejectedResult[];
+    const timedOut = rejectedWith("NJS-040");
+    const shed = rejectedWith("NJS-076");
     const slowest = Math.max(...res.map((r) => (r.status === "fulfilled" ? r.value : (r.reason as { at: number }).at)));
     m("queued caller worst wait (queueTimeout=1500ms)", slowest, "ms");
-    // The bound itself, not an exact count: how many callers queue depends on how many of the
-    // two pooled connections are ready at that instant (Thick mode may be replacing one).
-    // Every outcome is a served call or an NJS-040; each NJS-040 lands near queueTimeout, never ~3x.
-    expect(timedOut.length).toBeGreaterThanOrEqual(2);
-    expect(res.filter((r) => r.status === "fulfilled").length + timedOut.length).toBe(4);
-    for (const r of timedOut) expect(((r as PromiseRejectedResult).reason as { at: number }).at).toBeLessThan(1500 + 1000);
+    // The bound itself, not exact counts. Two callers get the two connections; the other two
+    // queue and time out with NJS-040 near queueTimeout, never ~3x (no retry). The pool health
+    // monitor's 30 s ping can be queued at that instant and take a queue slot: then one caller
+    // is shed at once with NJS-076 (queue full) instead of queueing — seen 1 run in ~10.
+    expect(res.filter((r) => r.status === "fulfilled")).toHaveLength(2);
+    expect(timedOut.length + shed.length).toBe(2);
+    expect(timedOut.length).toBeGreaterThanOrEqual(1);
+    for (const r of timedOut) expect((r.reason as { at: number }).at).toBeLessThan(1500 + 1000);
+    for (const r of shed) expect((r.reason as { at: number }).at).toBeLessThan(500);
   }, 30000);
 
   it("pool recovers after saturation", async () => {
