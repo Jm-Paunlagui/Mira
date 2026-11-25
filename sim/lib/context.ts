@@ -84,11 +84,13 @@ export async function buildContext(): Promise<Ctx> {
     if (typeof v !== "function" || /^[A-Z]/.test(name)) continue; // classes are tracked by prototype
     if (name === "createDb") api[name] = tracker.trackFn(name, v as never, (d) => tracker.trackObject("db", d as object));
     else if (name === "createPerformance") api[name] = tracker.trackFn(name, v as never, (p) => tracker.trackObject("performance", p as object));
+    else if (name === "createMigrator") api[name] = tracker.trackFn(name, v as never, (m) => tracker.trackObject("migrator", m as object));
     else api[name] = tracker.trackFn(name, v as never);
   }
   // Register the db-handle and performance methods up front, so an unused one is reported.
   tracker.trackObject("db", rawDb);
   tracker.trackObject("performance", mod.createPerformance(rawDb) as object);
+  tracker.trackObject("migrator", mod.createMigrator(rawDb) as object);
 
   const tracked = api as unknown as Api;
   return { api: tracked, db: tracked.createDb("appDb"), raw, rawCount, schemaUser: U };

@@ -11,6 +11,9 @@ coveragePathIgnorePatterns = [
   "src/utils/requestContext.ts",
   "src/constants/**",
   "test/**",
+  # Migration and table files the tests write to the OS temp directory and import.
+  "**/mira-mig-*/**",
+  "**/mira-tt-*/**",
 ]
 coverageThreshold = { lines = 1.0, functions = 1.0 }
 coverageReporter = ["text", "lcov"]
