@@ -11,7 +11,14 @@ Theme: config passed in, not read from Mira's own env names. Step 1 of the 3.0 r
 - **`fromEnv(options?)`**: opt-in reader for `MIRA_DB_*` (or per-pool prefixes) into a config. A number that does not parse throws instead of falling back.
 - `buildSimpleConnectString` / `buildTNSConnectString` are exported from the package.
 - Adapter: `closePool(name)` closes one pool and stops monitoring it; `isPoolOpen(name)`. Registry: `registerConnection` / `unregisterConnection` (used by `createMira`).
-- Types: `Mira`, `MiraConfig`, `PoolConfig`, `ResolvedMiraConfig`, `FromEnvOptions`.
+- Types: `Mira`, `MiraConfig`, `PoolConfig`, `ResolvedMiraConfig`, `FromEnvOptions`, `DriverMode`, `DriverOptions`, `MiraLogger`.
+- **Driver mode (step 2):** `configureDriver({ mode: "auto" | "thin" | "thick", libDir })` and `createMira({ driver })`. `"thin"` never loads an Oracle Client; `"thick"` fails instead of falling back. An explicit `libDir` is passed to `initOracleClient` as is, so Thick mode with a directory works on macOS and Linux (the `ORACLE_INSTANT_CLIENT` check looks for Windows DLLs). Once the driver is up, only a compatible setting is accepted. `fromEnv()` reads `MIRA_DRIVER_MODE` / `MIRA_DRIVER_LIB_DIR`.
+- **`initDriver()`** initialises the driver now and returns `{ mode, clientVersion }`; call it at startup to fail fast.
+- **Logger (step 2):** `createMira({ logger })` and `setLogger(logger)` send Mira's log lines to any object with `info` / `warn` / `error` (optional `debug`); `false` silences them. Mira's own logger now loads on the first line it writes, so an app with its own logger gets no `./logs` folder from Mira.
+
+### Changed
+
+- **Importing Mira initialises nothing.** `ORA_SDTZ`, `oracledb.fetchTypeHandler`, `oracledb.fetchArraySize` and `initOracleClient` now run once, when the first pool opens (or at `initDriver()`), instead of at import. Pools and queries behave as before. Code that read `oracledb.oracleClientVersion` or `ORA_SDTZ` before any pool opened now sees them unset; call `initDriver()` first.
 
 ### Fixed
 
@@ -19,7 +26,8 @@ Theme: config passed in, not read from Mira's own env names. Step 1 of the 3.0 r
 
 ### Tests
 
-- New `test/unit/miraConfig.test.ts` and `test/integration/createMira.test.ts`; `test/node/smoke.cjs` also runs `createMira()` from the built package under Node.
+- New `test/unit/miraConfig.test.ts`, `test/unit/log.test.ts` and `test/integration/createMira.test.ts`; driver-mode cases in `test/unit/adapter.test.ts`. `test/node/smoke.cjs` also runs `createMira()` from the built package under Node and checks that importing it leaves `ORA_SDTZ` alone.
+- `test/unit/adapter.test.ts` restored `runtimePaths` from the namespace `mock.module` had rewritten, so every adapter loaded after the compiled-exe tests still thought it was compiled. It now restores from a snapshot.
 
 ## [2.1.0] — 2026-11-26
 

@@ -27,8 +27,10 @@ import { EventEmitter } from "events";
 import database from "../database";
 // Captured at load, not per call: freshOracleAdapter.js relies on it (see database.ts).
 const { getConnectionConfig, getConnectionNames } = database;
-import { logger } from "../../utils/logger";
-import { oracleMessages } from "../../constants/messages";
+import { log } from "../log";
+import { oracleMessages, miraConfigMessages } from "../../constants/messages";
+import { checkDriver, MiraConfigError } from "../defineConfig";
+import type { DriverMode, DriverOptions } from "../types";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 1 — Oracle client environment  (was: oracleEnvironment.js)
@@ -37,11 +39,11 @@ import { oracleMessages } from "../../constants/messages";
 function validateOracleClient() {
     const clientPath = process.env.ORACLE_INSTANT_CLIENT;
     if (!clientPath) {
-        logger.warning(oracleMessages.ORACLE_INSTANT_CLIENT_NOT_SET);
+        log().warning(oracleMessages.ORACLE_INSTANT_CLIENT_NOT_SET);
         return false;
     }
     if (!fs.existsSync(clientPath)) {
-        logger.warning(oracleMessages.ORACLE_CLIENT_PATH_NOT_FOUND(clientPath));
+        log().warning(oracleMessages.ORACLE_CLIENT_PATH_NOT_FOUND(clientPath));
         return false;
     }
 
@@ -61,13 +63,13 @@ function validateOracleClient() {
     if (!hasCoreDll) missing.push("oraociei23.dll or oraociei.dll");
 
     if (missing.length) {
-        logger.warning(
+        log().warning(
             oracleMessages.ORACLE_FILES_MISSING(missing, clientPath),
         );
         return false;
     }
 
-    logger.notice(oracleMessages.ORACLE_CLIENT_VALIDATED(clientPath));
+    log().notice(oracleMessages.ORACLE_CLIENT_VALIDATED(clientPath));
     return true;
 }
 
@@ -77,7 +79,7 @@ function setupOracleEnvironment() {
     const current = process.env.PATH || "";
     if (!current.includes(clientPath)) {
         process.env.PATH = `${clientPath};${current}`;
-        logger.notice(`Oracle client prepended to PATH: ${clientPath}`);
+        log().notice(`Oracle client prepended to PATH: ${clientPath}`);
     }
 }
 
@@ -118,15 +120,15 @@ function _loadEnvForCompiled() {
                 const value = trimmed.slice(eqIdx + 1).trim();
                 if (!process.env[key]) process.env[key] = value;
             }
-            logger.notice(`Env loaded from: ${filePath}`);
+            log().notice(`Env loaded from: ${filePath}`);
             return;
         } catch (err) {
-            logger.warning(
+            log().warning(
                 `Could not read .env at ${filePath}: ${err.message}`,
             );
         }
     }
-    logger.warning("No .env found in compiled environment.");
+    log().warning("No .env found in compiled environment.");
 }
 
 /** The node-oracledb module (loaded lazily below so a compiled exe can stage its environment first). */
@@ -137,59 +139,121 @@ function _ensureSessionTimeZone() {
     if (process.env.ORA_SDTZ === undefined || process.env.ORA_SDTZ.trim() === "") process.env.ORA_SDTZ = "+00:00";
 }
 
-function _initOracleClient(db: OracleDb) {
+function _initOracleClient(db: OracleDb, libDir?: string) {
     if (db.oracleClientVersion) return;
-    const clientPath = process.env.ORACLE_INSTANT_CLIENT;
-    const isValid = validateOracleClient();
+    const clientPath = libDir ?? process.env.ORACLE_INSTANT_CLIENT;
+    // An explicit libDir is passed as is: validateOracleClient checks the Windows DLL names only.
+    const isValid = libDir ? true : validateOracleClient();
     try {
         if (isValid && clientPath) {
             db.initOracleClient({ libDir: clientPath, ...THICK_BINARY_OPTS });
-            logger.notice(
-                "Oracle client initialised from ORACLE_INSTANT_CLIENT.",
+            log().notice(
+                libDir ? `Oracle client initialised from ${libDir}.` : "Oracle client initialised from ORACLE_INSTANT_CLIENT.",
             );
         } else {
             db.initOracleClient(THICK_BINARY_OPTS);
-            logger.notice("Oracle client initialised from system PATH.");
+            log().notice("Oracle client initialised from system PATH.");
         }
     } catch (err) {
         if (!err.message.includes("NJS-077"))
-            logger.warning(`Oracle client init: ${err.message}`);
+            log().warning(`Oracle client init: ${err.message}`);
     }
 }
 
-let oracledb: OracleDb;
-try {
-    if (isCompiled) {
-        logger.notice(
-            "Compiled exe detected — bootstrapping Oracle environment.",
-        );
-        _loadEnvForCompiled();
-        setupOracleEnvironment();
+// The module is loaded here; nothing is initialised until the first pool (initDriver).
+// Loading it is side-effect free and gives db.oracledb its constants.
+if (isCompiled) {
+    log().notice(
+        "Compiled exe detected — bootstrapping Oracle environment.",
+    );
+    _loadEnvForCompiled();
+    setupOracleEnvironment();
+}
+const oracledb: OracleDb = require("oracledb") as OracleDb;
+
+/** What configureDriver() asked for; read by initDriver(). */
+let _driverOptions: { mode: DriverMode; libDir?: string } = { mode: "auto" };
+/** Set once initDriver() has run. */
+let _driverInfo: Readonly<{ mode: "thin" | "thick"; clientVersion?: number }> | null = null;
+
+/**
+ * Chooses Thin or Thick mode for this process. Must run before the first pool
+ * opens. After that, options compatible with the running driver ("auto", or
+ * the mode that loaded, with no other libDir) are accepted and anything else
+ * throws, because the Oracle Client cannot be unloaded.
+ * @param {DriverOptions} [options]
+ * @throws {MiraConfigError} for an invalid option.
+ * @throws {Error} when the driver is already initialised differently.
+ */
+function configureDriver(options: DriverOptions = {}): void {
+    const issues: string[] = [];
+    checkDriver(options, issues);
+    if (issues.length) throw new MiraConfigError(issues);
+    const next = { mode: options.mode ?? "auto", libDir: options.libDir };
+    if (_driverInfo) {
+        // Compatible with what is running: "auto" or the mode that loaded, and no other libDir.
+        const modeOk = next.mode === "auto" || next.mode === _driverInfo.mode;
+        const dirOk = next.libDir === undefined || next.libDir === _driverOptions.libDir;
+        if (!modeOk || !dirOk) {
+            const show = (mode: string, dir?: string) => (dir ? `${mode} (${dir})` : mode);
+            throw new Error(
+                miraConfigMessages.DRIVER_ALREADY_INITIALISED(show(_driverInfo.mode, _driverOptions.libDir), show(next.mode, next.libDir)),
+            );
+        }
+        return;
     }
-    oracledb = require("oracledb") as OracleDb;
-
-    // Session time zone: +00:00 in both driver modes. Thin mode opens every
-    // session in UTC; Thick mode opened it in the operating system's zone, and a
-    // JS Date written to a TIMESTAMP WITH (LOCAL) TIME ZONE column then moved by
-    // that zone's offset. The Oracle client reads ORA_SDTZ when it creates a
-    // session, so it is set before the client loads. A numeric offset, not "UTC":
-    // a named region needs the client's time-zone file, and an older client on a
-    // newer server fails with ORA-01805. A value the caller already set wins.
-    _ensureSessionTimeZone();
-
-    // Always attempt Thick mode when ORACLE_INSTANT_CLIENT is set
-    // (not just for compiled executables). Thick mode supports all
-    // password verifier types; Thin mode rejects some (e.g. 0x939).
-    _initOracleClient(oracledb);
-
-    const mode = oracledb.oracleClientVersion ? "Thick" : "Thin";
-    logger.notice(`oracledb driver loaded (${mode} mode).`);
-} catch (err) {
-    logger.critical(`Failed to load oracledb: ${err.message}`);
-    throw err;
+    _driverOptions = next;
 }
 
-oracledb.fetchArraySize = 1000; // Reduce internal round-trips for bulk reads (default: 100)
+/**
+ * Initialises node-oracledb once, as configureDriver() asked: session time
+ * zone, the money-safe fetch handler, and (auto / thick) the Oracle Client.
+ * Runs by itself before the first pool; call it at startup to fail fast.
+ * @returns {{ mode: "thin" | "thick", clientVersion?: number }}
+ * @throws {Error} in "thick" mode when the Oracle Client cannot load.
+ */
+function initDriver(): Readonly<{ mode: "thin" | "thick"; clientVersion?: number }> {
+    if (_driverInfo) return _driverInfo;
+    const { mode, libDir } = _driverOptions;
+    try {
+        // Session time zone: +00:00 in both driver modes. Thin mode opens every
+        // session in UTC; Thick mode opened it in the operating system's zone, and a
+        // JS Date written to a TIMESTAMP WITH (LOCAL) TIME ZONE column then moved by
+        // that zone's offset. The Oracle client reads ORA_SDTZ when it creates a
+        // session, so it is set before the client loads. A numeric offset, not "UTC":
+        // a named region needs the client's time-zone file, and an older client on a
+        // newer server fails with ORA-01805. A value the caller already set wins.
+        _ensureSessionTimeZone();
+
+        // Applied driver-wide so EVERY query (wrapper methods and raw conn.execute alike)
+        // gets exact decimal strings for scaled NUMBER columns. It used to live only in
+        // EXECUTE_OPTIONS, which no wrapper query passes — money silently arrived as
+        // IEEE doubles (123456789012345.6789 → 123456789012345.67).
+        oracledb.fetchTypeHandler = moneySafeFetchTypeHandler;
+        oracledb.fetchArraySize = 1000; // Reduce internal round-trips for bulk reads (default: 100)
+
+        if (mode === "auto") {
+            // Thick when a client can load (it supports every password verifier;
+            // Thin rejects some, e.g. 0x939), else Thin.
+            _initOracleClient(oracledb, libDir);
+        } else if (mode === "thick" && !oracledb.oracleClientVersion) {
+            const clientPath = libDir ?? process.env.ORACLE_INSTANT_CLIENT;
+            try {
+                oracledb.initOracleClient({ ...(clientPath && { libDir: clientPath }), ...THICK_BINARY_OPTS });
+            } catch (err) {
+                if (!err.message.includes("NJS-077")) throw err;
+            }
+        }
+
+        const version = oracledb.oracleClientVersion;
+        _driverInfo = Object.freeze({ mode: version ? "thick" : "thin", ...(version && { clientVersion: version }) } as const);
+        log().notice(`oracledb driver loaded (${version ? "Thick" : "Thin"} mode).`);
+        return _driverInfo;
+    } catch (err) {
+        log().critical(`Failed to load oracledb: ${err.message}`);
+        throw err;
+    }
+}
 
 const OUT_FORMAT_OBJECT = oracledb.OUT_FORMAT_OBJECT;
 // node-oracledb names this constant SYSDBA; "SYSDBA_PRIVILEGE" does not exist on the driver (it was always undefined).
@@ -277,11 +341,7 @@ function moneySafeFetchTypeHandler(metaData: import("oracledb").Metadata<unknown
     return undefined; // default handling for everything else
 }
 
-// Applied driver-wide so EVERY query (wrapper methods and raw conn.execute alike)
-// gets exact decimal strings for scaled NUMBER columns. It used to live only in
-// EXECUTE_OPTIONS, which no wrapper query passes — money silently arrived as
-// IEEE doubles (123456789012345.6789 → 123456789012345.67).
-oracledb.fetchTypeHandler = moneySafeFetchTypeHandler;
+// oracledb.fetchTypeHandler is set to this handler by initDriver(), before the first pool.
 
 const EXECUTE_OPTIONS = Object.freeze({
     outFormat: OUT_FORMAT_OBJECT,
@@ -356,7 +416,7 @@ class PoolHealthMonitor extends EventEmitter {
         try {
             this.emit("change", { name, healthy });
         } catch (e) {
-            logger.warning(`Pool health listener failed for "${name}": ${e.message}`);
+            log().warning(`Pool health listener failed for "${name}": ${e.message}`);
         }
     }
 
@@ -371,7 +431,7 @@ class PoolHealthMonitor extends EventEmitter {
     recordProbeSuccess(name: string): void {
         const meta = this._ensure(name);
         if (!meta.healthy) {
-            logger.notice(
+            log().notice(
                 oracleMessages.POOL_RECOVERED(name, meta.consecutiveFailures),
             );
         }
@@ -385,7 +445,7 @@ class PoolHealthMonitor extends EventEmitter {
         try {
             this.emit("check", { name, ok });
         } catch (e) {
-            logger.warning(`Pool health listener failed for "${name}": ${e.message}`);
+            log().warning(`Pool health listener failed for "${name}": ${e.message}`);
         }
     }
 
@@ -420,7 +480,7 @@ class PoolHealthMonitor extends EventEmitter {
                 // must not leave the connection checked out, one leak per tick.
                 if (conn) {
                     await conn.close().catch((e: Error) =>
-                        logger.warning(
+                        log().warning(
                             oracleMessages.CLOSE_FAILED(name, e.message),
                         ),
                     );
@@ -431,7 +491,7 @@ class PoolHealthMonitor extends EventEmitter {
                 !meta.healthy &&
                 meta.consecutiveFailures >= this._maxFailures
             ) {
-                logger.notice(
+                log().notice(
                     oracleMessages.POOL_RECOVERED(
                         name,
                         meta.consecutiveFailures,
@@ -445,7 +505,7 @@ class PoolHealthMonitor extends EventEmitter {
         } catch {
             meta.consecutiveFailures++;
             meta.lastCheck = new Date();
-            logger.warning(
+            log().warning(
                 oracleMessages.POOL_HEALTH_CHECK_FAILED(
                     name,
                     meta.consecutiveFailures,
@@ -454,7 +514,7 @@ class PoolHealthMonitor extends EventEmitter {
             if (meta.consecutiveFailures >= this._maxFailures) {
                 if (meta.healthy) {
                     // O5: ORACLE_POOL_DOWN rule delivers the email; tap must not double-notify
-                    logger.critical(
+                    log().critical(
                         oracleMessages.POOL_MARKED_UNHEALTHY(
                             name,
                             this._maxFailures,
@@ -503,7 +563,7 @@ class PoolHealthMonitor extends EventEmitter {
         if (this._inFlight.has(name)) return;
         this._inFlight.add(name);
         this.checkPool(name)
-            .catch((e) => logger.warning(`Health check "${name}": ${e.message}`))
+            .catch((e) => log().warning(`Health check "${name}": ${e.message}`))
             .finally(() => this._inFlight.delete(name));
     }
 
@@ -596,7 +656,7 @@ function _validateConfig(config: import("oracledb").PoolAttributes, name: unknow
     const isPlaceholder =
         config.user && String(config.user).includes("placeholder");
     if (process.env.NODE_ENV === "development" && isPlaceholder) {
-        logger.warning(
+        log().warning(
             `Dev mode: placeholder config for "${name}". Missing: ${missing.join(", ")}`,
         );
         return;
@@ -631,13 +691,14 @@ function _warnIfThreadPoolTooSmall(name: unknown, poolMax: number) {
     const configured = Number(process.env.UV_THREADPOOL_SIZE);
     const fromEnv = Number.isInteger(configured) && configured > 0;
     const threads = fromEnv ? configured : 4;
-    if (poolMax > threads) logger.warning(oracleMessages.THREADPOOL_TOO_SMALL(name, poolMax, threads, fromEnv));
+    if (poolMax > threads) log().warning(oracleMessages.THREADPOOL_TOO_SMALL(name, poolMax, threads, fromEnv));
 }
 
 async function _createPool(name: unknown, dbConfig: import("oracledb").PoolAttributes, attempt = 0) {
     const MAX_RETRIES = 3;
     const delay = Math.min(1000 * 2 ** attempt, 10_000);
 
+    initDriver();
     _validateConfig(dbConfig, name);
 
     // Unique alias per attempt to avoid NJS-046 collisions
@@ -654,7 +715,7 @@ async function _createPool(name: unknown, dbConfig: import("oracledb").PoolAttri
     const logSafe = { ...config };
     delete logSafe.password;
     delete logSafe.user;
-    logger.info(`Creating pool "${name}"…`);
+    log().info(`Creating pool "${name}"…`);
 
     let pool;
     try {
@@ -668,7 +729,7 @@ async function _createPool(name: unknown, dbConfig: import("oracledb").PoolAttri
         await conn.ping();
         await conn.close();
 
-        logger.notice(oracleMessages.POOL_READY(name, pool));
+        log().notice(oracleMessages.POOL_READY(name, pool));
         _warnIfThreadPoolTooSmall(name, pool.poolMax);
         return pool;
     } catch (err) {
@@ -684,7 +745,7 @@ async function _createPool(name: unknown, dbConfig: import("oracledb").PoolAttri
         // A stopping process does not keep retrying: closeAll() would wait
         // its per-pool guard on a creation nobody needs any more.
         if (attempt < MAX_RETRIES && !isShuttingDown) {
-            logger.warning(
+            log().warning(
                 oracleMessages.POOL_FAILED(
                     name,
                     attempt + 1,
@@ -692,7 +753,7 @@ async function _createPool(name: unknown, dbConfig: import("oracledb").PoolAttri
                     err.message,
                 ),
             );
-            logger.warning(oracleMessages.POOL_RETRYING(name, delay));
+            log().warning(oracleMessages.POOL_RETRYING(name, delay));
             await _sleep(_jitter(delay));
             if (isShuttingDown) {
                 throw new Error("App is shutting down — no new connections.");
@@ -725,7 +786,7 @@ function _getOrCreatePool(name: string) {
             const t = setTimeout(() => {
                 if (poolRegistry.get(name) === p) {
                     poolRegistry.delete(name);
-                    logger.info(
+                    log().info(
                         oracleMessages.POOL_CREATE_FAILED_EVICTED(
                             name,
                             POOL_CREATE_COOLDOWN_MS,
@@ -748,7 +809,7 @@ function _getOrCreatePool(name: string) {
  */
 async function initializePools() {
     const names = getConnectionNames();
-    logger.notice(
+    log().notice(
         `Initializing ${names.length} database pool(s): ${names.join(", ")}`,
     );
 
@@ -761,10 +822,10 @@ async function initializePools() {
             const safeCfg = { ...POOL_DEFAULTS, ...config };
             delete safeCfg.password;
             delete safeCfg.user;
-            logger.notice(`Creating ${name} pool with configuration:`, safeCfg);
+            log().notice(`Creating ${name} pool with configuration:`, safeCfg);
 
             const pool = await _getOrCreatePool(name);
-            logger.notice(
+            log().notice(
                 `${name} pool created successfully with ${pool.poolMin}-${pool.poolMax} connections`,
             );
             results.push({ name, success: true });
@@ -781,7 +842,7 @@ async function initializePools() {
                   ? "Pool alias collision during retry. The previous pool was not fully cleaned up."
                   : "Check DB credentials, network connectivity, and Oracle client installation.";
 
-            logger.critical(`Failed to initialize pool "${name}"`, {
+            log().critical(`Failed to initialize pool "${name}"`, {
                 error: err.message,
                 type: err.constructor.name,
                 stack: err.stack,
@@ -795,11 +856,11 @@ async function initializePools() {
 
     const failed = results.filter((r) => !r.success);
     if (failed.length) {
-        logger.warning(
+        log().warning(
             `${failed.length}/${names.length} pool(s) failed to initialize: ${failed.map((f) => f.name).join(", ")}. They will retry on first use.`,
         );
     } else {
-        logger.notice(`All ${names.length} pool(s) initialized successfully.`);
+        log().notice(`All ${names.length} pool(s) initialized successfully.`);
     }
     return results;
 }
@@ -874,11 +935,11 @@ async function _acquireConnection(connectionName: string, pool: import("oracledb
                 async (conn: import("oracledb").Connection) => {
                     try {
                         await conn.close();
-                        logger.warning(
+                        log().warning(
                             oracleMessages.ACQUIRE_ORPHAN_CLOSED(connectionName),
                         );
                     } catch (e) {
-                        logger.warning(
+                        log().warning(
                             oracleMessages.CLOSE_FAILED(connectionName, e.message),
                         );
                     }
@@ -889,7 +950,7 @@ async function _acquireConnection(connectionName: string, pool: import("oracledb
             const isLastAttempt = attempt >= ACQUIRE_MAX_ATTEMPTS;
             if (isLastAttempt || !_isTransientDbError(err)) throw err;
 
-            logger.warning(
+            log().warning(
                 oracleMessages.ACQUIRE_RETRY(
                     connectionName,
                     attempt,
@@ -935,7 +996,7 @@ async function withConnection<T>(connectionName: string, callback: (conn: import
         const result = await callback(conn);
         const elapsed = Date.now() - start;
         if (elapsed > 5_000)
-            logger.warning(oracleMessages.SLOW_OP(connectionName, elapsed));
+            log().warning(oracleMessages.SLOW_OP(connectionName, elapsed));
         return result;
     } catch (err) {
         // A deliberate AppError from the callback (e.g. a 409 thrown inside
@@ -953,7 +1014,7 @@ async function withConnection<T>(connectionName: string, callback: (conn: import
         // A readiness probe (bypassBreaker) is unauthenticated: its failures
         // stay off the critical-email tap so callers cannot spend the hourly
         // budget. Outage alerting is delivered by the ORACLE_POOL_DOWN rule.
-        logger.critical(
+        log().critical(
             oracleMessages.OP_FAILED(
                 connectionName,
                 Date.now() - start,
@@ -978,7 +1039,7 @@ async function withConnection<T>(connectionName: string, callback: (conn: import
             try {
                 await conn.close();
             } catch (e) {
-                logger.warning(
+                log().warning(
                     oracleMessages.CLOSE_FAILED(connectionName, e.message),
                 );
             }
@@ -1001,7 +1062,7 @@ async function withTransaction<T>(connectionName: string, callback: (conn: impor
             try {
                 await conn.rollback();
             } catch (e) {
-                logger.warning(
+                log().warning(
                     oracleMessages.ROLLBACK_FAILED(connectionName, e.message),
                 );
             }
@@ -1041,7 +1102,7 @@ async function withBatchConnection(connectionName: string, operations: ((...args
                     index: i,
                 });
             } catch (err) {
-                logger.warning(oracleMessages.BATCH_OP_FAILED(i, err.message));
+                log().warning(oracleMessages.BATCH_OP_FAILED(i, err.message));
                 results.push({ success: false, error: err.message, index: i });
                 if (err.code && FATAL.has(err.code)) throw err;
             }
@@ -1095,12 +1156,12 @@ async function getPoolStats() {
 
 async function closeAll() {
     if (isShuttingDown) {
-        logger.warning(oracleMessages.SHUTDOWN_ALREADY);
+        log().warning(oracleMessages.SHUTDOWN_ALREADY);
         return;
     }
     isShuttingDown = true;
     healthMonitor.stop();
-    logger.notice(oracleMessages.CLOSING_ALL_POOLS);
+    log().notice(oracleMessages.CLOSING_ALL_POOLS);
     const closures: Promise<void>[] = [];
     for (const [name, poolPromise] of poolRegistry) {
         closures.push(
@@ -1108,9 +1169,9 @@ async function closeAll() {
                 poolPromise.then((p: import("oracledb").Pool) => p.close(10)),
                 _timeout(30_000, `Shutdown timeout for "${name}"`),
             ])
-                .then(() => logger.notice(oracleMessages.POOL_CLOSED(name)))
+                .then(() => log().notice(oracleMessages.POOL_CLOSED(name)))
                 .catch((e) =>
-                    logger.warning(
+                    log().warning(
                         oracleMessages.POOL_CLOSE_ERROR(name, e.message),
                     ),
                 ),
@@ -1119,7 +1180,7 @@ async function closeAll() {
     await Promise.allSettled(closures);
     poolRegistry.clear();
     _monitoredNames.clear();
-    logger.notice(oracleMessages.ALL_POOLS_CLOSED);
+    log().notice(oracleMessages.ALL_POOLS_CLOSED);
 }
 
 /**
@@ -1138,9 +1199,9 @@ async function closePool(name: string): Promise<void> {
     try {
         const pool: import("oracledb").Pool = await poolPromise;
         await pool.close(10);
-        logger.notice(oracleMessages.POOL_CLOSED(name));
+        log().notice(oracleMessages.POOL_CLOSED(name));
     } catch (e) {
-        logger.warning(oracleMessages.POOL_CLOSE_ERROR(name, e.message));
+        log().warning(oracleMessages.POOL_CLOSE_ERROR(name, e.message));
     }
 }
 
@@ -1261,4 +1322,4 @@ const __export_onPoolHealthCheck = (fn: (check: { name: string; ok: boolean }) =
         return () => healthMonitor.off("check", fn);
     };
 const __export_setPoolHealthWatched = (watched: boolean) => healthMonitor.setWatched(watched);
-export { toDriverConnectTimeoutSec, POOL_DEFAULTS, withConnection, withTransaction, withBatchConnection, initializePools, closeAll, closePool, isPoolOpen, getPoolStats, __export_isPoolHealthy as isPoolHealthy, __export_getHealthMetrics as getHealthMetrics, __export___setPoolHealthForTest as __setPoolHealthForTest, __export_onPoolHealthChange as onPoolHealthChange, __export_allPoolsHealthy as allPoolsHealthy, __export_recordProbeSuccess as recordProbeSuccess, __export_nudgePoolHealth as nudgePoolHealth, __export_onPoolHealthCheck as onPoolHealthCheck, __export_setPoolHealthWatched as setPoolHealthWatched, validateOracleClient, setupOracleEnvironment, oracledb, OUT_FORMAT_OBJECT, SYSDBA_PRIVILEGE, EXECUTE_OPTIONS, moneySafeFetchTypeHandler };
+export { configureDriver, initDriver, toDriverConnectTimeoutSec, POOL_DEFAULTS, withConnection, withTransaction, withBatchConnection, initializePools, closeAll, closePool, isPoolOpen, getPoolStats, __export_isPoolHealthy as isPoolHealthy, __export_getHealthMetrics as getHealthMetrics, __export___setPoolHealthForTest as __setPoolHealthForTest, __export_onPoolHealthChange as onPoolHealthChange, __export_allPoolsHealthy as allPoolsHealthy, __export_recordProbeSuccess as recordProbeSuccess, __export_nudgePoolHealth as nudgePoolHealth, __export_onPoolHealthCheck as onPoolHealthCheck, __export_setPoolHealthWatched as setPoolHealthWatched, validateOracleClient, setupOracleEnvironment, oracledb, OUT_FORMAT_OBJECT, SYSDBA_PRIVILEGE, EXECUTE_OPTIONS, moneySafeFetchTypeHandler };

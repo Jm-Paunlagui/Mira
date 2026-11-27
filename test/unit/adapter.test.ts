@@ -15,11 +15,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import database from "../../src/config/database";
-import * as realRuntime from "../../src/utils/runtimePaths";
+import * as liveRuntime from "../../src/utils/runtimePaths";
 import { logger } from "../../src/utils/logger";
 import * as realAdapter from "../../src/config/adapters/oracle";
 
 type Adapter = typeof import("../../src/config/adapters/oracle");
+// Snapshot: mock.module rewrites the live namespace, so restoring from it would keep IS_COMPILED: true.
+const realRuntime = { ...liveRuntime };
 const realOracledb = realAdapter.oracledb;
 const realSetTimeout = globalThis.setTimeout;
 const wait = (ms: number) => new Promise((r) => realSetTimeout(r, ms));
@@ -153,7 +155,10 @@ describe("unit/adapter: driver loading and Oracle client environment", () => {
     process.env.ORACLE_INSTANT_CLIENT = tmp;
     let got: unknown;
     const a = await loadAdapter(makeDriver({ initOracleClient: (o: unknown) => { got = o; } }));
+    expect(got).toBeUndefined(); // importing the adapter no longer touches the driver
+    expect(a.initDriver()).toEqual({ mode: "thin" }); // the stub reports no client version
     expect(got).toEqual({ libDir: tmp });
+    expect(a.initDriver()).toBe(a.initDriver()); // once per process
     await a.closeAll();
   });
 
@@ -161,17 +166,22 @@ describe("unit/adapter: driver loading and Oracle client environment", () => {
     delete process.env.ORACLE_INSTANT_CLIENT;
     let got: unknown = "unset";
     const a = await loadAdapter(makeDriver({ initOracleClient: (o: unknown) => { got = o; } }));
+    a.initDriver();
     expect(got).toEqual({});
     const b = await loadAdapter(makeDriver({ initOracleClient: () => { throw new Error("DPI-1047: cannot locate a 64-bit Oracle Client library"); } }));
+    expect(b.initDriver().mode).toBe("thin");
     const c = await loadAdapter(makeDriver({ oracleClientVersion: 1903000000 }));
+    expect(c.initDriver()).toEqual({ mode: "thick", clientVersion: 1903000000 });
     expect(c.oracledb.oracleClientVersion).toBe(1903000000);
     for (const x of [a, b, c]) await x.closeAll();
   });
 
-  it("a driver that cannot load aborts the module (logged CRITICAL, rethrown)", async () => {
+  it("a driver that fails to initialise throws from initDriver (logged CRITICAL), not at import", async () => {
     const broken = makeDriver();
     Object.defineProperty(broken, "oracleClientVersion", { get() { throw new Error("driver exploded"); } });
-    await expect(loadAdapter(broken)).rejects.toThrow("driver exploded");
+    const a = await loadAdapter(broken);
+    expect(() => a.initDriver()).toThrow("driver exploded");
+    expect(() => a.initDriver()).toThrow("driver exploded"); // not cached: retried next time
   });
 
   it("compiled exe: reads .env from the working directory (existing keys win)", async () => {
@@ -648,15 +658,17 @@ describe("unit/adapter: Thick-mode safety (2.1)", () => {
 
   it("sets ORA_SDTZ=+00:00 before the client loads, unless it is already set", async () => {
     await withEnv({ ORA_SDTZ: undefined }, async () => {
-      await loadAdapter(makeDriver());
+      const a = await loadAdapter(makeDriver());
+      expect(process.env.ORA_SDTZ).toBeUndefined(); // not at import
+      a.initDriver();
       expect(process.env.ORA_SDTZ).toBe("+00:00");
     });
     await withEnv({ ORA_SDTZ: "  " }, async () => {
-      await loadAdapter(makeDriver());
+      (await loadAdapter(makeDriver())).initDriver();
       expect(process.env.ORA_SDTZ).toBe("+00:00");
     });
     await withEnv({ ORA_SDTZ: "-05:00" }, async () => {
-      await loadAdapter(makeDriver());
+      (await loadAdapter(makeDriver())).initDriver();
       expect(process.env.ORA_SDTZ).toBe("-05:00");
     });
   });
@@ -683,5 +695,99 @@ describe("unit/adapter: Thick-mode safety (2.1)", () => {
     expect((await run(thick(), "10")).filter((w) => w.includes("UV_THREADPOOL_SIZE"))).toEqual([]);
     expect((await run(thick(), "junk")).some((w) => w.includes("not set; Node's default is 4"))).toBe(true);
     expect((await run(makeDriver(), undefined)).filter((w) => w.includes("UV_THREADPOOL_SIZE"))).toEqual([]);
+  });
+});
+
+describe("unit/adapter: driver mode — configureDriver / initDriver (2.2)", () => {
+  const spyDriver = (extra: Record<string, unknown> = {}) => {
+    const calls: unknown[] = [];
+    const d = makeDriver({ initOracleClient: (o: unknown) => void calls.push(o), ...extra });
+    return { d: d as typeof d & { fetchTypeHandler?: unknown; fetchArraySize?: number }, calls };
+  };
+  const envClient = process.env.ORACLE_INSTANT_CLIENT;
+  const restoreClient = () => (envClient === undefined ? delete process.env.ORACLE_INSTANT_CLIENT : (process.env.ORACLE_INSTANT_CLIENT = envClient));
+
+  it("thin: never loads an Oracle Client; driver-wide settings apply at init, not import", async () => {
+    const { d, calls } = spyDriver();
+    const a = await loadAdapter(d);
+    expect(d.fetchTypeHandler).toBeUndefined();
+    a.configureDriver({ mode: "thin" });
+    expect(a.initDriver()).toEqual({ mode: "thin" });
+    expect(calls).toEqual([]);
+    expect(d.fetchTypeHandler).toBe(a.moneySafeFetchTypeHandler);
+    expect(d.fetchArraySize).toBe(1000);
+  });
+
+  it("the first pool initialises the driver as configured", async () => {
+    const { d, calls } = spyDriver();
+    const a = await loadAdapter(d);
+    a.configureDriver({ mode: "thick", libDir: "/opt/ic" });
+    register("s_drv_first");
+    await a.withConnection("s_drv_first", async () => 1);
+    expect(calls).toEqual([{ libDir: "/opt/ic" }]);
+    await a.closeAll();
+  });
+
+  it("thick: libDir, else ORACLE_INSTANT_CLIENT, else the system path; NJS-077 is fine, other errors throw", async () => {
+    try {
+      process.env.ORACLE_INSTANT_CLIENT = "/env/ic";
+      let x = spyDriver();
+      let a = await loadAdapter(x.d);
+      a.configureDriver({ mode: "thick" });
+      a.initDriver();
+      expect(x.calls).toEqual([{ libDir: "/env/ic" }]);
+
+      delete process.env.ORACLE_INSTANT_CLIENT;
+      x = spyDriver();
+      a = await loadAdapter(x.d);
+      a.configureDriver({ mode: "thick" });
+      a.initDriver();
+      expect(x.calls).toEqual([{}]);
+
+      x = spyDriver({ oracleClientVersion: 2300000000 });
+      a = await loadAdapter(x.d);
+      a.configureDriver({ mode: "thick" });
+      expect(a.initDriver()).toEqual({ mode: "thick", clientVersion: 2300000000 });
+      expect(x.calls).toEqual([]); // already loaded
+
+      a = await loadAdapter(makeDriver()); // stub init throws NJS-077
+      a.configureDriver({ mode: "thick" });
+      expect(a.initDriver().mode).toBe("thin");
+
+      a = await loadAdapter(makeDriver({ initOracleClient: () => { throw new Error("DPI-1047: no client"); } }));
+      a.configureDriver({ mode: "thick", libDir: "/nope" });
+      expect(() => a.initDriver()).toThrow("DPI-1047: no client");
+    } finally {
+      restoreClient();
+    }
+  });
+
+  it("auto with libDir: passed as is, no Windows DLL check", async () => {
+    const { d, calls } = spyDriver();
+    const a = await loadAdapter(d);
+    a.configureDriver({ mode: "auto", libDir: "/opt/instantclient_23" });
+    a.initDriver();
+    expect(calls).toEqual([{ libDir: "/opt/instantclient_23" }]);
+  });
+
+  it("configureDriver validates; after init it accepts compatible options only", async () => {
+    const a = await loadAdapter(makeDriver({ oracleClientVersion: 2300000000 }));
+    expect(() => a.configureDriver({ mode: "fast" as "thin", libDir: "", extra: 1 } as never)).toThrow(
+      '[mira] Invalid config:\n  - driver.extra is not a driver option\n  - driver.mode must be "auto", "thin" or "thick"\n  - driver.libDir must be a non-empty string',
+    );
+    a.configureDriver(); // defaults to auto
+    a.initDriver();
+    a.configureDriver();
+    a.configureDriver({ mode: "thick" });
+    expect(() => a.configureDriver({ mode: "thin" })).toThrow(
+      "[mira] The Oracle driver is already initialised as thick; it cannot change to thin in this process. Set the driver before the first pool opens.",
+    );
+    expect(() => a.configureDriver({ libDir: "/other" })).toThrow("already initialised as thick; it cannot change to auto (/other)");
+
+    const b = await loadAdapter(makeDriver());
+    b.configureDriver({ libDir: "/ic" });
+    b.initDriver();
+    b.configureDriver({ libDir: "/ic", mode: "thin" });
+    expect(() => b.configureDriver({ mode: "thick" })).toThrow("already initialised as thin (/ic); it cannot change to thick");
   });
 });

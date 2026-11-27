@@ -110,6 +110,31 @@ describe("unit: defineConfig", () => {
   });
 });
 
+describe("unit: defineConfig — driver and logger", () => {
+  it("valid driver and logger are kept (driver copied and frozen)", () => {
+    const driver = { mode: "thick" as const, libDir: "/opt/ic" };
+    const c = defineConfig({ pools: { a: pool }, driver, logger: console });
+    expect(c.driver).toEqual(driver);
+    expect(c.driver).not.toBe(driver);
+    expect(Object.isFrozen(c.driver)).toBe(true);
+    expect(c.logger).toBe(console);
+    expect(defineConfig({ pools: { a: pool }, logger: false }).logger).toBe(false);
+    const plain = defineConfig({ pools: { a: pool } });
+    expect("driver" in plain).toBe(false);
+    expect("logger" in plain).toBe(false);
+  });
+
+  it("reports bad driver and logger options with the pool issues", () => {
+    expect(issuesOf(() => defineConfig({ pools: { a: pool }, driver: { mode: "fast", libDir: " ", x: 1 } as never, logger: {} as never }))).toEqual([
+      "driver.x is not a driver option",
+      'driver.mode must be "auto", "thin" or "thick"',
+      "driver.libDir must be a non-empty string",
+      "logger must have info, warn and error functions (debug optional), or be false",
+    ]);
+    expect(issuesOf(() => defineConfig({ pools: { a: pool }, driver: "thin" as never }))).toEqual(["driver must be an object"]);
+  });
+});
+
 describe("unit: fromEnv", () => {
   const base = { MIRA_DB_USER: "APP", MIRA_DB_PASSWORD: "pw", MIRA_DB_CONNECT_STRING: "db:1521/APP" };
 
@@ -158,6 +183,14 @@ describe("unit: fromEnv", () => {
       'env prefix "mira_x" must be upper case letters, digits and _, starting with a letter',
       'env prefix "7" must be upper case letters, digits and _, starting with a letter',
     ]);
+  });
+
+  it("MIRA_DRIVER_MODE / MIRA_DRIVER_LIB_DIR set the driver when present", () => {
+    expect("driver" in fromEnv({ env: base })).toBe(false);
+    expect(fromEnv({ env: { ...base, MIRA_DRIVER_MODE: " thin " } }).driver).toEqual({ mode: "thin" });
+    expect(fromEnv({ env: { ...base, MIRA_DRIVER_LIB_DIR: "/opt/ic" } }).driver).toEqual({ libDir: "/opt/ic" });
+    expect(fromEnv({ env: { ...base, MIRA_DRIVER_MODE: "thick", MIRA_DRIVER_LIB_DIR: "/ic" } }).driver).toEqual({ mode: "thick", libDir: "/ic" });
+    expect(issuesOf(() => fromEnv({ env: { ...base, MIRA_DRIVER_MODE: "turbo" } }))).toEqual(['driver.mode must be "auto", "thin" or "thick"']);
   });
 
   it("parsed numbers still go through defineConfig's ranges", () => {

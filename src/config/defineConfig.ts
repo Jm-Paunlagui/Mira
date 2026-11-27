@@ -8,7 +8,8 @@
  */
 
 import { miraConfigMessages as MSG } from "../constants/messages/miraConfig.messages";
-import type { MiraConfig, PoolConfig, ResolvedMiraConfig } from "./types";
+import type { DriverOptions, MiraConfig, PoolConfig, ResolvedMiraConfig } from "./types";
+import { isMiraLogger } from "./log";
 
 /** A pool name: a letter, then up to 63 letters, digits or `_`. */
 const POOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
@@ -68,6 +69,23 @@ function checkPool(name: string, pool: unknown, issues: string[]): void {
   }
 }
 
+const DRIVER_MODES = new Set(["auto", "thin", "thick"]);
+
+/** Pushes one issue per problem with a `driver` option object. */
+function checkDriver(driver: unknown, issues: string[]): void {
+  if (!isPlainObject(driver)) {
+    issues.push(MSG.DRIVER_NOT_OBJECT);
+    return;
+  }
+  for (const key of Object.keys(driver)) {
+    if (key !== "mode" && key !== "libDir") issues.push(MSG.DRIVER_UNKNOWN_KEY(key));
+  }
+  if (driver.mode !== undefined && !DRIVER_MODES.has(driver.mode as string)) issues.push(MSG.DRIVER_MODE_INVALID);
+  if (driver.libDir !== undefined && (typeof driver.libDir !== "string" || driver.libDir.trim() === "")) {
+    issues.push(MSG.DRIVER_LIBDIR_INVALID);
+  }
+}
+
 /**
  * Validates `config` and returns a frozen copy with `defaultPool` filled in.
  * With one pool, that pool is the default; with more, `defaultPool` is required.
@@ -98,6 +116,9 @@ function defineConfig<P extends string>(config: MiraConfig<P>): ResolvedMiraConf
     issues.push(MSG.DEFAULT_POOL_UNKNOWN(defaultPool));
   }
 
+  if (config.driver !== undefined) checkDriver(config.driver, issues);
+  if (config.logger !== undefined && !isMiraLogger(config.logger)) issues.push(MSG.LOGGER_INVALID);
+
   if (issues.length) throw new MiraConfigError(issues);
 
   const frozen = {} as Record<P, Readonly<PoolConfig>>;
@@ -106,7 +127,9 @@ function defineConfig<P extends string>(config: MiraConfig<P>): ResolvedMiraConf
     pools: Object.freeze(frozen),
     defaultPool: defaultPool as P,
     poolNames: Object.freeze([...names]),
+    ...(config.driver !== undefined && { driver: Object.freeze({ ...config.driver }) as Readonly<DriverOptions> }),
+    ...(config.logger !== undefined && { logger: config.logger }),
   });
 }
 
-export { defineConfig, MiraConfigError, POOL_NAME_RE };
+export { defineConfig, checkDriver, MiraConfigError, POOL_NAME_RE };

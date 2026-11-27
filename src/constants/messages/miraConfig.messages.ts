@@ -27,6 +27,17 @@ const miraConfigMessages = {
   DEFAULT_POOL_UNKNOWN: (name: unknown) =>
     `defaultPool "${String(name).slice(0, 80)}" is not one of the pools`,
 
+  DRIVER_NOT_OBJECT: "driver must be an object",
+  DRIVER_UNKNOWN_KEY: (key: string) => `driver.${key.slice(0, 80)} is not a driver option`,
+  DRIVER_MODE_INVALID: 'driver.mode must be "auto", "thin" or "thick"',
+  DRIVER_LIBDIR_INVALID: "driver.libDir must be a non-empty string",
+  LOGGER_INVALID: "logger must have info, warn and error functions (debug optional), or be false",
+
+  DRIVER_ALREADY_INITIALISED: (was: string, asked: string) =>
+    `[mira] The Oracle driver is already initialised as ${was}; it cannot change to ${asked} in this process. Set the driver before the first pool opens.`,
+  LOGGER_CONFLICT:
+    "[mira] Another logger is already set (by setLogger or a live createMira instance). Pass the same logger, or close that instance first.",
+
   ENV_PREFIX_INVALID: (prefix: unknown) =>
     `env prefix "${String(prefix).slice(0, 80)}" must be upper case letters, digits and _, starting with a letter`,
   ENV_REQUIRED: (name: string) => `${name} is not set`,
