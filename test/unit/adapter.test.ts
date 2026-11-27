@@ -587,21 +587,13 @@ describe("unit/adapter: Thick-mode safety (2.1)", () => {
     }
   };
 
-  it("sets ORA_SDTZ=+00:00 before the client loads, unless it is already set", async () => {
-    await withEnv({ ORA_SDTZ: undefined }, async () => {
-      const a = await loadAdapter(makeDriver());
-      expect(process.env.ORA_SDTZ).toBeUndefined(); // not at import
-      a.initDriver();
-      expect(process.env.ORA_SDTZ).toBe("+00:00");
-    });
-    await withEnv({ ORA_SDTZ: "  " }, async () => {
-      (await loadAdapter(makeDriver())).initDriver();
-      expect(process.env.ORA_SDTZ).toBe("+00:00");
-    });
-    await withEnv({ ORA_SDTZ: "-05:00" }, async () => {
-      (await loadAdapter(makeDriver())).initDriver();
-      expect(process.env.ORA_SDTZ).toBe("-05:00");
-    });
+  it("never writes ORA_SDTZ (forcing +00:00 moved Dates on a process not on UTC)", async () => {
+    for (const value of [undefined, "  ", "-05:00"]) {
+      await withEnv({ ORA_SDTZ: value }, async () => {
+        (await loadAdapter(makeDriver())).initDriver();
+        expect(process.env.ORA_SDTZ).toBe(value);
+      });
+    }
   });
 
   it("warns when a Thick-mode pool can outgrow UV_THREADPOOL_SIZE; never in Thin mode", async () => {
@@ -794,11 +786,12 @@ describe("unit/adapter: releasing a connection the server already closed (3.0)",
 });
 
 describe("unit/adapter: session time zone per pooled session (3.0)", () => {
-  // Under Bun a runtime process.env change never reaches the Oracle Client, so ORA_SDTZ alone
-  // left Thick-mode sessions in the machine's zone. Every pool sets it in its sessionCallback.
-  const capture = () => {
+  // node-oracledb writes a Date in the PROCESS's zone and Oracle reads it in the SESSION's zone,
+  // so every pool sets each new session to the process's offset (or the caller's ORA_SDTZ).
+  const capture = (extra: Record<string, unknown> = {}) => {
     const seen: { cfg?: { sessionCallback?: (c: unknown, tag: string, done: (e?: Error) => void) => void } } = {};
     const driver = makeDriver({
+      ...extra,
       async createPool(cfg: { poolAlias: string; sessionCallback?: never }) {
         seen.cfg = cfg;
         return { poolAlias: cfg.poolAlias, poolMin: 1, poolMax: 1, connectionsOpen: 0, connectionsInUse: 0, getConnection: async () => conn(), close: async () => {} };
@@ -806,12 +799,23 @@ describe("unit/adapter: session time zone per pooled session (3.0)", () => {
     });
     return { seen, driver };
   };
-  const runCallback = (cb: NonNullable<NonNullable<ReturnType<typeof capture>["seen"]["cfg"]>["sessionCallback"]>, fail = false) =>
-    new Promise<{ sql: string; err?: Error }>((resolve) => {
-      let sql = "";
-      const c = { execute: async (s: string) => { sql = s; if (fail) throw new Error("ORA-01882: timezone region not found"); return {}; } };
-      cb(c, "", (err) => resolve({ sql, err }));
+  /** Runs the callback on a stub session; `refuse` makes statements matching it fail (ORA-01882). */
+  const runCallback = (cb: NonNullable<NonNullable<ReturnType<typeof capture>["seen"]["cfg"]>["sessionCallback"]>, refuse: RegExp | null = null) =>
+    new Promise<{ sql: string; sqls: string[]; err?: Error }>((resolve) => {
+      const sqls: string[] = [];
+      const c = { execute: async (q: string) => { sqls.push(q); if (refuse?.test(q)) throw new Error("ORA-01882: timezone region not found"); return {}; } };
+      cb(c, "", (err) => resolve({ sql: sqls[sqls.length - 1], sqls, err }));
     });
+  const withTz = async (zone: string, fn: () => Promise<void>) => {
+    const tz = process.env.TZ;
+    process.env.TZ = zone;
+    try {
+      await fn();
+    } finally {
+      if (tz === undefined) delete process.env.TZ;
+      else process.env.TZ = tz;
+    }
+  };
   const withSdtz = async (value: string | undefined, fn: () => Promise<void>) => {
     const before = process.env.ORA_SDTZ;
     if (value === undefined) delete process.env.ORA_SDTZ;
@@ -824,16 +828,43 @@ describe("unit/adapter: session time zone per pooled session (3.0)", () => {
     }
   };
 
-  it("default +00:00: every new session runs ALTER SESSION SET TIME_ZONE; a failure reaches the driver", async () => {
+  it("Thin: the process's region (or its offset when it has none); an unknown region falls back to the offset", async () => {
     await withSdtz(undefined, async () => {
       const { seen, driver } = capture();
-      const a = await loadAdapter(driver);
-      register("s_tz_default");
-      await a.withConnection("s_tz_default", async () => 1);
+      const a = await loadAdapter(driver); // the stub reports no client version: Thin mode
+      register("s_tz_thin");
+      await a.withConnection("s_tz_thin", async () => 1);
       const cb = seen.cfg!.sessionCallback!;
-      expect(await runCallback(cb)).toEqual({ sql: "ALTER SESSION SET TIME_ZONE = '+00:00'", err: undefined });
-      const failed = await runCallback(cb, true);
-      expect(failed.err?.message).toMatch(/ORA-01882/);
+      for (const [zone, sql] of [
+        ["UTC", "ALTER SESSION SET TIME_ZONE = '+00:00'"],
+        ["Asia/Manila", "ALTER SESSION SET TIME_ZONE = 'Asia/Manila'"],
+        ["America/New_York", "ALTER SESSION SET TIME_ZONE = 'America/New_York'"],
+      ]) {
+        await withTz(zone, async () => expect(await runCallback(cb)).toEqual({ sql, sqls: [sql], err: undefined }));
+      }
+      await withTz("Asia/Kolkata", async () => {
+        const region = Intl.DateTimeFormat().resolvedOptions().timeZone; // ICU may say Asia/Calcutta
+        const r = await runCallback(cb, /Asia\//);
+        expect(r).toEqual({ sql: "ALTER SESSION SET TIME_ZONE = '+05:30'", sqls: [`ALTER SESSION SET TIME_ZONE = '${region}'`, "ALTER SESSION SET TIME_ZONE = '+05:30'"], err: undefined });
+      });
+      await withTz("America/Caracas", async () => {
+        const failed = await runCallback(cb, /./); // region and offset both refused: the driver hears of it
+        expect(failed.sqls).toEqual(["ALTER SESSION SET TIME_ZONE = 'America/Caracas'", "ALTER SESSION SET TIME_ZONE = '-04:00'"]);
+        expect(failed.err?.message).toMatch(/ORA-01882/);
+      });
+      await a.closeAll();
+    });
+  });
+
+  it("Thick: the offset, never a region (the client's time-zone file can differ from the server's: ORA-01805)", async () => {
+    await withSdtz(undefined, async () => {
+      const { seen, driver } = capture({ oracleClientVersion: 2300000000 });
+      const a = await loadAdapter(driver);
+      register("s_tz_thick");
+      await a.withConnection("s_tz_thick", async () => 1);
+      const cb = seen.cfg!.sessionCallback!;
+      await withTz("Asia/Manila", async () => expect((await runCallback(cb)).sqls).toEqual(["ALTER SESSION SET TIME_ZONE = '+08:00'"]));
+      await withTz("America/Caracas", async () => expect((await runCallback(cb)).sqls).toEqual(["ALTER SESSION SET TIME_ZONE = '-04:00'"]));
       await a.closeAll();
     });
   });

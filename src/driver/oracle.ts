@@ -41,30 +41,63 @@ function _binaryOpts(): { binaryDir?: string } {
 type OracleDb = typeof import("oracledb");
 
 /**
- * The zone every pooled session is set to: the caller's ORA_SDTZ, else +00:00.
- * Resolved once by initDriver(); null when the caller's value is not one Mira
- * will put into SQL (then sessions keep the client's default and a warning says so).
+ * The session time zone the caller chose with ORA_SDTZ: undefined when unset
+ * (sessions follow the process's zone), null when it is not a value Mira will
+ * put into SQL (sessions are left as the client opens them; a warning says so).
+ * Resolved once by initDriver().
  */
-let _sessionTimeZone: string | null = "+00:00";
+let _sessionTimeZoneOverride: string | null | undefined;
 /** An offset (+08:00), a region (Asia/Manila), LOCAL or DBTIMEZONE: no quote or space can get in. */
 const SESSION_TZ_RE = /^[A-Za-z0-9_+\-/:]{1,64}$/;
 
-/** Resolves the session zone and sets ORA_SDTZ for clients that read it (see the note where it is called). */
-function _ensureSessionTimeZone() {
+/** Reads the caller's ORA_SDTZ once. Mira never writes ORA_SDTZ itself. */
+function _resolveSessionTimeZone() {
     const own = process.env.ORA_SDTZ?.trim();
-    if (!own) process.env.ORA_SDTZ = "+00:00";
-    _sessionTimeZone = own ? (SESSION_TZ_RE.test(own) ? own : null) : "+00:00";
-    if (_sessionTimeZone === null) log().warning(oracleMessages.SESSION_TZ_IGNORED);
+    _sessionTimeZoneOverride = own ? (SESSION_TZ_RE.test(own) ? own : null) : undefined;
+    if (_sessionTimeZoneOverride === null) log().warning(oracleMessages.SESSION_TZ_IGNORED);
+}
+
+/** The process's current UTC offset as Oracle writes it: +08:00, -05:00, +05:30. */
+function _processUtcOffset(): string {
+    const minutes = -new Date().getTimezoneOffset();
+    const abs = Math.abs(minutes);
+    return `${minutes < 0 ? "-" : "+"}${String(Math.floor(abs / 60)).padStart(2, "0")}:${String(abs % 60).padStart(2, "0")}`;
+}
+
+/** The process's IANA zone (Asia/Manila, America/New_York) when it is one Oracle can take; else null. */
+function _processRegion(): string | null {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return zone && zone.includes("/") && SESSION_TZ_RE.test(zone) ? zone : null;
 }
 
 /**
  * Pool sessionCallback: runs once per NEW pooled session (not per checkout) and
- * sets its time zone. ORA_SDTZ alone is not enough: under Bun a process.env
- * change made at runtime never reaches the Oracle Client's getenv, so Thick
- * mode opened sessions in the machine's zone and moved JS Dates by its offset.
+ * sets its time zone to the process's (or to the caller's ORA_SDTZ).
+ *
+ * node-oracledb turns a JS Date into a timestamp in the PROCESS's zone, and
+ * Oracle reads that timestamp in the SESSION's zone; when the two differ, a Date
+ * written to a TIMESTAMP WITH (LOCAL) TIME ZONE column moves by the difference.
+ * Thick mode opens sessions in the C runtime's zone, which differs whenever the
+ * JS zone was changed (bun test forces UTC); forcing +00:00, as 2.x did, was right
+ * only for a process on UTC.
+ *
+ * Thin mode gets the region (America/New_York), so a Date from the other side
+ * of a daylight-saving change converts with its own offset; if the server does
+ * not know the region, the offset. Thick mode gets the offset: a region makes it
+ * fetch with the client's time-zone file, which fails (ORA-01805) when that file
+ * differs from the server's. In a zone with daylight saving, a Thick-mode Date
+ * from the other season therefore moves by an hour: run such a process on UTC.
  */
 function _setSessionTimeZone(conn: import("oracledb").Connection, _requestedTag: string, done: (err?: Error) => void): void {
-    conn.execute(`ALTER SESSION SET TIME_ZONE = '${_sessionTimeZone}'`).then(() => done(), (err: Error) => done(err));
+    const alter = (zone: string) => conn.execute(`ALTER SESSION SET TIME_ZONE = '${zone}'`);
+    const offset = _processUtcOffset();
+    const region = _driverInfo?.mode === "thin" ? _processRegion() : null;
+    const run = _sessionTimeZoneOverride
+        ? alter(_sessionTimeZoneOverride)
+        : region
+          ? alter(region).catch(() => alter(offset))
+          : alter(offset);
+    run.then(() => done(), (err: Error) => done(err));
 }
 
 /** "auto": try Thick mode from libDir or the system library path; a failure leaves Thin mode. */
@@ -138,16 +171,9 @@ function initDriver(): Readonly<{ mode: "thin" | "thick"; clientVersion?: number
     if (_driverInfo) return _driverInfo;
     const { mode, libDir } = _driverOptions;
     try {
-        // Session time zone: +00:00 in both driver modes. Thin mode opens every
-        // session in UTC; Thick mode opened it in the operating system's zone, and a
-        // JS Date written to a TIMESTAMP WITH (LOCAL) TIME ZONE column then moved by
-        // that zone's offset. Every pool's sessionCallback sets it per new session
-        // (_setSessionTimeZone); ORA_SDTZ is also set, before the client loads, for
-        // connections an app opens on the driver itself (Node passes it through;
-        // Bun does not). A numeric offset, not "UTC": a named region needs the
-        // client's time-zone file, and an older client on a newer server fails with
-        // ORA-01805. A value the caller already set wins.
-        _ensureSessionTimeZone();
+        // Session time zone: each pooled session is set to the process's own zone
+        // (see _setSessionTimeZone); an ORA_SDTZ the caller set wins.
+        _resolveSessionTimeZone();
 
         // Applied driver-wide so EVERY query (wrapper methods and raw conn.execute alike)
         // gets exact decimal strings for scaled NUMBER columns. It used to live only in
@@ -630,7 +656,7 @@ async function _createPool(name: string, dbConfig: import("oracledb").PoolAttrib
         ...POOL_DEFAULTS,
         ...dbConfig,
         poolAlias,
-        ...(_sessionTimeZone !== null && { sessionCallback: _setSessionTimeZone }),
+        ...(_sessionTimeZoneOverride !== null && { sessionCallback: _setSessionTimeZone }),
     };
     // App config is ms; the driver wants seconds (the acquire race elsewhere stays ms).
     config.connectTimeout = toDriverConnectTimeoutSec(config.connectTimeout);

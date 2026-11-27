@@ -9,7 +9,7 @@
  * so the shift showed in Thick mode whatever TZ said.
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { schema, coll, dropIfExists, rawExec } from "../helpers/db";
+import { db, schema, coll, dropIfExists, rawExec } from "../helpers/db";
 
 const T = "MIRA_TZ_DATES";
 const at = new Date("2026-05-06T07:08:09.123Z");
@@ -38,9 +38,18 @@ describe("integration: dates and time zones", () => {
     );
   });
 
-  it("DEFECT: the session time zone is +00:00 in both driver modes (Thin's own default)", async () => {
+  it("the session time zone is the process's: its region in Thin mode, its offset in Thick mode", async () => {
+    // node-oracledb writes a Date in the process's zone; Oracle reads it in the session's.
+    const offsetAt = (d: Date) => {
+      const minutes = -d.getTimezoneOffset();
+      const abs = Math.abs(minutes);
+      return `${minutes < 0 ? "-" : "+"}${String(Math.floor(abs / 60)).padStart(2, "0")}:${String(abs % 60).padStart(2, "0")}`;
+    };
+    const region = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const thin = !db.oracledb.oracleClientVersion;
     const r = await rawExec<{ STZ: string; TXT: string }>(`SELECT SESSIONTIMEZONE AS STZ, TO_CHAR(TSZ, 'TZH:TZM') AS TXT FROM "${T}" WHERE K = 'one'`);
-    expect(r.rows?.[0]).toEqual({ STZ: "+00:00", TXT: "+00:00" });
+    expect(r.rows?.[0]?.STZ).toBe(thin && region.includes("/") ? region : offsetAt(new Date()));
+    expect(r.rows?.[0]?.TXT).toBe(offsetAt(at)); // the stored value carries that instant's own offset
   });
 
   it("a filter with a Date matches the row it wrote", async () => {

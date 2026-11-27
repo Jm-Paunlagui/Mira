@@ -112,11 +112,24 @@ function buildIncludeSQL(spec: RelationSpec, as: string, options: IncludeOptions
   return { sql: `${sql} AS ${quoteIdentifier(as)}`, binds };
 }
 
-/** One related row from JSON: date columns back to Date (no zone in the text = UTC, as Mira reads them). */
+/**
+ * Text from JSON back to a Date, read the way node-oracledb reads the column:
+ * text with a zone (TIMESTAMP WITH TIME ZONE) is that instant; text without one
+ * (TIMESTAMP, DATE, LOCAL TIME ZONE in the session's zone) is the PROCESS's local
+ * time, which is also the session's (see _setSessionTimeZone in driver/oracle.ts).
+ * JavaScript reads "YYYY-MM-DDTHH:MM:SS" as local but a bare "YYYY-MM-DD" as UTC,
+ * so a bare date gets its midnight spelled out.
+ */
+function jsonToDate(v: string): Date {
+  if (/(Z|[+-]\d\d:\d\d)$/.test(v)) return new Date(v);
+  return new Date(/^\d{4}-\d{2}-\d{2}$/.test(v) ? `${v}T00:00:00` : v);
+}
+
+/** One related row from JSON: date columns back to Date. */
 function decodeRow(spec: RelationSpec, row: Record<string, unknown>): Record<string, unknown> {
   for (const [col, c] of Object.entries(spec.target.columns)) {
     const v = row[col];
-    if (typeof v === "string" && DATE_TYPE.test(c.meta.type)) row[col] = new Date(/(Z|[+-]\d\d:\d\d)$/.test(v) ? v : `${v}Z`);
+    if (typeof v === "string" && DATE_TYPE.test(c.meta.type)) row[col] = jsonToDate(v);
   }
   return row;
 }

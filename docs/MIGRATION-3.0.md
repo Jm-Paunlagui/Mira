@@ -132,6 +132,7 @@ A blank variable counts as unset; a number that does not parse throws, naming th
 
 ## 9. Behaviour to re-check
 
+- **Session time zone.** 2.x forced every session to `+00:00`; 3.0 opens it in the process's zone, the only setting under which a JS `Date` keeps its instant in a `TIMESTAMP WITH (LOCAL) TIME ZONE` column. On a server running on UTC nothing changes. Elsewhere, under Node, 2.x had been moving such Dates by the process's offset; under Bun (CATHERINE) its `ORA_SDTZ` change never took effect, so 3.0 behaves exactly as CATHERINE already did. SQL using `CURRENT_TIMESTAMP` / `LOCALTIMESTAMP` now sees the process's zone. In Thick mode in a daylight-saving zone, run the process on UTC.
 - **Pool defaults.** Fields you leave out use Mira's pool defaults (min 10, max 50, queue 40). 2.x's env-driven pools defaulted to 5 / 20 / 40; set them explicitly (as in §2) to keep that.
 - **Missing credentials** always throw; the 2.x development-mode "placeholder" pass is gone.
 - **Config typos** throw: `MiraConfigError` lists every problem in `err.issues`.
