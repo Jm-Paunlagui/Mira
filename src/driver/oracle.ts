@@ -40,9 +40,31 @@ function _binaryOpts(): { binaryDir?: string } {
 /** The node-oracledb module. */
 type OracleDb = typeof import("oracledb");
 
-/** ORA_SDTZ=+00:00 unless set already (see the note where it is called). */
+/**
+ * The zone every pooled session is set to: the caller's ORA_SDTZ, else +00:00.
+ * Resolved once by initDriver(); null when the caller's value is not one Mira
+ * will put into SQL (then sessions keep the client's default and a warning says so).
+ */
+let _sessionTimeZone: string | null = "+00:00";
+/** An offset (+08:00), a region (Asia/Manila), LOCAL or DBTIMEZONE: no quote or space can get in. */
+const SESSION_TZ_RE = /^[A-Za-z0-9_+\-/:]{1,64}$/;
+
+/** Resolves the session zone and sets ORA_SDTZ for clients that read it (see the note where it is called). */
 function _ensureSessionTimeZone() {
-    if (process.env.ORA_SDTZ === undefined || process.env.ORA_SDTZ.trim() === "") process.env.ORA_SDTZ = "+00:00";
+    const own = process.env.ORA_SDTZ?.trim();
+    if (!own) process.env.ORA_SDTZ = "+00:00";
+    _sessionTimeZone = own ? (SESSION_TZ_RE.test(own) ? own : null) : "+00:00";
+    if (_sessionTimeZone === null) log().warning(oracleMessages.SESSION_TZ_IGNORED);
+}
+
+/**
+ * Pool sessionCallback: runs once per NEW pooled session (not per checkout) and
+ * sets its time zone. ORA_SDTZ alone is not enough: under Bun a process.env
+ * change made at runtime never reaches the Oracle Client's getenv, so Thick
+ * mode opened sessions in the machine's zone and moved JS Dates by its offset.
+ */
+function _setSessionTimeZone(conn: import("oracledb").Connection, _requestedTag: string, done: (err?: Error) => void): void {
+    conn.execute(`ALTER SESSION SET TIME_ZONE = '${_sessionTimeZone}'`).then(() => done(), (err: Error) => done(err));
 }
 
 /** "auto": try Thick mode from libDir or the system library path; a failure leaves Thin mode. */
@@ -119,10 +141,12 @@ function initDriver(): Readonly<{ mode: "thin" | "thick"; clientVersion?: number
         // Session time zone: +00:00 in both driver modes. Thin mode opens every
         // session in UTC; Thick mode opened it in the operating system's zone, and a
         // JS Date written to a TIMESTAMP WITH (LOCAL) TIME ZONE column then moved by
-        // that zone's offset. The Oracle client reads ORA_SDTZ when it creates a
-        // session, so it is set before the client loads. A numeric offset, not "UTC":
-        // a named region needs the client's time-zone file, and an older client on a
-        // newer server fails with ORA-01805. A value the caller already set wins.
+        // that zone's offset. Every pool's sessionCallback sets it per new session
+        // (_setSessionTimeZone); ORA_SDTZ is also set, before the client loads, for
+        // connections an app opens on the driver itself (Node passes it through;
+        // Bun does not). A numeric offset, not "UTC": a named region needs the
+        // client's time-zone file, and an older client on a newer server fails with
+        // ORA-01805. A value the caller already set wins.
         _ensureSessionTimeZone();
 
         // Applied driver-wide so EVERY query (wrapper methods and raw conn.execute alike)
@@ -606,6 +630,7 @@ async function _createPool(name: string, dbConfig: import("oracledb").PoolAttrib
         ...POOL_DEFAULTS,
         ...dbConfig,
         poolAlias,
+        ...(_sessionTimeZone !== null && { sessionCallback: _setSessionTimeZone }),
     };
     // App config is ms; the driver wants seconds (the acquire race elsewhere stays ms).
     config.connectTimeout = toDriverConnectTimeoutSec(config.connectTimeout);
@@ -930,10 +955,19 @@ async function withConnection<T>(connectionName: string, callback: (conn: import
         if (conn) {
             // Session settings a callback changed must not follow the pooled
             // connection to its next borrower (a leftover callTimeout aborts
-            // someone else's long query).
-            if (conn.callTimeout) conn.callTimeout = 0;
+            // someone else's long query). On a session that is already gone
+            // (Thick mode closes it when a call timeout cannot be interrupted:
+            // NJS-500 / ORA-03156), the reset itself throws DPI-1010. That must
+            // neither replace the caller's error nor skip the release: the
+            // connection is dropped from the pool instead of returned to it.
+            let dead = false;
             try {
-                await conn.close();
+                if (conn.callTimeout) conn.callTimeout = 0;
+            } catch {
+                dead = true;
+            }
+            try {
+                await (dead ? conn.close({ drop: true }) : conn.close());
             } catch (e) {
                 log().warning(
                     oracleMessages.CLOSE_FAILED(connectionName, e.message),

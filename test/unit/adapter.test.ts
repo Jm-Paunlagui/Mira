@@ -764,3 +764,104 @@ describe("unit/adapter: closePool during pool creation (3.0)", () => {
     }
   });
 });
+
+describe("unit/adapter: releasing a connection the server already closed (3.0)", () => {
+  it("a reset that throws (dead session) neither replaces the error nor skips the release: the connection is dropped", async () => {
+    const a = await loadAdapter(makeDriver());
+    const closes: unknown[] = [];
+    const dead = conn({ close: async (...args: unknown[]) => void closes.push(args[0] ?? "plain") } as never);
+    Object.defineProperty(dead, "callTimeout", {
+      get: () => 500,
+      set: () => { throw new Error("DPI-1010: not connected"); },
+    });
+    register("s_dead_session", { getConnection: async () => dead });
+    const err = await a
+      .withConnection("s_dead_session", async () => { throw new Error("NJS-500: connection to Oracle Database was closed or broken"); })
+      .catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/NJS-500/);
+    expect((err as Error).message).not.toMatch(/DPI-1010/);
+    expect(closes).toEqual(["plain", { drop: true }]); // the pool's warm-up ping, then the dead session dropped
+
+    // A live session with a callTimeout is reset and returned to the pool as usual.
+    const live = conn({ close: async (...args: unknown[]) => void closes.push(args[0] ?? "plain") } as never) as ReturnType<typeof conn> & { callTimeout: number };
+    live.callTimeout = 500;
+    register("s_live_session", { getConnection: async () => live });
+    expect(await a.withConnection("s_live_session", async () => "ok")).toBe("ok");
+    expect(live.callTimeout).toBe(0);
+    expect(closes).toEqual(["plain", { drop: true }, "plain", "plain"]); // + the new pool's warm-up, then returned
+    await a.closeAll();
+  });
+});
+
+describe("unit/adapter: session time zone per pooled session (3.0)", () => {
+  // Under Bun a runtime process.env change never reaches the Oracle Client, so ORA_SDTZ alone
+  // left Thick-mode sessions in the machine's zone. Every pool sets it in its sessionCallback.
+  const capture = () => {
+    const seen: { cfg?: { sessionCallback?: (c: unknown, tag: string, done: (e?: Error) => void) => void } } = {};
+    const driver = makeDriver({
+      async createPool(cfg: { poolAlias: string; sessionCallback?: never }) {
+        seen.cfg = cfg;
+        return { poolAlias: cfg.poolAlias, poolMin: 1, poolMax: 1, connectionsOpen: 0, connectionsInUse: 0, getConnection: async () => conn(), close: async () => {} };
+      },
+    });
+    return { seen, driver };
+  };
+  const runCallback = (cb: NonNullable<NonNullable<ReturnType<typeof capture>["seen"]["cfg"]>["sessionCallback"]>, fail = false) =>
+    new Promise<{ sql: string; err?: Error }>((resolve) => {
+      let sql = "";
+      const c = { execute: async (s: string) => { sql = s; if (fail) throw new Error("ORA-01882: timezone region not found"); return {}; } };
+      cb(c, "", (err) => resolve({ sql, err }));
+    });
+  const withSdtz = async (value: string | undefined, fn: () => Promise<void>) => {
+    const before = process.env.ORA_SDTZ;
+    if (value === undefined) delete process.env.ORA_SDTZ;
+    else process.env.ORA_SDTZ = value;
+    try {
+      await fn();
+    } finally {
+      if (before === undefined) delete process.env.ORA_SDTZ;
+      else process.env.ORA_SDTZ = before;
+    }
+  };
+
+  it("default +00:00: every new session runs ALTER SESSION SET TIME_ZONE; a failure reaches the driver", async () => {
+    await withSdtz(undefined, async () => {
+      const { seen, driver } = capture();
+      const a = await loadAdapter(driver);
+      register("s_tz_default");
+      await a.withConnection("s_tz_default", async () => 1);
+      const cb = seen.cfg!.sessionCallback!;
+      expect(await runCallback(cb)).toEqual({ sql: "ALTER SESSION SET TIME_ZONE = '+00:00'", err: undefined });
+      const failed = await runCallback(cb, true);
+      expect(failed.err?.message).toMatch(/ORA-01882/);
+      await a.closeAll();
+    });
+  });
+
+  it("an ORA_SDTZ the caller set wins; one that could break out of the SQL literal is refused with a warning", async () => {
+    await withSdtz("Asia/Manila", async () => {
+      const { seen, driver } = capture();
+      const a = await loadAdapter(driver);
+      register("s_tz_own");
+      await a.withConnection("s_tz_own", async () => 1);
+      expect((await runCallback(seen.cfg!.sessionCallback!)).sql).toBe("ALTER SESSION SET TIME_ZONE = 'Asia/Manila'");
+      await a.closeAll();
+    });
+    await withSdtz("+08:00' ; DROP TABLE X --", async () => {
+      const before = getLogger();
+      const warnings: string[] = [];
+      setLogger({ info() {}, warn: (m: string) => void warnings.push(m), error() {} });
+      try {
+        const { seen, driver } = capture();
+        const a = await loadAdapter(driver);
+        register("s_tz_bad");
+        await a.withConnection("s_tz_bad", async () => 1);
+        expect(seen.cfg!.sessionCallback).toBeUndefined();
+        expect(warnings.some((w) => w.startsWith("ORA_SDTZ is not an offset"))).toBe(true);
+        await a.closeAll();
+      } finally {
+        setLogger(before);
+      }
+    });
+  });
+});

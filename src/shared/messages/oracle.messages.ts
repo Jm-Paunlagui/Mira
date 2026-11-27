@@ -6,6 +6,8 @@
  */
 
 const oracleMessages = {
+  SESSION_TZ_IGNORED:
+    "ORA_SDTZ is not an offset (+08:00), a region (Asia/Manila), LOCAL or DBTIMEZONE; Mira leaves the session time zone at the client's default.",
   POOL_READY: (name: unknown, pool: { poolMin: number; poolMax: number }) =>
     `Pool "${name}" ready (min=${pool.poolMin}, max=${pool.poolMax}).`,
   THREADPOOL_TOO_SMALL: (name: unknown, poolMax: unknown, threads: unknown, fromEnv: boolean) =>

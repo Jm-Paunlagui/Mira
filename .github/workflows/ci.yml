@@ -38,13 +38,17 @@ jobs:
       - run: npm pack --dry-run
 
   test:
-    name: Oracle 23ai (${{ matrix.driver }} mode)
+    name: Oracle 23ai (${{ matrix.driver }} mode, ${{ matrix.connect }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         driver: [thin, thick]
+        # failover: the TNS descriptor 2.x always used (dedicated server, SELECT failover, whose
+        #   transparent reconnect can hide a dead session). easy: plain Easy Connect, as most 3.0
+        #   apps will connect; a Thick-mode call timeout there really closes the session.
+        connect: [failover, easy]
     services:
       oracle:
         image: gvenzl/oracle-free:23-slim-faststart
@@ -59,14 +63,10 @@ jobs:
           --health-timeout 5s
           --health-retries 30
     env:
-      # The test schema's pool: fromEnv() → appDb. The descriptor 2.x always used (dedicated
-      # server, SELECT failover), by service name. Thick mode's call-timeout and dead-connection
-      # chaos tests have only ever passed with this failover in place: on plain Easy Connect a
-      # timed-out call leaves a dead session (DPI-1010) still counted in use. Tracked in
-      # docs/ROADMAP-3.0.md ("Open: Thick mode without failover").
+      # The test schema's pool: fromEnv() → appDb, by the PDB's service name (see matrix.connect).
       MIRA_DB_USER: MIRA
       MIRA_DB_PASSWORD: MiraCi_app_2026
-      MIRA_DB_CONNECT_STRING: "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=1521))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=FREEPDB1)(FAILOVER_MODE=(TYPE=SELECT)(METHOD=BASIC)(RETRIES=180)(DELAY=5))))"
+      MIRA_DB_CONNECT_STRING: ${{ matrix.connect == 'easy' && 'localhost:1521/FREEPDB1' || '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=1521))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=FREEPDB1)(FAILOVER_MODE=(TYPE=SELECT)(METHOD=BASIC)(RETRIES=180)(DELAY=5))))' }}
       MIRA_DB_POOL_MIN: "5"
       MIRA_DB_POOL_MAX: "20"
       MIRA_DB_QUEUE_MAX: "40"
@@ -81,6 +81,10 @@ jobs:
       # runner: "concurrent transfers" ran 8 at once). node-oracledb's advice: at
       # least as many threads as pooled connections. Thin mode is unaffected.
       UV_THREADPOOL_SIZE: "32"
+      # Runners are on UTC, where a session that ignores the configured time zone still looks
+      # right. Run in +08:00 (no daylight saving) so a Date that moves by the machine's offset
+      # fails the time-zone tests (Thick mode under Bun did, unseen, until 3.0).
+      TZ: Asia/Manila
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2

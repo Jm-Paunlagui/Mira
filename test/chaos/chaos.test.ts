@@ -120,18 +120,21 @@ describe("chaos: pool exhaustion and slow calls", () => {
   // NOTE: how fast an in-flight call is interrupted depends on out-of-band break support between
   // driver and server. Through Docker port-forwarding on macOS it lands only when the call ends,
   // so latency is recorded, not asserted; the wrapper's job (error surfaces, connection released) is.
-  it("per-call timeout fails a runaway statement with NJS-123; the connection is released", async () => {
+  // Two correct outcomes: the call is interrupted (NJS-123 / DPI-1067: Thin mode, or Thick mode
+  // with transparent failover), or Thick mode, unable to interrupt it in flight, closes the
+  // session (NJS-500 with ORA-03156). Either way the caller sees that error, not a DPI-1010 from
+  // cleanup, and the dead session is dropped from the pool, not leaked. withConnection resets
+  // callTimeout itself (reliability suite), so the callback does not; a reset on the dead session
+  // would throw DPI-1010 over the real error.
+  it("per-call timeout fails a runaway statement; the error surfaces and the connection is released", async () => {
     const [err, ms] = await timeIt(() =>
       db.withConnection(async (c) => {
         c.callTimeout = 500;
-        try {
-          await c.execute("BEGIN DBMS_SESSION.SLEEP(3); END;");
-        } finally {
-          c.callTimeout = 0; // pooled connections keep this setting — see reliability suite
-        }
+        await c.execute("BEGIN DBMS_SESSION.SLEEP(3); END;");
       }).catch((e: Error) => e),
     );
-    expect((err as Error).message).toMatch(/NJS-123|DPI-1067|call timeout/i);
+    expect((err as Error).message).toMatch(/NJS-123|DPI-1067|call timeout|ORA-03156/i);
+    expect((err as Error).message).not.toMatch(/DPI-1010/);
     m("callTimeout(500ms) observed abort latency", ms, "ms", "OOB break unsupported via Docker/macOS → lands at call end");
     expect(await appDbInUse()).toBe(0);
     await appDbAlive();
