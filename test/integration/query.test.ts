@@ -3,7 +3,7 @@
  * against the live MIRA schema.
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { OracleCollection, QueryBuilder, Transaction, withCTE, withRecursiveCTE } from "../../src/utils/oracle-mongo-wrapper";
+import { OracleCollection, QueryBuilder, Transaction, withCTE, withRecursiveCTE } from "../../src";
 import { db, coll, createUsers, createOrders, createEmployees, dropIfExists, rawExec, sleep, USERS } from "../helpers/db";
 
 const U = "MIRA_IQ_USERS";

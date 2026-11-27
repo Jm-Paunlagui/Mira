@@ -9,8 +9,8 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import config from "../../src/config";
-import database from "../../src/config/database";
-import { Transaction, parseFilter } from "../../src/utils/oracle-mongo-wrapper";
+import database from "../../src/driver/registry";
+import { Transaction, parseFilter } from "../../src";
 import { db, schema, coll, dropIfExists, recordMetric, timeIt, sleep, appDbInUse } from "../helpers/db";
 
 const conns = database.connections as Record<string, Record<string, unknown>>;

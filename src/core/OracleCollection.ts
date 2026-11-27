@@ -1,0 +1,2332 @@
+
+
+/**
+ * ============================================================================
+ * OracleCollection.js — The Heart of the Library
+ * ============================================================================
+ *
+ * WHAT THIS FILE DOES:
+ *   This is the MAIN CLASS of the entire library. It mirrors MongoDB's
+ *   Collection API and gives you familiar methods like find(), insertOne(),
+ *   updateMany(), deleteOne(), aggregate(), etc. — but executing against
+ *   an Oracle database under the hood.
+ *
+ * HOW TO USE:
+ *   const users = new OracleCollection("users", db);
+ *   await users.findOne({ id: 1 });                     // Read one row
+ *   await users.insertOne({ name: "Ana" });              // Insert a row
+ *   await users.updateOne({ id: 1 }, { $set: { age: 25 } }); // Update
+ *   await users.deleteOne({ id: 1 });                   // Delete
+ *
+ * CONNECTION MANAGEMENT:
+ *   You never manage connections yourself. Each method internally calls
+ *   this._execute(fn), which:
+ *     - If inside a transaction → reuses the transaction's connection
+ *     - If standalone → borrows a connection from the pool, uses it, returns it
+ *
+ * COMPLETE METHOD REFERENCE:
+ *   Reading data:
+ *     find()           → Returns a lazy QueryBuilder (chainable - see QueryBuilder.js)
+ *     findOne()        → Get one row matching a filter
+ *     findOneAndUpdate() → Find a row, update it, and return the result
+ *     findOneAndDelete() → Find a row, delete it, and return the deleted row
+ *     findOneAndReplace() → Find a row and replace all its fields
+ *     countDocuments() → Count rows matching a filter
+ *     estimatedDocumentCount() → Fast count from Oracle metadata (no full scan)
+ *     distinct()       → Get unique values of a column
+ *
+ *   Writing data:
+ *     insertOne()      → Insert one row (returns the inserted ID)
+ *     insertMany()     → Bulk insert many rows at once
+ *     updateOne()      → Update the first row matching a filter
+ *     updateMany()     → Update ALL rows matching a filter
+ *     replaceOne()     → Replace all fields (except PK) of the first match
+ *     deleteOne()      → Delete the first row matching a filter
+ *     deleteMany()     → Delete ALL rows matching a filter
+ *     bulkWrite()      → Execute multiple operations in a single transaction
+ *
+ *   Aggregation & analytics:
+ *     aggregate()      → MongoDB-style aggregation pipeline (see aggregatePipeline.js)
+ *
+ *   Indexes:
+ *     createIndex()    → Create a database index for faster queries
+ *     createIndexes()  → Create multiple indexes at once
+ *     dropIndex()      → Remove an index
+ *     dropIndexes()    → Remove all non-primary-key indexes
+ *     getIndexes()     → List all indexes on the table
+ *     reIndex()        → Rebuild all indexes
+ *
+ *   Oracle MERGE (upsert):
+ *     merge()          → Insert or update based on a match condition
+ *     mergeFrom()      → Merge from another table
+ *
+ *   Oracle-specific (advanced):
+ *     connectBy()      → Hierarchical (tree) queries
+ *     pivot()          → Rotate rows into columns
+ *     unpivot()        → Rotate columns into rows
+ *     insertFromQuery() → INSERT INTO ... SELECT ...
+ *     updateFromJoin()  → Update using values from a joined table
+ *
+ *   Set operations (static methods):
+ *     OracleCollection.union()     → Combine results from two queries
+ *     OracleCollection.intersect() → Find common rows between two queries
+ *     OracleCollection.minus()     → Find rows in first query but not second
+ *
+ *   Destructive:
+ *     drop()           → DROP TABLE (deletes the entire table!)
+ * ============================================================================
+ */
+
+import type { DbConnection } from "../driver/db";
+import { quoteIdentifier, bindSafe, mergeBinds } from "../shared/utils";
+import { parseFilter } from "../parsers/filterParser";
+import { parseUpdate } from "../parsers/updateParser";
+import { QueryBuilder } from "./QueryBuilder";
+import { oracleMongoWrapperMessages as MSG } from "../shared/messages";
+
+/**
+ * Deep-clone an object/array while preserving Date instances.
+ * JSON.parse(JSON.stringify(...)) converts Dates to ISO strings, which then
+ * fail Oracle's NLS_DATE_FORMAT implicit conversion (ORA-01843) when passed
+ * as bind values against DATE columns.
+ *
+ * @param {*} value
+ * @returns {*}
+ */
+/**
+ * Turn the JSON text of $push / $addToSet / $percentile-list columns into JS arrays.
+ * "set" columns keep the first occurrence of each value (19c's JSON_ARRAYAGG has
+ * no DISTINCT). A NULL column (an empty group under ROLLUP, say) stays null.
+ */
+function _parseArrayColumns(rows: Record<string, unknown>[], arrays: Record<string, "array" | "set">): Record<string, unknown>[] {
+    for (const row of rows) {
+        for (const [col, kind] of Object.entries(arrays)) {
+            if (typeof row[col] !== "string") continue;
+            const values = JSON.parse(row[col] as string) as unknown[];
+            if (kind === "set") {
+                const seen = new Set<string>();
+                row[col] = values.filter((v) => {
+                    const key = JSON.stringify(v);
+                    return seen.has(key) ? false : (seen.add(key), true);
+                });
+            } else row[col] = values;
+        }
+    }
+    return rows;
+}
+
+function _deepClone<T>(value: T): T;
+function _deepClone(value: unknown): unknown {
+    if (value === null || typeof value !== "object") return value;
+    if (value instanceof Date) return new Date(value.getTime());
+    if (Array.isArray(value)) return value.map((v) => _deepClone(v));
+    // Class instances (a QueryBuilder in $lateralJoin / $inSelect) are kept by
+    // reference: copying their fields into a plain object drops their methods,
+    // and $lateralJoin then silently became LATERAL (SELECT 1 FROM DUAL) — a cross join.
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return value;
+    const src = value as Record<string, unknown>; // a plain object: null, Date and arrays were handled above
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(src)) out[k] = _deepClone(src[k]);
+    return out;
+}
+
+/**
+ * WHERE clause that picks ONE matching row for updateOne / replaceOne /
+ * deleteOne. An empty filter yields no WHERE from parseFilter, so appending
+ * "AND ROWNUM = 1" would produce invalid SQL ("… t0  AND ROWNUM = 1").
+ */
+/**
+ * RETURNING clause for a statement that may touch MANY rows (updateMany / deleteMany).
+ * Each column gets an array out-bind; node-oracledb fills it with one value per row.
+ * Values come back as strings (the driver's default OUT type), like updateOne's RETURNING.
+ */
+function _multiRowReturning(cols: string[] | undefined, oracledb: { BIND_OUT: number }): { sql: string; outBinds: Record<string, unknown> } {
+    if (!cols || cols.length === 0) return { sql: "", outBinds: {} };
+    const outBinds: Record<string, unknown> = {};
+    for (const c of cols) outBinds[`out_${bindSafe(c)}`] = { dir: oracledb.BIND_OUT };
+    return {
+        sql: ` RETURNING ${cols.map(quoteIdentifier).join(", ")} INTO ${cols.map((c) => `:out_${bindSafe(c)}`).join(", ")}`,
+        outBinds,
+    };
+}
+
+/** Zips the per-column out-bind arrays of a multi-row RETURNING into one object per affected row. */
+function _returnedRows(cols: string[], outBinds: unknown): Array<Record<string, unknown>> {
+    const ob = (outBinds ?? {}) as Record<string, unknown>;
+    const columns = cols.map((c) => {
+        const v = ob[`out_${bindSafe(c)}`];
+        return Array.isArray(v) ? v : v === undefined ? [] : [v];
+    });
+    const n = Math.max(0, ...columns.map((v) => v.length));
+    return Array.from({ length: n }, (_, i) => Object.fromEntries(cols.map((c, k) => [c, columns[k][i] ?? null])));
+}
+
+function _firstRowWhere(whereClause: string): string {
+    return whereClause ? `${whereClause} AND ROWNUM = 1` : "WHERE ROWNUM = 1";
+}
+
+/** The db handle createDb() returns. */
+type WrapperDb = ReturnType<typeof import("../driver/db").createDb>;
+/** RETURNING column names; values come back as the `returning` object/array. */
+type ReturningOption = { returning?: string[] };
+type FindOptions = import("./QueryBuilder").QueryBuilderOptions;
+type InsertManyOptions = ReturningOption & { batchErrors?: boolean };
+type UpdateOptions = ReturningOption & { upsert?: boolean };
+type IndexOptions = { name?: string; unique?: boolean; type?: "bitmap" | string };
+/** MERGE ... USING DUAL: what to do when the match condition hits / misses. */
+type MergeOptions = { whenMatched?: Record<string, unknown>; whenMatchedDelete?: Record<string, unknown>; whenNotMatched?: "insert" };
+type MergeFromOptions = { whenMatched?: { $set?: Record<string, unknown> } };
+/** Join condition: target column -> joined column, both bare names. */
+type JoinOn = Record<string, string>;
+type UpdateFromJoinSpec = {
+    target: string;
+    join: { table: string; on: JoinOn };
+    set: Record<string, unknown>;
+    where?: Record<string, unknown>;
+};
+
+type Filter = Record<string, unknown>;
+/** One bulkWrite operation (MongoDB shape); exactly one key is expected per entry. */
+type BulkWriteOp = {
+    insertOne?: { document: Record<string, unknown> };
+    updateOne?: { filter: Filter; update: Record<string, unknown>; options?: UpdateOptions };
+    updateMany?: { filter: Filter; update: Record<string, unknown>; options?: Record<string, unknown> };
+    deleteOne?: { filter: Filter; options?: ReturningOption };
+    deleteMany?: { filter: Filter };
+    replaceOne?: { filter: Filter; replacement: Record<string, unknown>; options?: Record<string, unknown> };
+};
+
+class OracleCollection {
+    declare _conn: import("../driver/db").DbConnection | null;
+    /** Set by a typed table with relations (relations().on()): what find().include() can fetch. */
+    declare _relations?: Readonly<Record<string, import("../typed/include").RelationSpec>>;
+    /** Set by a typed table with t.json() columns: which values to write as JSON text, which to parse. */
+    declare _json?: { encode: readonly string[]; decode: readonly string[] };
+    declare db: WrapperDb;
+    declare tableName: string;
+    /**
+     * Create an OracleCollection instance for a specific table.
+     *
+     * @param {string} tableName - The Oracle table name (e.g. "users", "orders")
+     * @param {Object} db - The db interface from createDb()
+     * @param {Object} [_conn] - Raw connection (internal use).
+     *   When null → standalone mode (borrows connections from pool).
+     *   When set → transaction mode (reuses this connection for all operations).
+     *   You normally don't pass this yourself — it's set by Session.collection().
+     */
+    constructor(tableName: string, db: WrapperDb, _conn: import("../driver/db").DbConnection | null = null) {
+        if (typeof tableName !== "string" || tableName === "") {
+            throw new TypeError(MSG.COLLECTION_INVALID_TABLE_NAME(tableName));
+        }
+        this.tableName = tableName;
+        this.db = db;
+        this._conn = _conn;
+    }
+
+    /**
+     * This collection itself. A typed table's collection (defineTable().on(db))
+     * is this same object with narrowed TypeScript signatures; `.untyped` gives
+     * back the 2.0 signatures for calls the typed layer does not cover.
+     */
+    get untyped(): OracleCollection {
+        return this;
+    }
+
+    /**
+     * This collection on another connection, keeping what a typed table set on it
+     * (JSON columns, relations; a model table's subclass keeps its model too).
+     */
+    _onConnection(conn: DbConnection): OracleCollection {
+        const c = new OracleCollection(this.tableName, this.db, conn);
+        if (this._json) c._json = this._json;
+        if (this._relations) c._relations = this._relations;
+        return c;
+    }
+
+    /** A document's t.json() values as JSON text, ready to bind (typed tables only). */
+    _encodeJson<T extends Record<string, unknown>>(doc: T): T {
+        if (!this._json || !doc || typeof doc !== "object") return doc;
+        const out: Record<string, unknown> = { ...doc };
+        for (const c of this._json.encode) if (out[c] != null) out[c] = JSON.stringify(out[c]);
+        return out as T;
+    }
+
+    /** $set of whole t.json() columns as JSON text (paths like "DOC.a" are merge patches already). */
+    _encodeJsonUpdate(update: Record<string, unknown>): Record<string, unknown> {
+        if (!this._json || !update || typeof update !== "object" || !update.$set) return update;
+        return { ...update, $set: this._encodeJson(update.$set as Record<string, unknown>) };
+    }
+
+    /** A row's JSON text in t.json() columns back to JS values, in place. */
+    _decodeJson<T>(row: T): T {
+        if (!this._json || !row || typeof row !== "object") return row;
+        const r = row as Record<string, unknown>;
+        for (const c of this._json.decode) if (typeof r[c] === "string") r[c] = JSON.parse(r[c] as string);
+        return row;
+    }
+
+    /**
+     * Internal: execute a callback with a database connection.
+     *
+     * This is THE pattern that makes every method work in both standalone
+     * mode and inside transactions without any code duplication.
+     *
+     * - If this._conn is set (inside a transaction/session) → use it directly
+     * - If this._conn is null (standalone call) → borrow from the pool, auto-release
+     *
+     * @param {Function} fn - async (conn) => result
+     * @returns {Promise<*>} Whatever fn returns
+     */
+    // Runs on the session connection when there is one, else borrows a pooled one.
+    async _execute<T>(fn: (conn: DbConnection) => T | Promise<T>): Promise<T> {
+        if (this._conn) return fn(this._conn);
+        return this.db.withConnection(fn);
+    }
+
+    // ─── Query / Read ─────────────────────────────────────────────
+
+    /**
+     * Returns a QueryBuilder (chainable cursor). SQL is NOT executed yet.
+     *
+     * Chain methods like .sort(), .limit(), .skip(), .project() to refine
+     * the query, then call a terminal method to execute:
+     *   .toArray()  → returns all matching rows
+     *   .next()     → returns the first matching row
+     *   .count()    → returns the count of matching rows
+     *   .forEach(fn)→ streams rows with O(1) memory
+     *
+     * @param {Object} filter - MongoDB-style filter (e.g. { status: "active" })
+     * @param {Object} [options] - Optional shortcuts:
+     *   - sort, limit, skip, projection, forUpdate, sample, asOf
+     * @returns {QueryBuilder} Lazy cursor — no SQL until you call a terminal method
+     *
+     * @example
+     *   const rows = await users.find({ status: "active" })
+     *     .sort({ name: 1 })     // ORDER BY "name" ASC
+     *     .limit(10)             // FETCH FIRST 10 ROWS ONLY
+     *     .project({ name: 1 })  // SELECT "name" only
+     *     .toArray();            // ← NOW the SQL runs
+     */
+    find(filter: Record<string, unknown> = {}, options: FindOptions = {}): QueryBuilder {
+        const qb = new QueryBuilder(
+            this.tableName,
+            filter,
+            this.db,
+            this._conn,
+            options,
+        );
+        if (options.sort) qb.sort(options.sort);
+        if (options.limit != null) qb.limit(options.limit);
+        if (options.skip != null) qb.skip(options.skip);
+        if (options.projection) qb.project(options.projection);
+        if (options.forUpdate) qb.forUpdate(options.forUpdate);
+        if (this._relations) qb._relations = this._relations;
+        if (this._json) qb._json = this._json;
+        return qb;
+    }
+
+    /**
+     * Find a single document (row) matching the filter.
+     *
+     * Equivalent to: SELECT * FROM table WHERE ... FETCH FIRST 1 ROW ONLY
+     * Returns null if no match is found.
+     *
+     * @param {Object} filter - Filter to match (e.g. { id: 1 })
+     * @param {Object} [_options] - Currently unused, reserved for future
+     * @returns {Promise<Object|null>} The matching row or null
+     *
+     * @example
+     *   const user = await users.findOne({ id: 42 });
+     *   if (user) console.log(user.name);
+     */
+    async findOne<T = Record<string, unknown>>(filter: Record<string, unknown>, _options: Record<string, unknown> = {}): Promise<T | null> {
+        return this._execute(async (conn) => {
+            const { whereClause, binds } = parseFilter(filter);
+            const sql = `SELECT * FROM ${quoteIdentifier(this.tableName)} t0 ${whereClause} FETCH FIRST 1 ROW ONLY`;
+            try {
+                const result = await conn.execute<T>(sql, binds, {
+                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                    autoCommit: !this._conn,
+                });
+                return this._decodeJson((result.rows ?? [])[0] ?? null);
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError("OracleCollection.findOne", err, sql, binds),
+                );
+            }
+        });
+    }
+
+    /**
+     * Find one document, update it, and return the before or after version.
+     *
+     * This is an atomic operation — the find and update happen as one unit.
+     * If no document matches and upsert is true, a new document is inserted.
+     *
+     * @param {Object} filter - Filter to find the document (e.g. { id: 1 })
+     * @param {Object} update - Update operators (e.g. { $set: { name: "Ana" } })
+     * @param {Object} [options]
+     *   - returnDocument: 'before' (default) or 'after' — which version to return
+     *   - upsert: true to insert if no match found
+     * @returns {Promise<Object|null>} The document (before or after update), or null
+     *
+     * @example
+     *   // Update and get the new version
+     *   const updated = await users.findOneAndUpdate(
+     *     { id: 1 },
+     *     { $set: { status: "premium" } },
+     *     { returnDocument: "after" }
+     *   );
+     */
+    async findOneAndUpdate<T = Record<string, unknown>>(filter: Record<string, unknown>, update: Record<string, unknown>, options: Record<string, unknown> = {}): Promise<T | null> {
+        return this._execute(async (conn) => {
+            const { whereClause, binds: filterBinds } = parseFilter(filter);
+            // Lock exactly one matching row, then change that row only (by ROWID):
+            // updating by the filter again would change EVERY matching row.
+            const found = await this._lockOne<T>(conn, whereClause, filterBinds, "OracleCollection.findOneAndUpdate");
+
+            if (!found) {
+                if (!options.upsert) return null;
+                // Upsert: insert the filter's equality values plus $set.
+                const fields: Record<string, unknown> = {};
+                if (update.$set) Object.assign(fields, update.$set);
+                for (const [k, v] of Object.entries(filter)) {
+                    if (typeof v !== "object") fields[k] = v;
+                }
+                const cols = Object.keys(fields);
+                const insertBinds: Record<string, unknown> = {};
+                cols.forEach((c, i) => {
+                    insertBinds[`v${i}`] = fields[c];
+                });
+                const insertSql = `INSERT INTO ${quoteIdentifier(this.tableName)} (${cols.map(quoteIdentifier).join(", ")}) VALUES (${cols.map((_, i) => `:v${i}`).join(", ")}) RETURNING ROWID INTO :mira_rid`;
+                let rid: unknown;
+                try {
+                    const ins = await conn.execute(insertSql, { ...insertBinds, mira_rid: { dir: this.db.oracledb.BIND_OUT, type: this.db.oracledb.STRING } }, { autoCommit: !this._conn });
+                    rid = (ins.outBinds as Record<string, unknown[]> | undefined)?.mira_rid?.[0];
+                } catch (err) {
+                    throw new Error(MSG.wrapError("OracleCollection.findOneAndUpdate", err, insertSql, insertBinds));
+                }
+                return options.returnDocument === "after" ? this._readByRowid<T>(conn, rid) : null;
+            }
+
+            const rid = found.MIRA_RID_;
+            delete found.MIRA_RID_;
+            const { setClause, binds: updateBinds } = parseUpdate(update);
+            const updateSql = `UPDATE ${quoteIdentifier(this.tableName)} t0 ${setClause} WHERE t0.ROWID = :mira_rid`;
+            try {
+                await conn.execute(updateSql, { ...updateBinds, mira_rid: rid }, { autoCommit: !this._conn });
+            } catch (err) {
+                throw new Error(MSG.wrapError("OracleCollection.findOneAndUpdate", err, updateSql));
+            }
+            // The changed row by its ROWID: the filter may no longer match it.
+            return options.returnDocument === "after" ? this._readByRowid<T>(conn, rid) : found;
+        });
+    }
+
+    /**
+     * Internal: select ONE row matching `whereClause` and lock it (FOR UPDATE),
+     * with its ROWID as MIRA_RID_. FETCH FIRST cannot be combined with FOR UPDATE
+     * (ORA-02014), so the row is picked in a subquery and locked outside it.
+     */
+    async _lockOne<T>(conn: DbConnection, whereClause: string, binds: Record<string, unknown>, scope: string): Promise<(T & Record<string, unknown>) | null> {
+        const t = quoteIdentifier(this.tableName);
+        const sql = `SELECT t0.*, t0.ROWID AS "MIRA_RID_" FROM ${t} t0 WHERE t0.ROWID IN (SELECT t0.ROWID FROM ${t} t0 ${whereClause} FETCH FIRST 1 ROW ONLY) FOR UPDATE`;
+        try {
+            const r = await conn.execute<T & Record<string, unknown>>(sql, binds, { outFormat: this.db.oracledb.OUT_FORMAT_OBJECT });
+            return (r.rows ?? [])[0] ?? null;
+        } catch (err) {
+            throw new Error(MSG.wrapError(scope, err, sql, binds));
+        }
+    }
+
+    /** Internal: the current version of the row at `rid`. */
+    async _readByRowid<T>(conn: DbConnection, rid: unknown): Promise<T | null> {
+        const sql = `SELECT * FROM ${quoteIdentifier(this.tableName)} t0 WHERE t0.ROWID = :mira_rid`;
+        const r = await conn.execute<T>(sql, { mira_rid: rid }, { outFormat: this.db.oracledb.OUT_FORMAT_OBJECT });
+        return (r.rows ?? [])[0] ?? null;
+    }
+
+    /**
+     * Find a document, delete it, and return the deleted document.
+     *
+     * Useful when you need to know WHAT was deleted. The document is
+     * found first, then deleted, and the found document is returned.
+     *
+     * @param {Object} filter - Filter to find the document (e.g. { id: 1 })
+     * @returns {Promise<Object|null>} The deleted document, or null if none found
+     *
+     * @example
+     *   const deleted = await users.findOneAndDelete({ id: 42 });
+     *   console.log(`Deleted user: ${deleted.name}`);
+     */
+    async findOneAndDelete<T = Record<string, unknown>>(filter: Record<string, unknown>): Promise<T | null> {
+        return this._execute(async (conn) => {
+            const { whereClause, binds } = parseFilter(filter);
+            // Include ROWID so we can delete by exact row address
+            const selectSql = `SELECT t0.*, t0.ROWID AS "MIRA_RID_" FROM ${quoteIdentifier(this.tableName)} t0 ${whereClause} FETCH FIRST 1 ROW ONLY`;
+
+            const found = await conn.execute<T & Record<string, unknown>>(selectSql, binds, {
+                outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+            });
+            const doc = (found.rows ?? [])[0] ?? null;
+            if (!doc) return null;
+
+            // Delete by exact ROWID — no subquery needed
+            const rid = doc["MIRA_RID_"];
+            delete doc["MIRA_RID_"];
+            const deleteSql = `DELETE FROM ${quoteIdentifier(this.tableName)} WHERE ROWID = :rid`;
+            try {
+                await conn.execute(
+                    deleteSql,
+                    { rid },
+                    {
+                        autoCommit: !this._conn,
+                    },
+                );
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.findOneAndDelete",
+                        err,
+                        deleteSql,
+                    ),
+                );
+            }
+            return doc;
+        });
+    }
+
+    /**
+     * Find a document, replace all its fields (except the ID/primary key),
+     * and return the before or after version.
+     *
+     * Unlike updateOne which applies operators ($set, $inc, etc.),
+     * replaceOne REPLACES the entire document with the new one.
+     *
+     * @param {Object} filter - Filter to find the document
+     * @param {Object} replacement - The complete new document
+     *   (all fields except ID will be overwritten)
+     * @param {Object} [options] - returnDocument: 'before' (default) or 'after'
+     * @returns {Promise<Object|null>} The document before/after replacement, or null
+     *
+     * @example
+     *   await users.findOneAndReplace(
+     *     { id: 1 },
+     *     { name: "Ana Maria", email: "ana@new.com", status: "active" },
+     *     { returnDocument: "after" }
+     *   );
+     */
+    async findOneAndReplace<T = Record<string, unknown>>(filter: Record<string, unknown>, replacement: Record<string, unknown>, options: Record<string, unknown> = {}): Promise<T | null> {
+        return this._execute(async (conn) => {
+            const { whereClause, binds: filterBinds } = parseFilter(filter);
+            // One locked row, replaced by ROWID (the filter alone would replace every match).
+            const beforeDoc = await this._lockOne<T>(conn, whereClause, filterBinds, "OracleCollection.findOneAndReplace");
+            if (!beforeDoc) return null;
+            const rid = beforeDoc.MIRA_RID_;
+            delete beforeDoc.MIRA_RID_;
+
+            // Build SET from replacement (exclude ID/primary key)
+            const cols = Object.keys(replacement).filter((c) => c !== "ID");
+            const setParts: unknown[] = [];
+            const replBinds: Record<string, unknown> = {};
+            cols.forEach((c, i) => {
+                const bname = `repl_${i}`;
+                replBinds[bname] = replacement[c];
+                setParts.push(`${quoteIdentifier(c)} = :${bname}`);
+            });
+
+            const updateSql = `UPDATE ${quoteIdentifier(this.tableName)} t0 SET ${setParts.join(", ")} WHERE t0.ROWID = :mira_rid`;
+            try {
+                await conn.execute(updateSql, { ...replBinds, mira_rid: rid }, { autoCommit: !this._conn });
+            } catch (err) {
+                throw new Error(MSG.wrapError("OracleCollection.findOneAndReplace", err, updateSql));
+            }
+            return options.returnDocument === "after" ? this._readByRowid<T>(conn, rid) : beforeDoc;
+        });
+    }
+
+    /**
+     * Count documents matching a filter.
+     *
+     * Runs SELECT COUNT(*) — scans the actual data. For a faster
+     * approximate count, use estimatedDocumentCount() instead.
+     *
+     * @param {Object} [filter] - Filter criticaleria (omit or {} for all rows)
+     * @returns {Promise<number>} The count of matching rows
+     *
+     * @example
+     *   const total = await users.countDocuments();               // Count all
+     *   const active = await users.countDocuments({ status: "active" }); // Filtered
+     */
+    async countDocuments(filter: Record<string, unknown> = {}): Promise<number> {
+        return this._execute(async (conn) => {
+            const { whereClause, binds } = parseFilter(filter);
+            const sql = `SELECT COUNT(*) AS CNT FROM ${quoteIdentifier(this.tableName)} t0 ${whereClause}`;
+            try {
+                const result = await conn.execute(sql, binds, {
+                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                    autoCommit: !this._conn,
+                });
+                return Number((result.rows ?? [])[0].CNT);
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.countDocuments",
+                        err,
+                        sql,
+                        binds,
+                    ),
+                );
+            }
+        });
+    }
+
+    /**
+     * Fast estimated count from Oracle's USER_TABLES metadata.
+     *
+     * This does NOT scan the table — it reads the last-known row count
+     * from Oracle's internal statistics. This is extremely fast but may
+     * be slightly stale (until the next ANALYZE/DBMS_STATS run).
+     *
+     * Good for dashboard counters where precision isn't critical.
+     *
+     * @returns {Promise<number>} Estimated number of rows
+     *
+     * @example
+     *   const approxCount = await users.estimatedDocumentCount();
+     *   console.log(`Approximately ${approxCount} users`);
+     */
+    async estimatedDocumentCount(): Promise<number> {
+        return this._execute(async (conn) => {
+            const sql = `SELECT NUM_ROWS FROM USER_TABLES WHERE TABLE_NAME = UPPER(:name)`;
+            try {
+                const result = await conn.execute(
+                    sql,
+                    { name: this.tableName },
+                    {
+                        outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                        autoCommit: !this._conn,
+                    },
+                );
+                return Number((result.rows ?? [])[0]?.NUM_ROWS ?? 0);
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.estimatedDocumentCount",
+                        err,
+                        sql,
+                    ),
+                );
+            }
+        });
+    }
+
+    /**
+     * Get distinct (unique) values of a specific column.
+     *
+     * Optionally filter which rows to consider.
+     *
+     * @param {string} field - Column name (e.g. "status")
+     * @param {Object} [filter] - Optional filter to narrow the scope
+     * @returns {Promise<Array>} Array of unique values
+     *
+     * @example
+     *   const statuses = await users.distinct("status");
+     *   // → ["active", "inactive", "pending"]
+     *
+     *   const cities = await users.distinct("city", { country: "PH" });
+     *   // → ["Manila", "Cebu", "Davao"]
+     */
+    async distinct(field: string, filter: Record<string, unknown> = {}): Promise<Array<unknown>> {
+        return this._execute(async (conn) => {
+            const { whereClause, binds } = parseFilter(filter);
+            const sql = `SELECT DISTINCT ${quoteIdentifier(field)} FROM ${quoteIdentifier(this.tableName)} t0 ${whereClause}`;
+            try {
+                const result = await conn.execute(sql, binds, {
+                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                    autoCommit: !this._conn,
+                });
+                return (result.rows ?? []).map((r: Record<string, unknown>) => r[field]);
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError("OracleCollection.distinct", err, sql, binds),
+                );
+            }
+        });
+    }
+
+    // ─── Insert Operations ───────────────────────────────────────
+
+    /**
+     * Insert a single document (row) into the table.
+     *
+     * Automatically handles:
+     *   - Building the INSERT SQL with bind variables
+     *   - RETURNING clause to get back the auto-generated ID
+     *   - Custom RETURNING columns via options.returning
+     *
+     * @param {Object} document - The data to insert (e.g. { name: "Ana", age: 25 })
+     * @param {Object} [options]
+     *   - returning: Array of column names to return from the INSERT
+     *     (e.g. ['ID', 'CREATED_AT'] to get back auto-generated values)
+     * @returns {Promise<{ acknowledged: boolean, insertedId: *, returning?: Object }>}
+     *   - acknowledged: true if the operation was accepted
+     *   - insertedId: The auto-generated ID of the inserted row
+     *   - returning: Object with requested RETURNING values (if options.returning was set)
+     *
+     * @example
+     *   const result = await users.insertOne({ name: "Ana", email: "ana@test.com" });
+     *   console.log(result.insertedId); // → 42 (auto-generated ID)
+     *
+     *   // With RETURNING clause:
+     *   const result2 = await users.insertOne(
+     *     { name: "Ben" },
+     *     { returning: ["ID", "CREATED_AT"] }
+     *   );
+     *   console.log(result2.returning.CREATED_AT); // → 2024-01-15T...
+     */
+    async insertOne(document: Record<string, unknown>, options: ReturningOption = {}): Promise<{ acknowledged: boolean; insertedId: number | string | null; returning?: Record<string, unknown>; }> {
+        document = this._encodeJson(document);
+        return this._execute(async (conn) => {
+            const cols = Object.keys(document);
+            const bindNames = cols.map((_, i) => `:v${i}`);
+            const binds: Record<string, unknown> = {};
+            cols.forEach((c, i) => {
+                binds[`v${i}`] = document[c];
+            });
+
+            // RETURNING clause
+            let returningSql = "";
+            const outBinds: Record<string, unknown> = {};
+            const returningCols = options.returning || [];
+            if (returningCols.length > 0) {
+                const retCols = returningCols.map(quoteIdentifier).join(", ");
+                const retOuts = returningCols
+                    .map((c: unknown) => `:out_${bindSafe(c)}`)
+                    .join(", ");
+                returningSql = ` RETURNING ${retCols} INTO ${retOuts}`;
+                for (const c of returningCols) {
+                    outBinds[`out_${bindSafe(c)}`] = { dir: this.db.oracledb.BIND_OUT };
+                }
+            }
+
+            // Always return ID
+            const hasIdCol = cols.some((c) => c.toUpperCase() === "ID");
+            if (!hasIdCol && !returningCols.includes("ID")) {
+                returningSql = returningSql || ` RETURNING "ID" INTO :out_id`;
+                if (!returningSql.includes("out_id")) {
+                    // ID already covered
+                } else {
+                    outBinds.out_id = {
+                        dir: this.db.oracledb.BIND_OUT,
+                        type: this.db.oracledb.NUMBER,
+                    };
+                }
+            }
+
+            const allBinds: Record<string, unknown> = { ...binds, ...outBinds };
+            const autoId = "out_id" in outBinds;
+            let sql = `INSERT INTO ${quoteIdentifier(this.tableName)} (${cols.map(quoteIdentifier).join(", ")}) VALUES (${bindNames.join(", ")})${returningSql}`;
+
+            try {
+                let result;
+                try {
+                    result = await conn.execute(sql, allBinds, { autoCommit: !this._conn });
+                } catch (e) {
+                    // The automatic RETURNING "ID" assumes an ID column. A table without one
+                    // refuses the whole statement (ORA-00904 "ID"), so nothing was inserted:
+                    // insert again without it, and report insertedId: null.
+                    if (!autoId || e.errorNum !== 904 || !String(e.message).includes('"ID"')) throw e;
+                    sql = sql.slice(0, sql.length - returningSql.length);
+                    delete allBinds.out_id;
+                    result = await conn.execute(sql, allBinds, { autoCommit: !this._conn });
+                }
+                const response: { acknowledged: boolean; insertedId: number | string | null; returning?: Record<string, unknown> } = { acknowledged: true, insertedId: null };
+
+                // Extract insertedId
+                if (result.outBinds) {
+                    if (result.outBinds.out_id) {
+                        response.insertedId = Array.isArray(
+                            result.outBinds.out_id,
+                        )
+                            ? result.outBinds.out_id[0]
+                            : result.outBinds.out_id;
+                    }
+                    if (returningCols.length > 0) {
+                        response.returning = {};
+                        for (const c of returningCols) {
+                            const val = result.outBinds[`out_${bindSafe(c)}`];
+                            response.returning[c] = Array.isArray(val)
+                                ? val[0]
+                                : val;
+                            if (
+                                c.toUpperCase() === "ID" &&
+                                !response.insertedId
+                            ) {
+                                const id = response.returning[c];
+                                // An out-bind yields a number (NUMBER), a string (default type) or null.
+                                if (typeof id === "number" || typeof id === "string" || id === null) response.insertedId = id;
+                            }
+                        }
+                    }
+                }
+
+                return response;
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.insertOne",
+                        err,
+                        sql,
+                        allBinds,
+                    ),
+                );
+            }
+        });
+    }
+
+    /**
+     * Insert multiple documents atomically using executeMany.
+     *
+     * All documents are inserted in a SINGLE TRANSACTION — if any one fails,
+     * none of them are inserted (unless `options.batchErrors` is enabled —
+     * see below). Much faster than calling insertOne() in a loop because it
+     * uses Oracle's executeMany() for bulk insertion.
+     *
+     * IMPORTANT: All documents must have the same set of keys (columns).
+     * The keys from the FIRST document define the columns for all rows.
+     *
+     * Session binding: when the collection was constructed with an explicit
+     * connection (session.collection() inside a Transaction), the inserts run
+     * on THAT connection and join the surrounding transaction — exactly like
+     * insertOne. Otherwise a dedicated transaction is opened as before.
+     *
+     * @param {Array<Object>} documents - Array of documents to insert
+     * @param {Object} [options]
+     *   - returning: Array of column names to RETURN per inserted row
+     *     (e.g. ['ORDER_ID']). Defaults to ['ID'] for backward compatibility.
+     *     Pass [] for tables without a returnable key column. RETURNING is
+     *     intended for NUMBER key columns (IDENTITY / sequence values).
+     *   - batchErrors: When true, row-level errors (e.g. ORA-00001) do NOT
+     *     abort the batch — failed rows are reported in result.batchErrors
+     *     as { offset, message } while the remaining rows are still inserted.
+     *     Mutually exclusive with a non-empty `returning` list.
+     * @returns {Promise<{
+     *   acknowledged: boolean,
+     *   insertedCount: number,
+     *   insertedIds: Array,
+     *   returning?: Array<Object>,
+     *   batchErrors?: Array<{ offset: number, message: string }>,
+     * }>}
+     *
+     * @example
+     *   const result = await users.insertMany([
+     *     { name: "Ana", age: 25 },
+     *     { name: "Ben", age: 30 },
+     *     { name: "Cat", age: 28 },
+     *   ]);
+     *   console.log(result.insertedCount); // → 3
+     *   console.log(result.insertedIds);   // → [1, 2, 3]
+     *
+     * @example
+     *   // Custom key column + per-row error isolation
+     *   const r1 = await orders.insertMany(rows, { returning: ["ORDER_ID"] });
+     *   console.log(r1.returning); // → [{ ORDER_ID: 7 }, { ORDER_ID: 8 }]
+     *
+     *   const r2 = await auditRows.insertMany(rows, {
+     *     returning: [],
+     *     batchErrors: true,
+     *   });
+     *   console.log(r2.batchErrors); // → [{ offset: 3, message: "ORA-00001: …" }]
+     */
+    async insertMany(documents: Array<Record<string, unknown>>, options: InsertManyOptions = {}): Promise<{
+        acknowledged: boolean;
+        insertedCount: number;
+        insertedIds: Array<unknown>;
+        returning?: Array<Record<string, number | null>>; // RETURNING out-binds are oracledb.NUMBER
+        batchErrors?: Array<{ offset: number; message: string; }>;
+    }> {
+        if (!Array.isArray(documents) || documents.length === 0) {
+            throw new Error(MSG.INSERT_MANY_EMPTY);
+        }
+        documents = documents.map((d) => this._encodeJson(d));
+
+        const returningCols = options.returning ?? ["ID"];
+        const batchErrors = options.batchErrors === true;
+        if (batchErrors && returningCols.length > 0) {
+            throw new Error(MSG.INSERT_MANY_RETURNING_WITH_BATCH_ERRORS);
+        }
+
+        // Documents may set different columns (optional ones left out). Using the first
+        // document's keys for all of them silently dropped every column only a later
+        // document had, so documents are grouped by their column set: one INSERT per
+        // group, each omitted column keeps its DEFAULT, and results come back in the
+        // caller's order. Every group runs on the same connection (one transaction).
+        const insertGroup = async (conn: DbConnection, docs: Array<Record<string, unknown>>) => {
+            const cols = Object.keys(docs[0]);
+            const placeholders = cols.map((_, i) => `:v${i}`).join(", ");
+
+            let returningSql = "";
+            if (returningCols.length > 0) {
+                const retCols = returningCols.map(quoteIdentifier).join(", ");
+                const retOuts = returningCols
+                    .map((c: unknown) => `:out_${bindSafe(c)}`)
+                    .join(", ");
+                returningSql = ` RETURNING ${retCols} INTO ${retOuts}`;
+            }
+            const sql = `INSERT INTO ${quoteIdentifier(this.tableName)} (${cols.map(quoteIdentifier).join(", ")}) VALUES (${placeholders})${returningSql}`;
+
+            // Build bind arrays for executeMany
+            const bindDefs: Record<string, import("oracledb").BindDefinition> = {};
+            const textColumns = new Set<string>(); // columns mixing numbers and strings (sent as text)
+            cols.forEach((c, i) => {
+                // Scan all documents for a non-null sample to determine the type
+                let sampleVal: unknown = null;
+                for (const doc of docs) {
+                    if (doc[c] != null) {
+                        sampleVal = doc[c];
+                        break;
+                    }
+                }
+                // maxSize is in BYTES, not characters. Multi-byte UTF-8
+                // (e.g. Filipino/Spanish names with ñ, é) would be
+                // truncated/ORA-06502 if sized by char length, so measure
+                // true byte length over every row's value for this column.
+                const maxBytes = Math.max(
+                    ...docs.map((d) => {
+                        const v = d[c];
+                        if (v == null) return 1;
+                        return Buffer.isBuffer(v) ? v.length : Buffer.byteLength(String(v), "utf8");
+                    }),
+                    1,
+                );
+                const name = `v${i}`;
+                // A column given as numbers in some documents and strings in others
+                // (a typed money column takes both): one text bind, the numbers sent as
+                // their decimal text, which Oracle converts to NUMBER exactly as it does
+                // a money string in insertOne. One bind type per column otherwise.
+                const kinds = new Set(docs.map((d) => typeof d[c]).filter((k) => k === "number" || k === "string"));
+                if (kinds.size === 2) {
+                    textColumns.add(c);
+                    bindDefs[name] = { type: this.db.oracledb.STRING, maxSize: Math.max(maxBytes, 100) };
+                } else if (typeof sampleVal === "number") {
+                    bindDefs[name] = { type: this.db.oracledb.NUMBER };
+                } else if (sampleVal instanceof Date) {
+                    bindDefs[name] = { type: this.db.oracledb.DATE };
+                } else if (Buffer.isBuffer(sampleVal)) {
+                    // Binary: a RAW-sized bind, or a BLOB bind past 32 KB (the RAW bind limit).
+                    bindDefs[name] = maxBytes > 32767
+                        ? { type: this.db.oracledb.DB_TYPE_BLOB }
+                        : { type: this.db.oracledb.BUFFER, maxSize: Math.max(maxBytes, 100) };
+                } else if (maxBytes > 32767) {
+                    // Text past 32 KB (the VARCHAR2 bind limit) can only go to a CLOB: bind it as one.
+                    bindDefs[name] = { type: this.db.oracledb.DB_TYPE_CLOB };
+                } else {
+                    bindDefs[name] = {
+                        type: this.db.oracledb.STRING,
+                        maxSize: Math.max(maxBytes, 100),
+                    };
+                }
+            });
+            for (const c of returningCols) {
+                bindDefs[`out_${bindSafe(c)}`] = {
+                    type: this.db.oracledb.NUMBER,
+                    dir: this.db.oracledb.BIND_OUT,
+                };
+            }
+
+            const bindRows = docs.map((doc) => {
+                const row: Record<string, unknown> = {};
+                cols.forEach((c, i) => {
+                    const v = doc[c] ?? null;
+                    row[`v${i}`] = textColumns.has(c) && typeof v === "number" ? String(v) : v;
+                });
+                return row;
+            });
+
+            try {
+                return await conn.executeMany(sql, bindRows, {
+                    autoCommit: false,
+                    bindDefs,
+                    ...(batchErrors ? { batchErrors: true } : {}),
+                });
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError("OracleCollection.insertMany", err, sql),
+                );
+            }
+        };
+
+        const run = async (conn: DbConnection) => {
+            // Consecutive documents with the same column set (key order does not matter)
+            // form one group, so rows are still inserted in the caller's order (identity
+            // values and sequences follow it): one round trip per change of shape.
+            const groups: number[][] = [];
+            let lastKey = "";
+            documents.forEach((doc, i) => {
+                const key = JSON.stringify(Object.keys(doc).sort());
+                if (groups.length > 0 && key === lastKey) groups[groups.length - 1].push(i);
+                else groups.push([i]);
+                lastKey = key;
+            });
+
+            const response: { acknowledged: boolean; insertedCount: number; insertedIds: unknown[]; returning?: Record<string, number | null>[]; batchErrors?: Array<{ offset: number; message: string }> } = {
+                acknowledged: true,
+                insertedCount: 0,
+                insertedIds: [],
+            };
+            const returning: Array<Record<string, number | null>> = [];
+            const errors: Array<{ offset: number; message: string }> = [];
+
+            for (const positions of groups) {
+                const result = await insertGroup(conn, positions.map((i) => documents[i]));
+                response.insertedCount += result.rowsAffected ?? 0;
+                if (returningCols.length > 0 && result.outBinds) {
+                    result.outBinds.forEach((ob: Record<string, unknown>, j: number) => {
+                        const rowOut: Record<string, number | null> = {};
+                        for (const c of returningCols) {
+                            const val = ob[`out_${bindSafe(c)}`];
+                            const v = Array.isArray(val) ? val[0] : val;
+                            rowOut[c] = typeof v === "number" ? v : null; // NUMBER out-bind: a number, or null for a NULL column
+                        }
+                        returning[positions[j]] = rowOut;
+                    });
+                }
+                if (batchErrors) {
+                    for (const e of (result.batchErrors ?? []) as Array<{ offset?: unknown; message?: string }>) {
+                        // The offset is within the group: report the document's own position.
+                        errors.push({ offset: positions[Number(e.offset)], message: e.message ?? String(e) });
+                    }
+                }
+            }
+
+            if (returningCols.length > 0 && returning.length > 0) {
+                response.returning = returning;
+                if (returningCols.includes("ID")) {
+                    response.insertedIds = returning.map((r) => r.ID ?? null);
+                }
+            }
+            if (batchErrors) {
+                response.batchErrors = errors.sort((a, b) => a.offset - b.offset);
+            }
+            return response;
+        };
+
+        // Session-bound collections join the surrounding transaction;
+        // unbound collections keep the original dedicated-transaction shape.
+        return this._conn ? run(this._conn) : this.db.withTransaction(run);
+    }
+
+    /**
+     * Update MANY rows in ONE executeMany round trip, each row matched by its
+     * own key values — the set-based counterpart of calling updateOne() in a
+     * loop when every row carries different values.
+     *
+     * Each row object supplies BOTH the key columns (options.keys — become
+     * the WHERE clause) and the value columns (every other property — become
+     * the SET clause). All rows must share the same set of properties; the
+     * FIRST row defines the column layout. Every value flows through bind
+     * variables — no caller data is ever interpolated into the SQL string.
+     *
+     * Session binding: identical to insertMany — runs on the bound connection
+     * inside a Transaction, or in its own dedicated transaction otherwise.
+     *
+     * O(1) Oracle round trips, O(n) bind-array space — n = row count.
+     *
+     * @param {Array<Object>} rows - Key + value columns per row (same shape)
+     * @param {Object} options
+     *   - keys: Array of property names that identify the target row
+     *     (e.g. ['ORDER_ID'] or ['TENANT_ID', 'ITEM_CODE'])
+     * @returns {Promise<{ acknowledged: boolean, modifiedCount: number }>}
+     *
+     * @example
+     *   // Stamp freshly signed ROW_HASH values onto 1,000 orders at once
+     *   await orders.bulkUpdateByKeys(
+     *     [
+     *       { ORDER_ID: 7, ROW_HASH: "ab…" },
+     *       { ORDER_ID: 8, ROW_HASH: "cd…" },
+     *     ],
+     *     { keys: ["ORDER_ID"] },
+     *   );
+     *   // → UPDATE "T_ORDERS" SET "ROW_HASH" = :s0 WHERE "ORDER_ID" = :k0
+     */
+    async bulkUpdateByKeys(rows: Array<Record<string, unknown>>, options: Record<string, unknown> = {}): Promise<{ acknowledged: boolean; modifiedCount: number; }> {
+        if (!Array.isArray(rows) || rows.length === 0) {
+            throw new Error(MSG.BULK_UPDATE_EMPTY);
+        }
+        const keys = options.keys;
+        if (!Array.isArray(keys) || keys.length === 0) {
+            throw new Error(MSG.BULK_UPDATE_KEYS_REQUIRED);
+        }
+
+        const allCols = Object.keys(rows[0]);
+        const setCols = allCols.filter((c) => !keys.includes(c));
+        if (setCols.length === 0) {
+            throw new Error(MSG.BULK_UPDATE_NO_SET_COLUMNS);
+        }
+
+        // Positional bind names (s0…, k0…) keep bind identifiers valid for any
+        // column name; column identifiers themselves are quoted as everywhere
+        // else in the wrapper.
+        const setClause = setCols
+            .map((c, i) => `${quoteIdentifier(c)} = :s${i}`)
+            .join(", ");
+        const whereClause = keys
+            .map((c, i) => `${quoteIdentifier(c)} = :k${i}`)
+            .join(" AND ");
+        const sql = `UPDATE ${quoteIdentifier(this.tableName)} SET ${setClause} WHERE ${whereClause}`;
+
+        // Bind definitions: same type-scan approach as insertMany.
+        const bindDefs: Record<string, import("oracledb").BindDefinition> = {};
+        const defFor = (col: string) => {
+            let sampleVal: unknown = null;
+            for (const row of rows) {
+                if (row[col] != null) {
+                    sampleVal = row[col];
+                    break;
+                }
+            }
+            if (typeof sampleVal === "number") {
+                return { type: this.db.oracledb.NUMBER };
+            }
+            if (sampleVal instanceof Date) {
+                return { type: this.db.oracledb.DATE };
+            }
+            // maxSize is in BYTES — measure true UTF-8 byte length so
+            // multi-byte values (e.g. names with ñ/é) are never truncated.
+            const maxBytes = Math.max(
+                ...rows.map((r) => {
+                    const v = r[col];
+                    return v != null
+                        ? Buffer.byteLength(String(v), "utf8")
+                        : 1;
+                }),
+                1,
+            );
+            return {
+                type: this.db.oracledb.STRING,
+                maxSize: Math.max(maxBytes, 100),
+            };
+        };
+        setCols.forEach((c, i) => {
+            bindDefs[`s${i}`] = defFor(c);
+        });
+        keys.forEach((c, i) => {
+            bindDefs[`k${i}`] = defFor(c);
+        });
+
+        const bindRows = rows.map((row) => {
+            const bound: Record<string, unknown> = {};
+            setCols.forEach((c, i) => {
+                bound[`s${i}`] = row[c] ?? null;
+            });
+            keys.forEach((c, i) => {
+                bound[`k${i}`] = row[c] ?? null;
+            });
+            return bound;
+        });
+
+        const run = async (conn: DbConnection) => {
+            try {
+                const result = await conn.executeMany(sql, bindRows, {
+                    autoCommit: false,
+                    bindDefs,
+                });
+                return {
+                    acknowledged: true,
+                    modifiedCount: result.rowsAffected ?? 0,
+                };
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.bulkUpdateByKeys",
+                        err,
+                        sql,
+                    ),
+                );
+            }
+        };
+
+        return this._conn ? run(this._conn) : this.db.withTransaction(run);
+    }
+
+    // ─── Update Operations ───────────────────────────────────────
+
+    /**
+     * Update the FIRST document matching the filter.
+     *
+     * Uses Oracle's ROWID subquery to ensure only ONE row is updated,
+     * even if multiple rows match the filter.
+     *
+     * Supports:
+     *   - upsert: If no match, insert a new document instead
+     *   - returning: Get back specific column values after the update
+     *
+     * @param {Object} filter - Which row to update (e.g. { id: 1 })
+     * @param {Object} update - Update operators (e.g. { $set: { name: "New" } })
+     * @param {Object} [options]
+     *   - upsert: true to insert if no match found
+     *   - returning: Array of column names to return
+     * @returns {Promise<{ acknowledged, matchedCount, modifiedCount, returning? }>}
+     *
+     * @example
+     *   await users.updateOne(
+     *     { id: 1 },
+     *     { $set: { status: "premium" }, $inc: { loginCount: 1 } }
+     *   );
+     */
+    async updateOne(filter: Record<string, unknown>, update: Record<string, unknown>, options: UpdateOptions = {}): Promise<{ acknowledged: boolean; matchedCount: number; modifiedCount: number; upsertedCount?: number; returning?: Record<string, unknown>;  }> {
+        update = this._encodeJsonUpdate(update);
+        return this._execute(async (conn) => {
+            const { whereClause, binds: filterBinds } = parseFilter(filter);
+            const { setClause, binds: updateBinds } = parseUpdate(update);
+            const allBinds = mergeBinds(filterBinds, updateBinds);
+
+            // RETURNING
+            let returningSql = "";
+            const outBinds: Record<string, unknown> = {};
+            const returningCols = options.returning || [];
+            if (returningCols.length > 0) {
+                const retCols = returningCols.map(quoteIdentifier).join(", ");
+                const retOuts = returningCols
+                    .map((c: unknown) => `:out_${bindSafe(c)}`)
+                    .join(", ");
+                returningSql = ` RETURNING ${retCols} INTO ${retOuts}`;
+                for (const c of returningCols) {
+                    outBinds[`out_${bindSafe(c)}`] = { dir: this.db.oracledb.BIND_OUT };
+                }
+            }
+
+            const finalBinds = { ...allBinds, ...outBinds };
+            const sql = `UPDATE ${quoteIdentifier(this.tableName)} ${setClause} WHERE ROWID = (SELECT ROWID FROM ${quoteIdentifier(this.tableName)} t0 ${_firstRowWhere(whereClause)})${returningSql}`;
+
+            try {
+                const result = await conn.execute(sql, finalBinds, {
+                    autoCommit: !this._conn,
+                });
+
+                if (result.rowsAffected === 0 && options.upsert) {
+                    // Upsert: insert
+                    const fields: Record<string, unknown> = {};
+                    if (update.$set) Object.assign(fields, update.$set);
+                    for (const [k, v] of Object.entries(filter)) {
+                        if (typeof v !== "object") fields[k] = v;
+                    }
+                    const cols = Object.keys(fields);
+                    const vals = cols.map((_, i) => `:v${i}`);
+                    const insertBinds: Record<string, unknown> = {};
+                    cols.forEach((c, i) => {
+                        insertBinds[`v${i}`] = fields[c];
+                    });
+                    const insertSql = `INSERT INTO ${quoteIdentifier(this.tableName)} (${cols.map(quoteIdentifier).join(", ")}) VALUES (${vals.join(", ")})`;
+                    await conn.execute(insertSql, insertBinds, {
+                        autoCommit: !this._conn,
+                    });
+                    return {
+                        acknowledged: true,
+                        matchedCount: 0,
+                        modifiedCount: 0,
+                        upsertedCount: 1,
+                    };
+                }
+
+                const response: { acknowledged: boolean; matchedCount: number; modifiedCount: number; returning?: Record<string, unknown> } = {
+                    acknowledged: true,
+                    matchedCount: (result.rowsAffected ?? 0) > 0 ? 1 : 0,
+                    modifiedCount: result.rowsAffected ?? 0,
+                };
+                if (returningCols.length > 0 && result.outBinds) {
+                    response.returning = {};
+                    for (const c of returningCols) {
+                        const val = result.outBinds[`out_${bindSafe(c)}`];
+                        response.returning[c] = Array.isArray(val)
+                            ? val[0]
+                            : val;
+                    }
+                }
+                return response;
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.updateOne",
+                        err,
+                        sql,
+                        finalBinds,
+                    ),
+                );
+            }
+        });
+    }
+
+    /**
+     * Update ALL documents matching the filter.
+     *
+     * Unlike updateOne which updates only the first match,
+     * updateMany updates EVERY row that matches the filter.
+     *
+     * @param {Object} filter - Which rows to update (e.g. { status: "trial" })
+     * @param {Object} update - Update operators (e.g. { $set: { status: "expired" } })
+     * @param {{ returning?: string[] }} [options] - `returning`: columns to read back from EVERY updated row
+     *   (`result.returning`, one object per row, values as strings)
+     * @returns {Promise<{ acknowledged, matchedCount, modifiedCount }>}
+     *
+     * @example
+     *   // Mark all trial accounts as expired
+     *   const result = await users.updateMany(
+     *     { status: "trial" },
+     *     { $set: { status: "expired" }, $currentDate: { updatedAt: true } }
+     *   );
+     *   console.log(`Updated ${result.modifiedCount} users`);
+     */
+    async updateMany(filter: Record<string, unknown>, update: Record<string, unknown>, options: ReturningOption = {}): Promise<{ acknowledged: boolean; matchedCount: number; modifiedCount: number; returning?: Array<Record<string, unknown>> }> {
+        update = this._encodeJsonUpdate(update);
+        return this._execute(async (conn) => {
+            const { whereClause, binds: filterBinds } = parseFilter(filter);
+            const { setClause, binds: updateBinds } = parseUpdate(update);
+            const ret = _multiRowReturning(options.returning, this.db.oracledb);
+            const allBinds = { ...mergeBinds(filterBinds, updateBinds), ...ret.outBinds };
+
+            const sql = `UPDATE ${quoteIdentifier(this.tableName)} t0 ${setClause} ${whereClause}${ret.sql}`;
+            try {
+                const result = await conn.execute(sql, allBinds, {
+                    autoCommit: !this._conn,
+                });
+                return {
+                    acknowledged: true,
+                    matchedCount: result.rowsAffected ?? 0,
+                    modifiedCount: result.rowsAffected ?? 0,
+                    ...(options.returning?.length ? { returning: _returnedRows(options.returning, result.outBinds) } : {}),
+                };
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.updateMany",
+                        err,
+                        sql,
+                        allBinds,
+                    ),
+                );
+            }
+        });
+    }
+
+    /**
+     * Replace a single document entirely (except primary key).
+     *
+     * Unlike updateOne which uses operators ($set, $inc), replaceOne
+     * REPLACES all columns with the values from the replacement object.
+     * The ID column is preserved automatically.
+     *
+     * @param {Object} filter - Which row to replace (e.g. { id: 1 })
+     * @param {Object} replacement - Complete new document (ID column is excluded)
+     * @param {Object} [_options] - Reserved for future use
+     * @returns {Promise<{ acknowledged, matchedCount, modifiedCount }>}
+     *
+     * @example
+     *   await users.replaceOne(
+     *     { id: 1 },
+     *     { name: "New Name", email: "new@test.com", status: "active" }
+     *   );
+     */
+    async replaceOne(filter: Record<string, unknown>, replacement: Record<string, unknown>, _options: Record<string, unknown> = {}): Promise<{ acknowledged: boolean; matchedCount: number; modifiedCount: number;  }> {
+        replacement = this._encodeJson(replacement);
+        return this._execute(async (conn) => {
+            const { whereClause, binds: filterBinds } = parseFilter(filter);
+            const cols = Object.keys(replacement).filter((c) => c !== "ID");
+            const setParts: unknown[] = [];
+            const replBinds: Record<string, unknown> = {};
+            cols.forEach((c, i) => {
+                const bname = `repl_${i}`;
+                replBinds[bname] = replacement[c];
+                setParts.push(`${quoteIdentifier(c)} = :${bname}`);
+            });
+
+            const allBinds = mergeBinds(filterBinds, replBinds);
+            const sql = `UPDATE ${quoteIdentifier(this.tableName)} SET ${setParts.join(", ")} WHERE ROWID = (SELECT ROWID FROM ${quoteIdentifier(this.tableName)} t0 ${_firstRowWhere(whereClause)})`;
+
+            try {
+                const result = await conn.execute(sql, allBinds, {
+                    autoCommit: !this._conn,
+                });
+                return {
+                    acknowledged: true,
+                    matchedCount: (result.rowsAffected ?? 0) > 0 ? 1 : 0,
+                    modifiedCount: result.rowsAffected ?? 0,
+                };
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.replaceOne",
+                        err,
+                        sql,
+                        allBinds,
+                    ),
+                );
+            }
+        });
+    }
+
+    /**
+     * Execute multiple operations atomically in a single transaction.
+     *
+     * All operations run in ONE transaction — if any fails, ALL are rolled back.
+     * Supports: insertOne, updateOne, updateMany, deleteOne, deleteMany, replaceOne.
+     *
+     * @param {Array} operations - Array of operation objects
+     * @returns {Promise<{ acknowledged, results }>}
+     *
+     * @example
+     *   await users.bulkWrite([
+     *     { insertOne: { document: { name: "Ana", age: 25 } } },
+     *     { updateOne: { filter: { id: 2 }, update: { $set: { age: 31 } } } },
+     *     { deleteOne: { filter: { id: 99 } } },
+     *   ]);
+     */
+    async bulkWrite(operations: BulkWriteOp[]): Promise<{ acknowledged: boolean; results: unknown[];  }> {
+        if (!Array.isArray(operations) || operations.length === 0) {
+            throw new Error(MSG.BULK_WRITE_EMPTY);
+        }
+
+        // On a session collection the operations join the session's transaction (its
+        // commit / rollback decides); standalone, they run in a transaction of their own.
+        const run = async (sessionColl: OracleCollection) => {
+            const results: unknown[] = [];
+
+            for (const op of operations) {
+                if (op.insertOne) {
+                    results.push(
+                        await sessionColl.insertOne(op.insertOne.document),
+                    );
+                } else if (op.updateOne) {
+                    results.push(
+                        await sessionColl.updateOne(
+                            op.updateOne.filter,
+                            op.updateOne.update,
+                            op.updateOne.options,
+                        ),
+                    );
+                } else if (op.updateMany) {
+                    results.push(
+                        await sessionColl.updateMany(
+                            op.updateMany.filter,
+                            op.updateMany.update,
+                            op.updateMany.options,
+                        ),
+                    );
+                } else if (op.deleteOne) {
+                    results.push(
+                        await sessionColl.deleteOne(
+                            op.deleteOne.filter,
+                            op.deleteOne.options,
+                        ),
+                    );
+                } else if (op.deleteMany) {
+                    results.push(
+                        await sessionColl.deleteMany(op.deleteMany.filter),
+                    );
+                } else if (op.replaceOne) {
+                    results.push(
+                        await sessionColl.replaceOne(
+                            op.replaceOne.filter,
+                            op.replaceOne.replacement,
+                            op.replaceOne.options,
+                        ),
+                    );
+                } else {
+                    throw new Error(MSG.BULK_WRITE_UNKNOWN_OP(Object.keys(op)));
+                }
+            }
+
+            return { acknowledged: true, results };
+        };
+        if (this._conn) return run(this);
+        return this.db.withTransaction((conn: DbConnection) => run(this._onConnection(conn)));
+    }
+
+    // ─── Delete Operations ───────────────────────────────────────
+
+    /**
+     * Delete the FIRST document matching the filter.
+     *
+     * Uses ROWID subquery to ensure only ONE row is deleted,
+     * even if multiple rows match.
+     *
+     * @param {Object} filter - Which row to delete (e.g. { id: 1 })
+     * @param {Object} [options]
+     *   - returning: Array of column names to return from the deleted row
+     * @returns {Promise<{ acknowledged, deletedCount, returning? }>}
+     *
+     * @example
+     *   const result = await users.deleteOne({ id: 42 });
+     *   console.log(result.deletedCount); // → 1
+     *
+     *   // With RETURNING to get the deleted data:
+     *   const result2 = await users.deleteOne(
+     *     { id: 42 },
+     *     { returning: ["name", "email"] }
+     *   );
+     *   console.log(result2.returning.name); // → "Ana"
+     */
+    async deleteOne(filter: Record<string, unknown>, options: ReturningOption = {}): Promise<{ acknowledged: boolean; deletedCount: number; returning?: Record<string, unknown>;  }> {
+        return this._execute(async (conn) => {
+            const { whereClause, binds } = parseFilter(filter);
+
+            let returningSql = "";
+            const outBinds: Record<string, unknown> = {};
+            const returningCols = options.returning || [];
+            if (returningCols.length > 0) {
+                const retCols = returningCols.map(quoteIdentifier).join(", ");
+                const retOuts = returningCols
+                    .map((c: unknown) => `:out_${bindSafe(c)}`)
+                    .join(", ");
+                returningSql = ` RETURNING ${retCols} INTO ${retOuts}`;
+                for (const c of returningCols) {
+                    outBinds[`out_${bindSafe(c)}`] = { dir: this.db.oracledb.BIND_OUT };
+                }
+            }
+
+            const allBinds = { ...binds, ...outBinds };
+            const sql = `DELETE FROM ${quoteIdentifier(this.tableName)} WHERE ROWID = (SELECT ROWID FROM ${quoteIdentifier(this.tableName)} t0 ${_firstRowWhere(whereClause)})${returningSql}`;
+
+            try {
+                const result = await conn.execute(sql, allBinds, {
+                    autoCommit: !this._conn,
+                });
+                const response: { acknowledged: boolean; deletedCount: number; returning?: Record<string, unknown> } = {
+                    acknowledged: true,
+                    deletedCount: result.rowsAffected ?? 0,
+                };
+                if (returningCols.length > 0 && result.outBinds) {
+                    response.returning = {};
+                    for (const c of returningCols) {
+                        const val = result.outBinds[`out_${bindSafe(c)}`];
+                        response.returning[c] = Array.isArray(val)
+                            ? val[0]
+                            : val;
+                    }
+                }
+                return response;
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.deleteOne",
+                        err,
+                        sql,
+                        allBinds,
+                    ),
+                );
+            }
+        });
+    }
+
+    /**
+     * Delete ALL documents matching the filter.
+     *
+     * BE CAREFUL: This deletes EVERY row that matches.
+     * Use an empty filter {} to delete all rows (like TRUNCATE).
+     *
+     * @param {Object} filter - Which rows to delete
+     * @param {{ limit?: number, returning?: string[] }} [options] - `limit`: delete at most this many matching rows (batch purges);
+     *   `returning`: columns to read back from EVERY deleted row (`result.returning`, one object per row, values as strings)
+     * @returns {Promise<{ acknowledged, deletedCount }>}
+     *
+     * @example
+     *   // Delete all inactive users
+     *   const result = await users.deleteMany({ status: "inactive" });
+     *   console.log(`Deleted ${result.deletedCount} users`);
+     */
+    async deleteMany(filter: Record<string, unknown>, options: ReturningOption & { limit?: number } = {}): Promise<{ acknowledged: boolean; deletedCount: number; returning?: Array<Record<string, unknown>> }> {
+        const { limit } = options;
+        if (limit !== undefined && !(Number.isInteger(limit) && limit > 0)) {
+            throw new TypeError(`deleteMany: limit must be a positive integer, got ${String(limit)}`);
+        }
+        return this._execute(async (conn) => {
+            const { whereClause, binds } = parseFilter(filter);
+            // A bounded delete removes at most `limit` matching rows (batch purges); parseFilter
+            // parenthesises every OR, so appending AND ROWNUM cannot change the filter's meaning.
+            let where = whereClause;
+            if (limit !== undefined) {
+                binds.del_limit = limit;
+                where = whereClause ? `${whereClause} AND ROWNUM <= :del_limit` : "WHERE ROWNUM <= :del_limit";
+            }
+            const ret = _multiRowReturning(options.returning, this.db.oracledb);
+            Object.assign(binds, ret.outBinds);
+            const sql = `DELETE FROM ${quoteIdentifier(this.tableName)} t0 ${where}${ret.sql}`;
+            try {
+                const result = await conn.execute(sql, binds, {
+                    autoCommit: !this._conn,
+                });
+                return {
+                    acknowledged: true,
+                    deletedCount: result.rowsAffected ?? 0,
+                    ...(options.returning?.length ? { returning: _returnedRows(options.returning, result.outBinds) } : {}),
+                };
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.deleteMany",
+                        err,
+                        sql,
+                        binds,
+                    ),
+                );
+            }
+        });
+    }
+
+    /**
+     * Drop this table entirely. WARNING: This is irreversible!
+     *
+     * Runs: DROP TABLE "tableName" CASCADE CONSTRAINTS
+     * This removes the table AND all foreign key constraints pointing to it.
+     *
+     * @returns {Promise<{ acknowledged }>}
+     */
+    async drop(): Promise<{ acknowledged: boolean;  }> {
+        return this._execute(async (conn) => {
+            const sql = `DROP TABLE ${quoteIdentifier(this.tableName)} CASCADE CONSTRAINTS`;
+            try {
+                await conn.execute(sql, {}, { autoCommit: !this._conn });
+                return { acknowledged: true };
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError("OracleCollection.drop", err, sql),
+                );
+            }
+        });
+    }
+
+    // ─── Aggregation ─────────────────────────────────────────────
+
+    /**
+     * Execute a MongoDB-style aggregation pipeline.
+     *
+     * The pipeline is an array of stages that transform data step by step.
+     * Each stage becomes an Oracle CTE (WITH ... AS). See aggregatePipeline.js.
+     *
+     * Supported stages: $match, $group, $sort, $limit, $skip, $count,
+     * $project, $addFields, $lookup, $lateralJoin, $out, $merge,
+     * $bucket, $facet, $replaceRoot, $unwind, $having
+     *
+     * The returned object is a Promise (so you can await it) AND has a
+     * _buildSQL() method (so createMaterializedView can extract the SQL).
+     *
+     * @param {Array} pipeline - Array of stage objects
+     * @returns {Promise<Array> & { _buildSQL: Function }}
+     *
+     * @example
+     *   const report = await orders.aggregate([
+     *     { $match: { status: "completed" } },
+     *     { $group: { _id: "$region", total: { $sum: "$amount" } } },
+     *     { $sort: { total: -1 } },
+     *     { $limit: 5 },
+     *   ]);
+     *   // Returns the top 5 regions by total order amount
+     */
+    aggregate(pipeline: Array<unknown>): Promise<Record<string, unknown>[]> & { _buildSQL: () => { sql: string; binds: Record<string, unknown> } } {
+        const { buildAggregateSQL } = (require("../pipeline/aggregatePipeline") as typeof import("../pipeline/aggregatePipeline"));
+        // Deep-clone preserving Date instances — JSON round-trip converts Dates to
+        // ISO strings which then fail Oracle's NLS_DATE_FORMAT implicit conversion
+        // (ORA-01843) when used as bind values against DATE columns.
+        const pipelineCopy = _deepClone(pipeline);
+        const { sql, binds, arrays } = buildAggregateSQL(
+            this.tableName,
+            pipelineCopy,
+            this.db,
+        );
+
+        const resultPromise: Promise<Record<string, unknown>[]> & { _buildSQL?: () => { sql: string; binds: Record<string, unknown> } } = this._execute(async (conn) => {
+            try {
+                const result = await conn.execute(sql, binds, {
+                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                    autoCommit: !this._conn,
+                });
+                const rows = (result.rows || []) as Record<string, unknown>[];
+                return arrays ? _parseArrayColumns(rows, arrays) : rows;
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.aggregate",
+                        err,
+                        sql,
+                        binds,
+                    ),
+                );
+            }
+        });
+
+        // Augment the promise so createMaterializedView can extract the SQL
+        resultPromise._buildSQL = () => ({ sql, binds });
+        return resultPromise as Promise<Record<string, unknown>[]> & { _buildSQL: () => { sql: string; binds: Record<string, unknown> } };
+    }
+
+    // ─── Index Operations ────────────────────────────────────────
+
+    /**
+     * Create an index on specified fields.
+     * @param {Object} fields - { colName: 1 (ASC) | -1 (DESC) }
+     * @param {Object} [options] - unique, name, type ('bitmap')
+     * @returns {Promise<{ acknowledged, indexName }>}
+     */
+    async createIndex(fields: Record<string, unknown>, options: IndexOptions = {}): Promise<{ acknowledged: boolean; indexName: string;  }> {
+        return this._execute(async (conn) => {
+            const cols = Object.entries(fields)
+                .map(
+                    ([col, dir]) =>
+                        `${quoteIdentifier(col)} ${dir === -1 ? "DESC" : "ASC"}`,
+                )
+                .join(", ");
+            const colNames = Object.keys(fields).join("_");
+            const indexName =
+                options.name || `IDX_${this.tableName}_${colNames}`;
+            const unique = options.unique ? "UNIQUE " : "";
+            const bitmap = options.type === "bitmap" ? "BITMAP " : "";
+            const sql = `CREATE ${unique}${bitmap}INDEX ${quoteIdentifier(indexName)} ON ${quoteIdentifier(this.tableName)} (${cols})`;
+
+            try {
+                await conn.execute(sql, {}, { autoCommit: !this._conn });
+                return { acknowledged: true, indexName };
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError("OracleCollection.createIndex", err, sql),
+                );
+            }
+        });
+    }
+
+    /**
+     * Create multiple indexes.
+     * @param {Array} indexSpecs - [{ fields, options }]
+     * @returns {Promise<{ acknowledged, indexNames }>}
+     */
+    async createIndexes(indexSpecs: Array<IndexOptions & { fields: Record<string, unknown>; options?: IndexOptions }>): Promise<{ acknowledged: boolean; indexNames: string[];  }> {
+        const indexNames: string[] = [];
+        for (const spec of indexSpecs) {
+            const result = await this.createIndex(
+                spec.fields,
+                spec.options || spec,
+            );
+            indexNames.push(result.indexName);
+        }
+        return { acknowledged: true, indexNames };
+    }
+
+    /**
+     * Drop a named index.
+     * @param {string} indexName
+     * @returns {Promise<{ acknowledged }>}
+     */
+    async dropIndex(indexName: string): Promise<{ acknowledged: boolean;  }> {
+        return this._execute(async (conn) => {
+            const sql = `DROP INDEX ${quoteIdentifier(indexName)}`;
+            try {
+                await conn.execute(sql, {}, { autoCommit: !this._conn });
+                return { acknowledged: true };
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError("OracleCollection.dropIndex", err, sql),
+                );
+            }
+        });
+    }
+
+    /**
+     * Drop all non-primary-key indexes on this table.
+     * @returns {Promise<{ acknowledged, dropped }>}
+     */
+    async dropIndexes(): Promise<{ acknowledged: boolean; dropped: string[];  }> {
+        return this._execute(async (conn) => {
+            const sql = `SELECT INDEX_NAME FROM USER_INDEXES WHERE TABLE_NAME = UPPER(:tbl) AND INDEX_TYPE <> 'LOB' AND INDEX_NAME NOT IN (SELECT CONSTRAINT_NAME FROM USER_CONSTRAINTS WHERE TABLE_NAME = UPPER(:tbl2) AND CONSTRAINT_TYPE = 'P')`;
+            const result = await conn.execute<{ INDEX_NAME: string }>(
+                sql,
+                { tbl: this.tableName, tbl2: this.tableName },
+                {
+                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                },
+            );
+            const dropped: string[] = [];
+            for (const row of result.rows ?? []) {
+                try {
+                    await conn.execute(
+                        `DROP INDEX ${quoteIdentifier(row.INDEX_NAME)}`,
+                        {},
+                        { autoCommit: !this._conn },
+                    );
+                    dropped.push(row.INDEX_NAME);
+                } catch (_err) {
+                    // Skip errors (e.g. system-generated indexes)
+                }
+            }
+            return { acknowledged: true, dropped };
+        });
+    }
+
+    /**
+     * Get all indexes on this table.
+     * @returns {Promise<Array<{ indexName, columns, unique, type }>>}
+     */
+    async getIndexes(): Promise<Array<{ indexName: string; columns: string[]; unique: boolean; type: string;  }>> {
+        return this._execute(async (conn) => {
+            // A DESC column is stored as a function-based index on a hidden SYS_NC…$
+            // column; its real expression ("QUARTER") is in USER_IND_EXPRESSIONS.
+            const sql = `SELECT i.INDEX_NAME, i.UNIQUENESS, i.INDEX_TYPE, ic.COLUMN_NAME, ic.COLUMN_POSITION, e.COLUMN_EXPRESSION FROM USER_INDEXES i JOIN USER_IND_COLUMNS ic ON i.INDEX_NAME = ic.INDEX_NAME LEFT JOIN USER_IND_EXPRESSIONS e ON e.INDEX_NAME = ic.INDEX_NAME AND e.COLUMN_POSITION = ic.COLUMN_POSITION WHERE i.TABLE_NAME = UPPER(:tbl) ORDER BY i.INDEX_NAME, ic.COLUMN_POSITION`;
+            const result = await conn.execute<{ INDEX_NAME: string; UNIQUENESS: string; INDEX_TYPE: string; COLUMN_NAME: string; COLUMN_EXPRESSION: string | null }>(
+                sql,
+                { tbl: this.tableName },
+                {
+                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                },
+            );
+
+            const indexMap: Record<string, { indexName: string; columns: string[]; unique: boolean; type: string }> = {};
+            for (const row of result.rows ?? []) {
+                if (!indexMap[row.INDEX_NAME]) {
+                    indexMap[row.INDEX_NAME] = {
+                        indexName: row.INDEX_NAME,
+                        columns: [],
+                        unique: row.UNIQUENESS === "UNIQUE",
+                        type: row.INDEX_TYPE,
+                    };
+                }
+                // A plain quoted column ("QUARTER") becomes its name; a real expression (UPPER("NAME")) stays as written.
+                const expr = row.COLUMN_EXPRESSION;
+                const quoted = expr != null && /^"(?:[^"]|"")+"$/.test(expr.trim()) ? expr.trim().slice(1, -1).replace(/""/g, '"') : null;
+                indexMap[row.INDEX_NAME].columns.push(quoted ?? expr ?? row.COLUMN_NAME);
+            }
+            return Object.values(indexMap);
+        });
+    }
+
+    /**
+     * Rebuild all indexes on this table.
+     * @returns {Promise<{ acknowledged }>}
+     */
+    async reIndex(): Promise<{ acknowledged: boolean;  }> {
+        return this._execute(async (conn) => {
+            const sql = `SELECT INDEX_NAME FROM USER_INDEXES WHERE TABLE_NAME = UPPER(:tbl) AND INDEX_TYPE <> 'LOB'`;
+            const result = await conn.execute<{ INDEX_NAME: string }>(
+                sql,
+                { tbl: this.tableName },
+                {
+                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                },
+            );
+            for (const row of result.rows ?? []) {
+                try {
+                    await conn.execute(
+                        `ALTER INDEX ${quoteIdentifier(row.INDEX_NAME)} REBUILD`,
+                        {},
+                        { autoCommit: !this._conn },
+                    );
+                } catch (_err) {
+                    // Skip errors
+                }
+            }
+            return { acknowledged: true };
+        });
+    }
+
+    // ─── MERGE / UPSERT ─────────────────────────────────────────
+
+    /**
+     * Oracle MERGE (upsert) statement using DUAL as the source.
+     *
+     * MERGE is Oracle's way of saying "insert if new, update if exists".
+     * This uses a single sourceData object matched against the table.
+     *
+     * @param {Object} sourceData - Data to merge (e.g. { id: 1, name: "Ana" })
+     * @param {Object} matchCondition - How to match rows:
+     *   - localField:   Column in the target table (e.g. "id")
+     *   - foreignField: Column in the source data (e.g. "id")
+     * @param {Object} [options]
+     *   - whenMatched: Update operators if row exists (e.g. { $set: { name: "New" } })
+     *   - whenNotMatched: "insert" to insert if no match
+     *   - whenMatchedDelete: Filter to conditionally delete matched rows
+     * @returns {Promise<{ acknowledged }>}
+     *
+     * @example
+     *   await users.merge(
+     *     { id: 1, name: "Ana", status: "active" },
+     *     { localField: "id", foreignField: "id" },
+     *     {
+     *       whenMatched: { $set: { name: "Ana", status: "active" } },
+     *       whenNotMatched: "insert"
+     *     }
+     *   );
+     */
+    async merge(sourceData: Record<string, unknown>, matchCondition: { localField: string; foreignField: string }, options: MergeOptions = {}): Promise<{ acknowledged: boolean;  }> {
+        return this._execute(async (conn) => {
+            const cols = Object.keys(sourceData);
+            // Positional bind names: column names are caller data and may hold
+            // characters that are not valid inside a bind placeholder.
+            const srcParts = cols.map((c, i) => `:merge_${i} AS ${quoteIdentifier(c)}`);
+            const srcBinds: Record<string, unknown> = {};
+            cols.forEach((c, i) => {
+                srcBinds[`merge_${i}`] = sourceData[c];
+            });
+
+            const onClause = `tgt.${quoteIdentifier(matchCondition.localField)} = src.${quoteIdentifier(matchCondition.foreignField)}`;
+
+            let whenMatchedSql = "";
+            if (options.whenMatched) {
+                const { setClause, binds: upBinds } = parseUpdate(
+                    options.whenMatched,
+                );
+                Object.assign(srcBinds, upBinds);
+                // Replace quotes to use tgt. prefix
+                whenMatchedSql = `\nWHEN MATCHED THEN UPDATE ${setClause}`;
+            }
+
+            let whenMatchedDeleteSql = "";
+            if (options.whenMatchedDelete) {
+                // "tgt" is the MERGE target alias, so a correlated $exists in
+                // the DELETE WHERE references the target row (the default "t0"
+                // does not exist in a MERGE and fails with ORA-00904).
+                const { whereClause, binds: delBinds } = parseFilter(
+                    options.whenMatchedDelete,
+                    "tgt",
+                );
+                Object.assign(srcBinds, delBinds);
+                const delWhere = whereClause.replace(/^WHERE\s+/i, "");
+                whenMatchedDeleteSql = `\n  DELETE ${delWhere ? `WHERE ${delWhere}` : ""}`;
+            }
+
+            let whenNotMatchedSql = "";
+            if (options.whenNotMatched === "insert") {
+                const insertCols = cols.map(quoteIdentifier).join(", ");
+                const insertVals = cols
+                    .map((c) => `src.${quoteIdentifier(c)}`)
+                    .join(", ");
+                whenNotMatchedSql = `\nWHEN NOT MATCHED THEN INSERT (${insertCols}) VALUES (${insertVals})`;
+            }
+
+            const sql = `MERGE INTO ${quoteIdentifier(this.tableName)} tgt\nUSING (SELECT ${srcParts.join(", ")} FROM DUAL) src\nON (${onClause})${whenMatchedSql}${whenMatchedDeleteSql}${whenNotMatchedSql}`;
+
+            try {
+                await conn.execute(sql, srcBinds, { autoCommit: !this._conn });
+                return { acknowledged: true };
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError("OracleCollection.merge", err, sql, srcBinds),
+                );
+            }
+        });
+    }
+
+    /**
+     * Merge rows from another TABLE (not a single object like merge()).
+     *
+     * This is for syncing two tables: "update target from source where they match".
+     * Use $src.colName in $set values to reference source table columns.
+     *
+     * @param {string} sourceTable - Name of the source table
+     * @param {Object} matchCondition - { localField, foreignField }
+     * @param {Object} [options]
+     *   - whenMatched: { $set: { col: "$src.sourceCol" } }
+     * @returns {Promise<{ acknowledged }>}
+     *
+     * @example
+     *   await target.mergeFrom("source_table",
+     *     { localField: "id", foreignField: "id" },
+     *     { whenMatched: { $set: { price: "$src.price", stock: "$src.stock" } } }
+     *   );
+     */
+    async mergeFrom(sourceTable: string, matchCondition: { localField: string; foreignField: string }, options: MergeFromOptions = {}): Promise<{ acknowledged: boolean;  }> {
+        return this._execute(async (conn) => {
+            const onClause = `tgt.${quoteIdentifier(matchCondition.localField)} = src.${quoteIdentifier(matchCondition.foreignField)}`;
+            const binds: Record<string, unknown> = {};
+
+            let whenMatchedSql = "";
+            if (options.whenMatched) {
+                const { $set } = options.whenMatched;
+                if ($set) {
+                    const parts = Object.entries($set).map(([col, val], i) => {
+                        if (
+                            typeof val === "string" &&
+                            val.startsWith("$src.")
+                        ) {
+                            return `tgt.${quoteIdentifier(col)} = src.${quoteIdentifier(val.replace("$src.", ""))}`;
+                        }
+                        const bname = `mergeFrom_${i}`;
+                        binds[bname] = val;
+                        return `tgt.${quoteIdentifier(col)} = :${bname}`;
+                    });
+                    whenMatchedSql = `\nWHEN MATCHED THEN UPDATE SET ${parts.join(", ")}`;
+                }
+            }
+
+            const sql = `MERGE INTO ${quoteIdentifier(this.tableName)} tgt\nUSING ${quoteIdentifier(sourceTable)} src\nON (${onClause})${whenMatchedSql}`;
+
+            try {
+                await conn.execute(sql, binds, { autoCommit: !this._conn });
+                return { acknowledged: true };
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.mergeFrom",
+                        err,
+                        sql,
+                        binds,
+                    ),
+                );
+            }
+        });
+    }
+
+    // ─── Oracle Advanced Features ────────────────────────────────
+
+    /**
+     * Hierarchical (tree) query using Oracle's CONNECT BY clause.
+     *
+     * This is for querying tree structures like org charts, category trees,
+     * bill-of-materials, etc. Oracle-specific — no MongoDB equivalent.
+     *
+     * @param {Object} spec
+     *   - startWith: Filter for root nodes (e.g. { manager_id: null })
+     *   - connectBy: How children link to parents (e.g. { prior: "id", to: "manager_id" })
+     *   - orderSiblings: Sort within each level (e.g. { name: 1 })
+     *   - maxLevel: Maximum depth to traverse
+     *   - includeLevel: true to add a LEVEL pseudo-column
+     *   - includePath: true to add a SYS_CONNECT_BY_PATH column
+     * @returns {Promise<Array>} Flattened tree rows with optional LEVEL/PATH
+     *
+     * @example
+     *   const tree = await employees.connectBy({
+     *     startWith: { manager_id: null },
+     *     connectBy: { prior: "id", to: "manager_id" },
+     *     includeLevel: true,
+     *     maxLevel: 5,
+     *   });
+     */
+    async connectBy(spec: Parameters<typeof import("../advanced/oracleAdvanced").buildConnectBy>[1]): Promise<Array<unknown>> {
+        const { buildConnectBy } = (require("../advanced/oracleAdvanced") as typeof import("../advanced/oracleAdvanced"));
+        const { sql, binds } = buildConnectBy(this.tableName, spec);
+
+        return this._execute(async (conn) => {
+            try {
+                const result = await conn.execute(sql, binds, {
+                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                    autoCommit: !this._conn,
+                });
+                return result.rows || [];
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.connectBy",
+                        err,
+                        sql,
+                        binds,
+                    ),
+                );
+            }
+        });
+    }
+
+    /**
+     * PIVOT query — rotate rows into columns.
+     *
+     * Example: Turn rows like { product: "A", month: "Jan", sales: 100 }
+     * into columns like { product: "A", JAN: 100, FEB: 200, MAR: 150 }
+     *
+     * @param {Object} spec
+     *   - value: Aggregate expression (e.g. { $sum: "$sales" })
+     *   - pivotOn: Column whose values become columns (e.g. "month")
+     *   - pivotValues: Array of values to pivot (e.g. ["Jan", "Feb", "Mar"])
+     *   - groupBy: Column(s) to keep as rows (e.g. ["product"])
+     * @returns {Promise<Array>} Pivoted rows
+     */
+    async pivot(spec: Parameters<typeof import("../advanced/oracleAdvanced").buildPivot>[1]): Promise<Array<unknown>> {
+        const { buildPivot } = (require("../advanced/oracleAdvanced") as typeof import("../advanced/oracleAdvanced"));
+        const { sql, binds } = buildPivot(this.tableName, spec);
+
+        return this._execute(async (conn) => {
+            try {
+                const result = await conn.execute(sql, binds, {
+                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                    autoCommit: !this._conn,
+                });
+                return result.rows || [];
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError("OracleCollection.pivot", err, sql, binds),
+                );
+            }
+        });
+    }
+
+    /**
+     * UNPIVOT query — rotate columns into rows (opposite of pivot).
+     *
+     * Example: Turn columns like { JAN: 100, FEB: 200 } into rows:
+     *   { month: "JAN", sales: 100 }, { month: "FEB", sales: 200 }
+     *
+     * @param {Object} spec
+     *   - valueColumn: Name for the value column in output (e.g. "sales")
+     *   - nameColumn: Name for the name column in output (e.g. "month")
+     *   - columns: Array of columns to unpivot (e.g. ["JAN", "FEB", "MAR"])
+     *   - includeNulls: true to include NULL values (uses INCLUDE NULLS)
+     * @returns {Promise<Array>} Unpivoted rows
+     */
+    async unpivot(spec: Parameters<typeof import("../advanced/oracleAdvanced").buildUnpivot>[1]): Promise<Array<unknown>> {
+        const { buildUnpivot } = (require("../advanced/oracleAdvanced") as typeof import("../advanced/oracleAdvanced"));
+        const { sql, binds } = buildUnpivot(this.tableName, spec);
+
+        return this._execute(async (conn) => {
+            try {
+                const result = await conn.execute(sql, binds, {
+                    outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
+                    autoCommit: !this._conn,
+                });
+                return result.rows || [];
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError("OracleCollection.unpivot", err, sql, binds),
+                );
+            }
+        });
+    }
+
+    // ─── Set Operations (static) ─────────────────────────────────
+
+    /**
+     * UNION or UNION ALL of two QueryBuilder results.
+     *
+     * UNION removes duplicates, UNION ALL keeps them (faster).
+     *
+     * @param {QueryBuilder} qb1 - First query
+     * @param {QueryBuilder} qb2 - Second query
+     * @param {Object} [options] - { all: true } for UNION ALL
+     * @returns {SetResultBuilder} Chainable builder (call .toArray() to execute)
+     *
+     * @example
+     *   const result = await OracleCollection.union(
+     *     users.find({ role: "admin" }),
+     *     users.find({ role: "superadmin" }),
+     *     { all: true }
+     *   ).toArray();
+     */
+    static union(qb1: QueryBuilder, qb2: QueryBuilder, options: Record<string, unknown> = {}): import("../joins/setOperations").SetResultBuilder {
+        const { SetResultBuilder } = (require("../joins/setOperations") as typeof import("../joins/setOperations"));
+        return new SetResultBuilder(
+            qb1,
+            qb2,
+            options.all ? "UNION ALL" : "UNION",
+        );
+    }
+
+    /**
+     * INTERSECT of two queries — returns rows that appear in BOTH results.
+     *
+     * @param {QueryBuilder} qb1 - First query
+     * @param {QueryBuilder} qb2 - Second query
+     * @returns {SetResultBuilder}
+     */
+    static intersect(qb1: QueryBuilder, qb2: QueryBuilder): import("../joins/setOperations").SetResultBuilder {
+        const { SetResultBuilder } = (require("../joins/setOperations") as typeof import("../joins/setOperations"));
+        return new SetResultBuilder(qb1, qb2, "INTERSECT");
+    }
+
+    /**
+     * MINUS of two queries — returns rows in the first query that are NOT in the second.
+     *
+     * @param {QueryBuilder} qb1 - First query (base)
+     * @param {QueryBuilder} qb2 - Second query (to subtract)
+     * @returns {SetResultBuilder}
+     */
+    static minus(qb1: QueryBuilder, qb2: QueryBuilder): import("../joins/setOperations").SetResultBuilder {
+        const { SetResultBuilder } = (require("../joins/setOperations") as typeof import("../joins/setOperations"));
+        return new SetResultBuilder(qb1, qb2, "MINUS");
+    }
+
+    // ─── INSERT INTO ... SELECT ──────────────────────────────────
+
+    /**
+     * Insert rows from a QueryBuilder's SELECT into another table.
+     *
+     * Generates: INSERT INTO target (cols) SELECT cols FROM source WHERE ...
+     * Automatically excludes identity/auto-generated columns.
+     *
+     * @param {string} targetTable - Table to insert into
+     * @param {QueryBuilder} queryBuilder - The SELECT query providing data
+     * @param {Object} [options]
+     *   - columns: Explicit list of columns to insert
+     * @returns {Promise<{ acknowledged, insertedCount }>}
+     *
+     * @example
+     *   // Copy active users to an archive table
+     *   await users.insertFromQuery(
+     *     "users_archive",
+     *     users.find({ status: "active" })
+     *   );
+     */
+    async insertFromQuery(targetTable: string, queryBuilder: QueryBuilder, options: { columns?: string[] } = {}): Promise<{ acknowledged: boolean; insertedCount: number;  }> {
+        return this._execute(async (conn) => {
+            const { sql: builtSql, binds } = queryBuilder._buildSQL();
+            let selectSql = builtSql;
+            let colList = "";
+
+            if (options.columns && options.columns.length > 0) {
+                // Explicit columns provided
+                colList = `(${options.columns.map(quoteIdentifier).join(", ")})`;
+                const colSelectList = options.columns
+                    .map(quoteIdentifier)
+                    .join(", ");
+                selectSql = selectSql.replace(
+                    /SELECT\s+.*?\s+FROM/i,
+                    `SELECT ${colSelectList} FROM`,
+                );
+            } else {
+                // No columns specified — exclude identity columns to avoid ORA-32795
+                const colResult = await conn.execute<{ COLUMN_NAME: string }>(
+                    `SELECT COLUMN_NAME FROM USER_TAB_COLUMNS WHERE TABLE_NAME = UPPER(:t) AND (IDENTITY_COLUMN IS NULL OR IDENTITY_COLUMN = 'NO') ORDER BY COLUMN_ID`,
+                    { t: targetTable },
+                    { outFormat: this.db.oracledb.OUT_FORMAT_OBJECT },
+                );
+                const cols: string[] = (colResult.rows ?? []).map((r) => r.COLUMN_NAME);
+                if (cols.length > 0) {
+                    colList = `(${cols.map(quoteIdentifier).join(", ")})`;
+                    const colSelectList = cols.map(quoteIdentifier).join(", ");
+                    selectSql = selectSql.replace(
+                        /SELECT\s+.*?\s+FROM/i,
+                        `SELECT ${colSelectList} FROM`,
+                    );
+                }
+            }
+
+            const sql = `INSERT INTO ${quoteIdentifier(targetTable)} ${colList} ${selectSql}`;
+
+            try {
+                const result = await conn.execute(sql, binds, {
+                    autoCommit: !this._conn,
+                });
+                return {
+                    acknowledged: true,
+                    insertedCount: result.rowsAffected ?? 0,
+                };
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError(
+                        "OracleCollection.insertFromQuery",
+                        err,
+                        sql,
+                        binds,
+                    ),
+                );
+            }
+        });
+    }
+
+    // ─── UPDATE ... JOIN ─────────────────────────────────────────
+
+    /**
+     * Update a table using values from a joined table.
+     *
+     * This is Oracle's way of doing "UPDATE ... FROM ... JOIN ...".
+     * First tries an inline view approach; if Oracle rejects it
+     * (non-key-preserved), falls back to a correlated subquery.
+     *
+     * @param {Object} spec
+     *   - target: Target table name
+     *   - join: { table, on: { localField, foreignField }, type? }
+     *   - set: { targetCol: "$joined.sourceCol" } or literal values
+     *   - where: Optional filter on the joined result
+     * @returns {Promise<{ acknowledged, modifiedCount }>}
+     *
+     * @example
+     *   await orders.updateFromJoin({
+     *     target: "orders",
+     *     join: { table: "products", on: { localField: "product_id", foreignField: "id" } },
+     *     set: { price: "$joined.price" },
+     *     where: { status: "pending" }
+     *   });
+     */
+    async updateFromJoin(spec: UpdateFromJoinSpec): Promise<{ acknowledged: boolean; modifiedCount: number;  }> {
+        return this._execute(async (conn) => {
+            const { target, join: joinSpec, set, where } = spec;
+
+            // Build correlated UPDATE subquery approach (more reliable in Oracle)
+            const setParts: string[] = [];
+            const binds: Record<string, unknown> = {};
+            let bindIdx = 0;
+
+            // A value is a column of the joined table only when it says so: "$joined.COL"
+            // or "<join table>.COL". Any other string (an email, "v1.2") is a literal.
+            const joinPrefix = `${String(joinSpec.table).replace(/"/g, "").toUpperCase()}.`;
+            const joinedCol = (v: unknown): string | null => {
+                if (typeof v !== "string") return null;
+                if (v.startsWith("$joined.")) return v.slice(8);
+                return v.toUpperCase().startsWith(joinPrefix) ? v.slice(joinPrefix.length) : null;
+            };
+            for (const [col, val] of Object.entries(set)) {
+                const targetCol = col.includes(".") ? col.split(".")[1] : col;
+                const srcCol = joinedCol(val);
+                if (srcCol !== null) {
+                    // Column reference from joined table
+                    setParts.push(
+                        `${quoteIdentifier(targetCol)} = (SELECT ${quoteIdentifier(srcCol)} FROM ${quoteIdentifier(joinSpec.table)} WHERE ${_buildJoinOn(joinSpec.on, target)} AND ROWNUM = 1)`,
+                    );
+                } else {
+                    const bname = `upd_join_${bindIdx++}`;
+                    binds[bname] = val;
+                    setParts.push(`${quoteIdentifier(targetCol)} = :${bname}`);
+                }
+            }
+
+            // WHERE — exists in joined table
+            let whereExtra = "";
+            if (where) {
+                const whereParts: string[] = [];
+                for (const [col, val] of Object.entries(where)) {
+                    const cleanCol = col.includes(".")
+                        ? col.split(".")[1]
+                        : col;
+                    const bname = `upd_where_${bindIdx++}`;
+                    binds[bname] = val;
+                    whereParts.push(`${quoteIdentifier(cleanCol)} = :${bname}`);
+                }
+                if (whereParts.length > 0) {
+                    whereExtra = ` AND ${whereParts.join(" AND ")}`;
+                }
+            }
+
+            const existsClause = `EXISTS (SELECT 1 FROM ${quoteIdentifier(joinSpec.table)} WHERE ${_buildJoinOn(joinSpec.on, target)}${whereExtra})`;
+            const sql = `UPDATE ${quoteIdentifier(target)} SET ${setParts.join(", ")} WHERE ${existsClause}`;
+
+            try {
+                const result = await conn.execute(sql, binds, {
+                    autoCommit: !this._conn,
+                });
+                return {
+                    acknowledged: true,
+                    modifiedCount: result.rowsAffected ?? 0,
+                };
+            } catch (err) {
+                throw new Error(
+                    MSG.wrapError("OracleCollection.updateFromJoin", err, sql),
+                );
+            }
+        });
+    }
+}
+
+/**
+ * Build a JOIN ON clause from an on-spec object.
+ * @param {Object} onSpec - e.g. { 'TABLE1.COL': 'TABLE2.COL' }
+ * @param {string} targetTable
+ * @returns {string}
+ */
+function _buildJoinOn(onSpec: JoinOn, targetTable: string): string {
+    return Object.entries(onSpec)
+        .map(([left, right]) => {
+            const leftParts = left.split(".");
+            const rightParts = right.split(".");
+            const leftCol = leftParts.length > 1 ? leftParts[1] : leftParts[0];
+            const rightCol =
+                rightParts.length > 1 ? rightParts[1] : rightParts[0];
+            return `${quoteIdentifier(targetTable)}.${quoteIdentifier(leftCol)} = ${quoteIdentifier(rightCol)}`;
+        })
+        .join(" AND ");
+}
+
+export { OracleCollection };

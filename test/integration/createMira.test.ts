@@ -7,10 +7,10 @@
  * each is a separate pool in the same schema.
  */
 import { describe, it, expect, afterAll } from "bun:test";
-import { createMira, MiraConfigError, OracleCollection, OracleSchema, OracleDCL, Transaction } from "../../src/utils/oracle-mongo-wrapper";
-import database from "../../src/config/database";
+import { createMira, MiraConfigError, OracleCollection, OracleSchema, OracleDCL, Transaction } from "../../src";
+import database from "../../src/driver/registry";
 import config from "../../src/config";
-import { getLogger, setLogger } from "../../src/config/log";
+import { getLogger, setLogger } from "../../src/shared/log";
 import { rawExec, dropIfExists } from "../helpers/db";
 
 const T = "MIRA_V3_ITEMS";

@@ -1,0 +1,135 @@
+# Mira 3.0 Roadmap
+
+**Status:** step 3 in progress · **Base:** v2.1.0 · **Branches (stacked):** `feature/v3-config` (#34) → `feature/v3-driver` (#35) → `feature/v3-restructure`
+
+Mira grew inside an app template (CATHERINE / eMeal), so `config/`, `constants/` and `utils/logger` were app code that ended up in the library. An app that installed `@jm-paunlagui/mira` from npm could use only the two built-in pools (`appDb`, `appDbBulk`), through Mira's own env names, and adding a pool meant editing `node_modules`. 3.0 makes Mira a standalone library: the app passes its config in, and Mira reads no env variable, writes no log file and initialises no driver unless asked.
+
+Update this file as each item lands: tick the box and add the PR number.
+
+---
+
+## 1. Progress
+
+| Step | What | Branch | PR | Status |
+|---|---|---|---|---|
+| 1 | `createMira()`, `defineConfig()`, `fromEnv()`, runtime pool registry, `closePool()` | `feature/v3-config` | #34 | ✅ open, ships as 2.2 |
+| 2 | Lazy driver init, `configureDriver()` / `initDriver()`, injectable logger | `feature/v3-driver` | #35 | ✅ open, ships as 2.2 |
+| 3 | Restructure + remove the 2.x API → **3.0.0** | `feature/v3-restructure` | — | 🚧 in progress |
+| 4 | CATHERINE switches from its own adapter copy to the npm package | CATHERINE repo | — | ⏳ after 3.0.0 |
+
+### Step 3 checklist
+
+- [x] **3a. Move files** to the target layout (§2). Import paths only; no behaviour change; full suite green at 100% (567 tests). 39 files moved with `git mv`; `package.json` entry is `dist/index.js`. Still to do: `config/index.ts` (adapter factory) stays until 3c, and `driver/registry.ts` still holds the connect-string builders until 3c splits out `config/connectString.ts`.
+- [ ] **3b. Drop app-template code.** Remove `logger.ts`, `logRedaction.ts`, `requestContext.ts`, `runtimePaths.ts`, `types/express.d.ts`. Default log sink becomes the console (§4 D1). Add `driver.binaryDir` for compiled executables (§4 D4); remove the compiled-exe `.env` loader.
+- [ ] **3c. Remove the 2.x API** (§3 "Removed"). Tests, `sim/`, the CLI and the Node smoke test move to `createMira()`. CI and `.env.example` move to `MIRA_DB_*`.
+- [ ] **3d. Package.** Version 3.0.0; `main` / `types` / `exports` → `dist/index.js`; drop `dotenv` and `@types/express`; publish `dist` only. Rewrite the README setup section; CHANGELOG 3.0.0; `docs/MIGRATION-3.0.md`.
+- [ ] **3e. Verify as a user would.** `npm pack`, install the tarball into an empty temp project with no `.env`, define its own pool, run a query under Node and Bun.
+- [ ] **3f. Merge order:** #34 → #35 → step 3 PR → tag `v3.0.0` → publish.
+
+---
+
+## 2. Target structure
+
+```
+src/
+  index.ts            public API (the only entry point in package.json "exports")
+  config/             what the app passes in
+    types.ts            MiraConfig, PoolConfig, DriverOptions, MiraLogger
+    defineConfig.ts     validation → MiraConfigError
+    fromEnv.ts          opt-in MIRA_* reader
+    connectString.ts    buildSimpleConnectString / buildTNSConnectString
+  driver/             talking to Oracle (the main API)
+    createMira.ts       createMira() → db / collection / schema / dcl / transaction / close
+    oracle.ts           node-oracledb init, pools, acquire, health monitor, shutdown
+    registry.ts         runtime pool registry (no built-in pools)
+    db.ts               the db handle (internal; createMira().db() returns it)
+  core/               OracleCollection, QueryBuilder, Transaction, sql, events
+  parsers/            filter, update, jsonPath
+  pipeline/           aggregate, window, CTE, series, subquery
+  joins/              joinBuilder, setOperations
+  schema/             OracleSchema, OracleDCL
+  typed/              defineTable, columns, model, relations, include, generate, validate
+  migrate/            migrator
+  advanced/           CONNECT BY, PIVOT, performance utilities
+  shared/             used by every layer
+    messages/           error and log message templates
+    log.ts              log sink (setLogger)
+    utils.ts            quoteIdentifier, convertTypes, rowToDoc, mergeBinds …
+  cli/mira.ts         mira generate types / mira migrate
+```
+
+The query layer's folders sit at the top level, so the old `oracle-mongo-wrapper/` folder needs no new name.
+
+### File map (2.x → 3.0)
+
+| 2.x | 3.0 |
+|---|---|
+| `src/utils/oracle-mongo-wrapper/index.ts` | `src/index.ts` |
+| `src/utils/oracle-mongo-wrapper/createMira.ts` | `src/driver/createMira.ts` |
+| `src/utils/oracle-mongo-wrapper/db.ts` | `src/driver/db.ts` |
+| `src/config/adapters/oracle.ts` | `src/driver/oracle.ts` |
+| `src/config/database.ts` | `src/driver/registry.ts` (built-ins removed in 3c) + `src/config/connectString.ts` |
+| `src/config/index.ts` (`DB_TYPE` adapter factory) | removed in 3c |
+| `src/config/log.ts` | `src/shared/log.ts` |
+| `src/config/{types,defineConfig,fromEnv}.ts` | unchanged |
+| `src/constants/messages/*` | `src/shared/messages/*` |
+| `src/utils/oracle-mongo-wrapper/utils.ts` | `src/shared/utils.ts` |
+| `src/utils/oracle-mongo-wrapper/{core/*,Transaction.ts,sql.ts,events.ts}` | `src/core/` |
+| `src/utils/oracle-mongo-wrapper/{parsers,pipeline,joins,schema,typed,migrate,advanced}/` | `src/<same name>/` |
+| `src/utils/oracle-mongo-wrapper/README.md` | folded into the root README in 3d |
+| `src/utils/oracle-mongo-wrapper/logs/` (stray log files) | deleted |
+| `src/utils/{logger,logRedaction,requestContext,runtimePaths}.ts`, `src/types/express.d.ts` | removed in 3b (they stay in CATHERINE) |
+| `src/cli/mira.ts` | unchanged path; uses `fromEnv()` from 3c |
+
+---
+
+## 3. Public API in 3.0
+
+**Kept / added** (exported from `src/index.ts`):
+
+- Entry: `createMira`, `defineConfig`, `fromEnv`, `MiraConfigError`, `configureDriver`, `initDriver`, `setLogger`, `buildSimpleConnectString`, `buildTNSConnectString`.
+- Query layer, unchanged: `OracleCollection`, `QueryBuilder`, `OracleSchema`, `OracleDCL`, `Transaction`, `defineTable`, `t`, `relations`, `createMigrator`, `sql`, `onQuery`, the builders and parsers, and all 2.1 types.
+
+**Removed:**
+
+| 2.x | 3.0 replacement |
+|---|---|
+| `createDb("appDb")` | `createMira(config).db()` |
+| Built-in `appDb` / `appDbBulk` pools from `APP_DB_*`, `DB_HOST`, `DB_PORT`, `DB_APP_SERVICE_NAME`, `APP_POOL_*`, `APP_BULK_*` | pools in the config; `fromEnv()` reads `MIRA_DB_*` |
+| `NODE_ENV=development` + `APP_TEST_DB_*` test-schema switch | the app picks its credentials |
+| `DB_TYPE` / `createAdapter()` | none (Mira is Oracle only) |
+| `POOL_NAMES`, `READINESS_GATING_POOLS` | `mira.config.poolNames`; readiness rules belong to the app |
+| `db.closePool()` closing every pool in the process | closes that Mira instance (already so for `createMira` handles) |
+| Mira's file logger, `ENABLE_CONSOLE_LOGS`, `LOG_*` variables | `logger` option / `setLogger()`; default console |
+| Compiled-exe `.env` loading and PATH set-up | the app does it; pass `driver.binaryDir` |
+
+---
+
+## 4. Decisions
+
+Each can be changed before 3d; say so in the PR.
+
+- **D1. Default log sink = console, warnings and errors only.** Without a `logger`, `warning` → `console.warn`, `critical` → `console.error`, `notice` / `info` are dropped. A library should not create files or chatter by default. `logger: console` gives everything; `false` gives silence.
+- **D2. `createDb` is removed, not deprecated.** The only app on Mira (CATHERINE) has its own copy of the adapter and does not install the package yet, so a shim has no one to protect. Internally `driver/db.ts` keeps building the handle.
+- **D3. One driver per process.** Pools, the health monitor and the Oracle Client stay process-wide (node-oracledb's Thick mode is process-wide anyway). Several `createMira()` instances share them, separated by pool name.
+- **D4. Compiled executables:** `driver.binaryDir` replaces Mira's own `IS_COMPILED` detection. The app knows where it staged the Thick binary; Mira no longer guesses from `Bun.main`.
+- **D5. Package exports only `.`** (plus `./package.json`). Deep imports such as `@jm-paunlagui/mira/dist/...` are not supported; everything public is on the root.
+- **D6. Messages stay templates in `shared/messages/`.** The "kept in sync with CATHERINE" note goes; CATHERINE keeps its own copy until step 4.
+
+---
+
+## 5. CATHERINE migration (step 4, outline)
+
+1. `bun add @jm-paunlagui/mira@3`.
+2. One `src/config/mira.ts` in CATHERINE: `createMira({ pools: { appDb, appDbBulk }, defaultPool: "appDb", driver: { binaryDir }, logger })`, with credentials from its existing env names and its own logger passed in.
+3. Replace `createDb("appDb")` with `mira.db()` / `mira.db("appDbBulk")`; imports from `@jm-paunlagui/mira`.
+4. Delete CATHERINE's copies of the adapter and wrapper; keep its logger, `runtimePaths`, `requestContext` and readiness rules (`READINESS_GATING_POOLS`).
+5. Shutdown hook: `await mira.close()`.
+
+---
+
+## 6. Rules that hold throughout
+
+- `bun test` only; 100% line and function coverage on everything under `src/` that Mira ships (bunfig ignore list updated as files move).
+- Six test folders under `test/` stay: unit, integration, performance, chaos, security, reliability.
+- Every phase ends green: `bun run typecheck`, `bun run test:coverage`, `bun run build && node --env-file=.env test/node/smoke.cjs`.

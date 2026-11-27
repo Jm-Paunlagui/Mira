@@ -2,14 +2,14 @@
 # Global hooks (pool shutdown, metrics persistence) — see test/helpers/setup.ts.
 preload = ["./test/helpers/setup.ts"]
 coverageSkipTestFiles = true
-# Coverage scope = the query layer: oracle-mongo-wrapper + config/adapter.
+# Coverage scope = everything Mira ships under src/ except the app-template files below.
 # Logger, redaction and message catalogs are not DB query code.
 coveragePathIgnorePatterns = [
   "src/utils/logger.ts",
   "src/utils/logRedaction.ts",
   "src/utils/runtimePaths.ts",
   "src/utils/requestContext.ts",
-  "src/constants/**",
+  "src/shared/messages/**",
   "test/**",
   # Migration and table files the tests write to the OS temp directory and import.
   "**/mira-mig-*/**",

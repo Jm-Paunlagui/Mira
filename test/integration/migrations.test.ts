@@ -8,14 +8,14 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from "bun:test"
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createMigrator, defineTable, t, type Migration } from "../../src/utils/oracle-mongo-wrapper";
+import { createMigrator, defineTable, t, type Migration } from "../../src";
 import { db, coll, dropIfExists, rawExec } from "../helpers/db";
 
 const H = "MIRA_IT_MIG_HIST";
 const A = "MIRA_IT_MIG_A";
 const B = "MIRA_IT_MIG_B";
 const V = "MIRA_IT_MIG_V";
-const srcIndex = path.resolve(import.meta.dir, "../../src/utils/oracle-mongo-wrapper/index.ts").replace(/\\/g, "/");
+const srcIndex = path.resolve(import.meta.dir, "../../src/index.ts").replace(/\\/g, "/");
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mira-mig-"));
 
 const Things = defineTable(A, { ID: t.id(), NAME: t.text(40), QTY: t.number().default(0) });

@@ -4,7 +4,7 @@
  * method's own return value alone.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "bun:test";
-import { OracleCollection } from "../../src/utils/oracle-mongo-wrapper";
+import { OracleCollection } from "../../src";
 import { db, schema, coll, createUsers, createOrders, createEmployees, dropIfExists, rawExec, USERS } from "../helpers/db";
 
 const U = "MIRA_IT_USERS";

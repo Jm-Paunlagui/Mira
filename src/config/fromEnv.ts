@@ -19,7 +19,7 @@
  * read here; they still drive createDb("appDb").
  */
 
-import { miraConfigMessages as MSG } from "../constants/messages/miraConfig.messages";
+import { miraConfigMessages as MSG } from "../shared/messages/miraConfig.messages";
 import { defineConfig, MiraConfigError } from "./defineConfig";
 import type { DriverMode, PoolConfig, ResolvedMiraConfig } from "./types";
 

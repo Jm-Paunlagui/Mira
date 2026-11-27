@@ -6,7 +6,7 @@
 import type { Ctx } from "../lib/context";
 import type { Sim } from "../lib/harness";
 import { T, type State } from "../lib/data";
-import type { Migration } from "../../src/utils/oracle-mongo-wrapper";
+import type { Migration } from "../../src";
 
 export async function schemaStage(sim: Sim, ctx: Ctx, state: State) {
   const { api, db, raw, schemaUser } = ctx;

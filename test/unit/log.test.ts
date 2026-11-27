@@ -1,10 +1,10 @@
 /**
- * UNIT — src/config/log.ts: the adapter's log sink. Default is Mira's own
+ * UNIT — src/shared/log.ts: the adapter's log sink. Default is Mira's own
  * logger; setLogger swaps in an app logger (levels mapped) or silence.
  * Every test puts the default back: the sink is process-wide.
  */
 import { describe, it, expect, afterEach } from "bun:test";
-import { log, setLogger, getLogger, isMiraLogger } from "../../src/config/log";
+import { log, setLogger, getLogger, isMiraLogger } from "../../src/shared/log";
 import { logger as miraOwn } from "../../src/utils/logger";
 
 afterEach(() => setLogger(null));

@@ -9,7 +9,7 @@
  * Identifiers are passed upper-case: the wrapper quotes them verbatim, so a
  * lower-case name would create a case-sensitive object.
  */
-import { createDb, OracleCollection, OracleSchema } from "../../src/utils/oracle-mongo-wrapper";
+import { createDb, OracleCollection, OracleSchema } from "../../src";
 
 export const db = createDb("appDb");
 export const schema = new OracleSchema(db);

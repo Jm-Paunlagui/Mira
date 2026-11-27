@@ -1,7 +1,7 @@
 /**
  * TYPE TESTS for model conveniences (Mira 2.1). Checked by `bun run typecheck`, never run.
  */
-import { defineTable, t, relations, hasMany, createDb, type HookContext } from "../../src/utils/oracle-mongo-wrapper";
+import { defineTable, t, relations, hasMany, createDb, type HookContext } from "../../src";
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 const assert = <T extends true>(_ok?: T) => {};

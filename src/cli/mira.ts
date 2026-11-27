@@ -71,7 +71,7 @@ function loadEnv(file: string, required: boolean): void {
   }
 }
 
-type Api = typeof import("../utils/oracle-mongo-wrapper");
+type Api = typeof import("..");
 const say = (text: string) => process.stdout.write(`${text}\n`);
 
 /** Run `fn` with a db handle; the pool is closed afterwards. */
@@ -80,7 +80,7 @@ async function withDb(flags: Record<string, string>, fn: (api: Api, db: ReturnTy
   // The logger writes to stdout, where generated code and reports go: quiet unless --verbose.
   process.env.ENABLE_CONSOLE_LOGS = flags.verbose ? "true" : "false";
   // Loaded after the environment is in place: the adapter reads it at load time.
-  const api = require("../utils/oracle-mongo-wrapper") as Api;
+  const api = require("..") as Api;
   const db = api.createDb("appDb");
   try {
     return await fn(api, db);
@@ -106,7 +106,7 @@ async function generateTypes(flags: Record<string, string>): Promise<number> {
 async function migrate(sub: string, rest: string[], flags: Record<string, string>): Promise<number> {
   const dir = path.resolve(flags.dir ?? "migrations");
   if (sub === "new") {
-    const { migrationFileName, migrationTemplate } = require("../utils/oracle-mongo-wrapper/migrate/migrator") as typeof import("../utils/oracle-mongo-wrapper/migrate/migrator");
+    const { migrationFileName, migrationTemplate } = require("../migrate/migrator") as typeof import("../migrate/migrator");
     const file = path.join(dir, migrationFileName(rest.join(" ")));
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(file, migrationTemplate(flags.import));

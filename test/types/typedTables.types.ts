@@ -3,7 +3,7 @@
  * Every line marked @ts-expect-error must be a compile error; everything else must
  * compile. An exact-type assertion (`Equal`) fails the build when an inferred type drifts.
  */
-import { defineTable, t, createDb, Transaction, type RowOf, type InsertOf } from "../../src/utils/oracle-mongo-wrapper";
+import { defineTable, t, createDb, Transaction, type RowOf, type InsertOf } from "../../src";
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 const assert = <T extends true>(_ok?: T) => {};

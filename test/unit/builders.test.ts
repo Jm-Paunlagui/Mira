@@ -32,9 +32,9 @@ import {
   QueryBuilder,
   withCTE,
   withRecursiveCTE,
-} from "../../src/utils/oracle-mongo-wrapper";
-import { resetBindCounter } from "../../src/utils/oracle-mongo-wrapper/parsers/filterParser";
-import { resetUpdateCounter } from "../../src/utils/oracle-mongo-wrapper/parsers/updateParser";
+} from "../../src";
+import { resetBindCounter } from "../../src/parsers/filterParser";
+import { resetUpdateCounter } from "../../src/parsers/updateParser";
 
 const db = createDb("appDb");
 const c = new OracleCollection("T_U", db);

@@ -8,9 +8,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { defineTable, t, relations, hasMany, generateTableTypes, OracleCollection, type TypedTable } from "../../src/utils/oracle-mongo-wrapper";
+import { defineTable, t, relations, hasMany, generateTableTypes, OracleCollection, type TypedTable } from "../../src";
 import { db, coll, dropIfExists, rawExec } from "../helpers/db";
-import type { DbConnection } from "../../src/utils/oracle-mongo-wrapper/db";
+import type { DbConnection } from "../../src/driver/db";
 
 type Doc = { city: string; total: number; vip?: boolean; at?: string; tags: Array<string | number>; items: Array<{ sku: string; qty: number }>; addr?: { zip: number } };
 const P = "MIRA_JS_PEOPLE";
@@ -26,7 +26,7 @@ const DOCS: Array<{ ID: number; PERSON_ID: number | null; DOC: Doc; EXTRA?: unkn
   { ID: 3, PERSON_ID: null, DOC: { city: "Iloilo", total: 75.5, tags: ["b"], items: [] } },
 ];
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mira-tt-json-"));
-const srcIndex = path.resolve(import.meta.dir, "../../src/utils/oracle-mongo-wrapper/index.ts").replace(/\\/g, "/");
+const srcIndex = path.resolve(import.meta.dir, "../../src/index.ts").replace(/\\/g, "/");
 const ids = async (filter: object) => (await docs.find(filter as never).sort({ ID: 1 }).project({ ID: 1 }).toArray()).map((r) => r.ID);
 
 async function reset() {

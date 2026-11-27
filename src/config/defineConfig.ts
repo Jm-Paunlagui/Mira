@@ -7,9 +7,9 @@
  * would otherwise silently fall back to the default.
  */
 
-import { miraConfigMessages as MSG } from "../constants/messages/miraConfig.messages";
+import { miraConfigMessages as MSG } from "../shared/messages/miraConfig.messages";
 import type { DriverOptions, MiraConfig, PoolConfig, ResolvedMiraConfig } from "./types";
-import { isMiraLogger } from "./log";
+import { isMiraLogger } from "../shared/log";
 
 /** A pool name: a letter, then up to 63 letters, digits or `_`. */
 const POOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;

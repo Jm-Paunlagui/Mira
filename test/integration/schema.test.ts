@@ -4,7 +4,7 @@
  * USER_* data dictionary, not by the method's return value.
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { OracleDCL, createPerformance } from "../../src/utils/oracle-mongo-wrapper";
+import { OracleDCL, createPerformance } from "../../src";
 import { db, schema, coll, createUsers, dropIfExists, rawExec } from "../helpers/db";
 
 const T = "MIRA_IS_T";

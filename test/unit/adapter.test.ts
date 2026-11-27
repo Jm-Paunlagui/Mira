@@ -1,5 +1,5 @@
 /**
- * UNIT — src/config/adapters/oracle.ts driven by a scriptable stub driver.
+ * UNIT — src/driver/oracle.ts driven by a scriptable stub driver.
  *
  * Each scenario loads a FRESH copy of the adapter (`import("…oracle.ts?tag")`)
  * with a stub `oracledb` placed in require.cache, so pool creation, acquire
@@ -14,12 +14,12 @@ import { describe, it, expect, beforeAll, afterAll, mock } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import database from "../../src/config/database";
+import database from "../../src/driver/registry";
 import * as liveRuntime from "../../src/utils/runtimePaths";
 import { logger } from "../../src/utils/logger";
-import * as realAdapter from "../../src/config/adapters/oracle";
+import * as realAdapter from "../../src/driver/oracle";
 
-type Adapter = typeof import("../../src/config/adapters/oracle");
+type Adapter = typeof import("../../src/driver/oracle");
 // Snapshot: mock.module rewrites the live namespace, so restoring from it would keep IS_COMPILED: true.
 const realRuntime = { ...liveRuntime };
 const realOracledb = realAdapter.oracledb;
@@ -85,7 +85,7 @@ async function loadAdapter(driver: unknown, opts: { compiled?: boolean } = {}): 
   require.cache[oracledbKey] = { id: oracledbKey, filename: oracledbKey, loaded: true, exports: driver } as never;
   if (opts.compiled) mock.module("../../src/utils/runtimePaths", () => ({ ...realRuntime, IS_COMPILED: true }));
   try {
-    return (await import(`../../src/config/adapters/oracle.ts?fresh=${++seq}`)) as Adapter;
+    return (await import(`../../src/driver/oracle.ts?fresh=${++seq}`)) as Adapter;
   } finally {
     if (opts.compiled) mock.module("../../src/utils/runtimePaths", () => ({ ...realRuntime }));
     require.cache[oracledbKey] = saved;

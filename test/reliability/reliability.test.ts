@@ -3,7 +3,7 @@
  * no lost updates, idempotent upserts, stable latency, exact round-trips.
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { Transaction } from "../../src/utils/oracle-mongo-wrapper";
+import { Transaction } from "../../src";
 import { db, schema, coll, dropIfExists, rawExec, recordMetric, percentile, timeIt, appDbInUse } from "../helpers/db";
 
 const C = "MIRA_RL_COUNTER";

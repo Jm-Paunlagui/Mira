@@ -1,7 +1,7 @@
 /**
  * UNIT — the createMira() config layer: defineConfig (src/config/defineConfig.ts),
  * fromEnv (src/config/fromEnv.ts) and the runtime registry added to
- * src/config/database.ts (registerConnection / unregisterConnection).
+ * src/driver/registry.ts (registerConnection / unregisterConnection).
  * Registry tests use a fresh copy of database.ts so the shared registry the
  * adapter reads is never touched here.
  */
@@ -200,7 +200,7 @@ describe("unit: fromEnv", () => {
 
 describe("unit: runtime connection registry", () => {
   it("register adds a pool; unregister removes it", async () => {
-    const m = await import("../../src/config/database.ts?registry-add");
+    const m = await import("../../src/driver/registry.ts?registry-add");
     m.registerConnection("extraDb", { user: "u", password: "p", connectString: "h:1/s", poolMax: 3 });
     expect(m.getConnectionConfig("extraDb").poolMax).toBe(3);
     expect(m.getConnectionNames()).toEqual(["appDb", "appDbBulk", "extraDb"]);
@@ -212,7 +212,7 @@ describe("unit: runtime connection registry", () => {
   });
 
   it("a built-in name is shadowed, then restored; built-ins cannot be unregistered", async () => {
-    const m = await import("../../src/config/database.ts?registry-shadow");
+    const m = await import("../../src/driver/registry.ts?registry-shadow");
     const original = m.getConnectionConfig("appDbBulk");
     m.registerConnection("appDbBulk", { user: "mine", password: "p", connectString: "h:1/s" });
     expect(m.getConnectionConfig("appDbBulk").user).toBe("mine");
@@ -223,7 +223,7 @@ describe("unit: runtime connection registry", () => {
   });
 
   it("refuses bad names; lookups see own keys only", async () => {
-    const m = await import("../../src/config/database.ts?registry-names");
+    const m = await import("../../src/driver/registry.ts?registry-names");
     for (const bad of ["", "1x", "a-b", "__proto__", 5 as unknown as string]) {
       expect(() => m.registerConnection(bad, {})).toThrow(/^Invalid connection name/);
     }

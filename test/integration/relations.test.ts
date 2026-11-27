@@ -3,7 +3,7 @@
  * Every expected value is built from the rows inserted here.
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { defineTable, t, relations, hasMany, hasOne, belongsTo, Transaction, OracleCollection } from "../../src/utils/oracle-mongo-wrapper";
+import { defineTable, t, relations, hasMany, hasOne, belongsTo, Transaction, OracleCollection } from "../../src";
 import { db, dropIfExists } from "../helpers/db";
 
 const Customers = defineTable("MIRA_RL_CUSTOMERS", { ID: t.id(), NAME: t.text(30), CITY: t.text(30).nullable() });

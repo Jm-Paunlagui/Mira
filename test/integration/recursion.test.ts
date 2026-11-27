@@ -4,7 +4,7 @@
  * (series()). Results are compared with the same computation in JS.
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { series, withRecursiveCTE } from "../../src/utils/oracle-mongo-wrapper";
+import { series, withRecursiveCTE } from "../../src";
 import { coll, db, dropIfExists, schema } from "../helpers/db";
 
 const B = "MIRA_RC_BOM";

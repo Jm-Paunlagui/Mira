@@ -4,13 +4,13 @@
  * the public API plus an untracked raw-SQL handle for verification.
  *
  * Schema switch: Mira already redirects appDb / appDbBulk to APP_TEST_DB_* when
- * NODE_ENV=development and APP_TEST_DB_USERNAME is set (src/config/database.ts).
+ * NODE_ENV=development and APP_TEST_DB_USERNAME is set (src/driver/registry.ts).
  * The simulation sets those from MIRA_SIM_DB_* before Mira is first imported,
  * so the library is exercised through its normal configuration path.
  */
 import * as tracker from "./tracker";
 
-export type Api = typeof import("../../src/utils/oracle-mongo-wrapper");
+export type Api = typeof import("../../src");
 type Db = ReturnType<Api["createDb"]>;
 
 export interface Ctx {
@@ -44,8 +44,8 @@ export async function buildContext(): Promise<Ctx> {
   process.env.DB_TEST_SID = process.env.MIRA_SIM_DB_SID ?? "";
   if (!process.env.MIRA_LOGS) process.env.ENABLE_CONSOLE_LOGS = "false";
 
-  const mod = (await import("../../src/utils/oracle-mongo-wrapper")) as Api;
-  const { Session } = await import("../../src/utils/oracle-mongo-wrapper/Transaction");
+  const mod = (await import("../../src")) as Api;
+  const { Session } = await import("../../src/core/Transaction");
 
   // Untracked handle for verification, created before anything is wrapped.
   const rawDb = mod.createDb("appDb");

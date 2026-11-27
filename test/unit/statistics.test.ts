@@ -3,8 +3,8 @@
  * accumulators, window options and sort / paging options. No database round trip.
  */
 import { describe, it, expect } from "bun:test";
-import { buildAggregateSQL, buildWindowExpr, buildOrderBy, createDb, OracleCollection, QueryBuilder } from "../../src/utils/oracle-mongo-wrapper";
-import { sortTerm } from "../../src/utils/oracle-mongo-wrapper/utils";
+import { buildAggregateSQL, buildWindowExpr, buildOrderBy, createDb, OracleCollection, QueryBuilder } from "../../src";
+import { sortTerm } from "../../src/shared/utils";
 
 const db = createDb("appDb");
 const c = new OracleCollection("T_U", db);

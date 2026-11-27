@@ -1,10 +1,10 @@
 /**
- * UNIT — connection registry (src/config/database.ts) and adapter factory
+ * UNIT — connection registry (src/driver/registry.ts) and adapter factory
  * (src/config/index.ts). Module-load branches are reached by importing fresh
  * copies (`?tag` query) with the environment arranged first.
  */
 import { describe, it, expect, afterEach } from "bun:test";
-import database, { buildSimpleConnectString, buildTNSConnectString, getConnectionConfig, getConnectionNames, POOL_NAMES, READINESS_GATING_POOLS } from "../../src/config/database";
+import database, { buildSimpleConnectString, buildTNSConnectString, getConnectionConfig, getConnectionNames, POOL_NAMES, READINESS_GATING_POOLS } from "../../src/driver/registry";
 import config from "../../src/config";
 
 const saved = { ...process.env };
@@ -37,7 +37,7 @@ describe("unit: database registry", () => {
     process.env.APP_TEST_DB_USERNAME = "tester";
     process.env.APP_TEST_DB_PASSWORD = "pw";
     process.env.DB_TEST_HOST = "testhost";
-    const m = await import("../../src/config/database.ts?testdb");
+    const m = await import("../../src/driver/registry.ts?testdb");
     expect(m.usingTestDb).toBe(true);
     expect(m.connections.appDb.user).toBe("tester");
     expect(m.connections.appDbBulk.connectString).toContain("HOST=testhost");
@@ -48,7 +48,7 @@ describe("unit: database registry", () => {
     delete process.env.APP_TEST_DB_USERNAME;
     process.env.APP_POOL_TIMEOUT = "0";
     process.env.APP_POOL_MIN = "";
-    const m = await import("../../src/config/database.ts?devonly");
+    const m = await import("../../src/driver/registry.ts?devonly");
     expect(m.usingTestDb).toBe(false);
     expect(m.connections.appDb.poolTimeout).toBe(0);
     expect(m.connections.appDb.poolMin).toBe(5);
@@ -62,7 +62,7 @@ describe("unit: database registry", () => {
       return orig.call(this, v, ...rest);
     } as typeof orig;
     try {
-      await expect(import("../../src/config/database.ts?failclosed")).rejects.toThrow(/Invalid READINESS_GATING_POOLS entry "appDb"/);
+      await expect(import("../../src/driver/registry.ts?failclosed")).rejects.toThrow(/Invalid READINESS_GATING_POOLS entry "appDb"/);
     } finally {
       Array.prototype.includes = orig;
     }

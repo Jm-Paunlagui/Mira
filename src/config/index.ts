@@ -10,7 +10,7 @@
  * value (CWE-89 pool forgery).
  *
  * To add a new DB engine:
- *   1. Create src/config/adapters/<engine>.js
+ *   1. Create src/driver/<engine>.ts
  *   2. Add a case in _loadAdapter()
  *   3. Set DB_TYPE=<engine> in .env
  */
@@ -20,7 +20,7 @@
 function _loadAdapter(engine: string) {
   switch (engine.toLowerCase()) {
     case "oracle":
-      return (require("./adapters/oracle") as typeof import("./adapters/oracle"));
+      return (require("../driver/oracle") as typeof import("../driver/oracle"));
 
     // case 'postgres': return require('./adapters/postgres');
     // case 'mssql':    return require('./adapters/mssql');
@@ -28,7 +28,7 @@ function _loadAdapter(engine: string) {
     default:
       throw new Error(
         `Unknown DB_TYPE "${engine}". ` +
-          `Supported: oracle. Add a new adapter in src/config/adapters/ to extend.`,
+          `Supported: oracle. Add a new adapter in src/driver/ to extend.`,
       );
   }
 }
@@ -47,5 +47,5 @@ const _default = createAdapter();
 export default {
   ..._default,
   createAdapter,
-  ...(require("./database") as typeof import("./database")),
+  ...(require("../driver/registry") as typeof import("../driver/registry")),
 };

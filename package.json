@@ -20,15 +20,15 @@
   "license": "Apache-2.0",
   "author": "John Moises Paunlagui",
   "type": "commonjs",
-  "main": "dist/utils/oracle-mongo-wrapper/index.js",
-  "types": "dist/utils/oracle-mongo-wrapper/index.d.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
     "mira": "dist/cli/mira.js"
   },
   "exports": {
     ".": {
-      "types": "./dist/utils/oracle-mongo-wrapper/index.d.ts",
-      "default": "./dist/utils/oracle-mongo-wrapper/index.js"
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
     },
     "./package.json": "./package.json"
   },
