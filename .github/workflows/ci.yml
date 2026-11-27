@@ -60,9 +60,11 @@ jobs:
           --health-retries 30
     env:
       # The test schema's pool: fromEnv() → appDb. FREEPDB1 is the PDB's service name.
+      # ":dedicated" asks for a dedicated server, as 2.x's (SERVER=DEDICATED) descriptor did:
+      # in Thick mode a call timeout on a shared-server session ended in DPI-1010 (not connected).
       MIRA_DB_USER: MIRA
       MIRA_DB_PASSWORD: MiraCi_app_2026
-      MIRA_DB_CONNECT_STRING: localhost:1521/FREEPDB1
+      MIRA_DB_CONNECT_STRING: localhost:1521/FREEPDB1:dedicated
       MIRA_DB_POOL_MIN: "5"
       MIRA_DB_POOL_MAX: "20"
       MIRA_DB_QUEUE_MAX: "40"
