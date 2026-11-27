@@ -59,12 +59,14 @@ jobs:
           --health-timeout 5s
           --health-retries 30
     env:
-      # The test schema's pool: fromEnv() → appDb. FREEPDB1 is the PDB's service name.
-      # ":dedicated" asks for a dedicated server, as 2.x's (SERVER=DEDICATED) descriptor did:
-      # in Thick mode a call timeout on a shared-server session ended in DPI-1010 (not connected).
+      # The test schema's pool: fromEnv() → appDb. The descriptor 2.x always used (dedicated
+      # server, SELECT failover), by service name. Thick mode's call-timeout and dead-connection
+      # chaos tests have only ever passed with this failover in place: on plain Easy Connect a
+      # timed-out call leaves a dead session (DPI-1010) still counted in use. Tracked in
+      # docs/ROADMAP-3.0.md ("Open: Thick mode without failover").
       MIRA_DB_USER: MIRA
       MIRA_DB_PASSWORD: MiraCi_app_2026
-      MIRA_DB_CONNECT_STRING: localhost:1521/FREEPDB1:dedicated
+      MIRA_DB_CONNECT_STRING: "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=1521))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=FREEPDB1)(FAILOVER_MODE=(TYPE=SELECT)(METHOD=BASIC)(RETRIES=180)(DELAY=5))))"
       MIRA_DB_POOL_MIN: "5"
       MIRA_DB_POOL_MAX: "20"
       MIRA_DB_QUEUE_MAX: "40"
