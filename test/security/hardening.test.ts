@@ -181,3 +181,16 @@ describe("security: DCL errors", () => {
     await expect(dcl.revoke(["SELECT"], "T", "NOPE")).rejects.toThrow(/OracleDCL\.revoke.*REVOKE SELECT ON "T" FROM "NOPE"/s);
   });
 });
+
+describe("security: connect-string validation is linear (no ReDoS)", () => {
+  it("long hostile hosts are refused quickly", () => {
+    const start = performance.now();
+    for (const h of ["0:".repeat(50_000) + "!", "a".repeat(100_000) + "!", "[" + ":".repeat(100_000), "1".repeat(300)]) {
+      expect(() => buildSimpleConnectString(h, 1521, "S")).toThrow(TypeError);
+    }
+    expect(() => buildSimpleConnectString("[::1", 1521, "S")).toThrow(TypeError);
+    expect(() => buildSimpleConnectString("::1]", 1521, "S")).toThrow(TypeError);
+    expect(() => buildSimpleConnectString("[a.b]", 1521, "S")).toThrow(TypeError);
+    expect(performance.now() - start).toBeLessThan(200);
+  });
+});

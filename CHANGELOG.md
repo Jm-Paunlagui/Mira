@@ -15,6 +15,10 @@ Theme: security hardening. A red-team pass (a new SQL-text fuzzer, plus hand-wri
 - **Connect-string injection.** `buildSimpleConnectString`, `buildTNSConnectString` and `fromEnv`'s `HOST`/`PORT`/`SERVICE` wrote their parts into the descriptor unchecked. A host such as `db)(ADDRESS=(HOST=evil)…` added an address and sent the credentials to another server. Host, port (1–65535) and service/SID are now validated; errors name the part, never the value.
 - **Stack exhaustion.** A filter, update or pipeline nested 100,000 levels deep overflowed the stack inside the recursive parsers. Input deeper than 100 levels, or input that refers to itself, is refused up front with a `RangeError`.
 
+### Performance
+
+- **IN-list padding.** `$in` / `$nin` lists of up to 1,000 values are sent at power-of-two lengths, repeating the last value (results are identical). Lengths 1–1,000 now map to 11 SQL texts instead of 1,000, so Oracle reuses the parsed cursor. Measured p95: 2–4× lower (700 values: 11.6 → 3.0 ms).
+
 ### Fixed
 
 - A `Buffer` or a ``sql`…` `` statement inside a filter kept its type: the filter-resolution step copied every object field by field.

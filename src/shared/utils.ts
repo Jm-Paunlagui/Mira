@@ -369,15 +369,27 @@ const MAX_QUERY_DEPTH = 100;
  */
 function assertMaxDepth(value: unknown, where: string, max = MAX_QUERY_DEPTH): void {
   if (!value || typeof value !== "object") return;
-  const stack: Array<[unknown, number]> = [[value, 1]];
-  while (stack.length > 0) {
-    const [v, d] = stack.pop()!;
+  // Two parallel stacks (no tuple per node) and index loops: the walk is on every query.
+  const nodes: unknown[] = [value];
+  const depths: number[] = [1];
+  while (nodes.length > 0) {
+    const v = nodes.pop() as object;
+    const d = depths.pop()!;
     if (d > max) throw new RangeError(MSG.QUERY_TOO_DEEP(where, max));
+    if (Array.isArray(v)) {
+      for (let i = 0; i < v.length; i++) {
+        const c = v[i];
+        if (c !== null && typeof c === "object") { nodes.push(c); depths.push(d + 1); }
+      }
+      continue;
+    }
     // Only plain objects and arrays are query structure; a QueryBuilder, Date or Buffer is a leaf.
     const proto = Object.getPrototypeOf(v);
-    if (!Array.isArray(v) && proto !== Object.prototype && proto !== null) continue;
-    const children = Array.isArray(v) ? v : Object.values(v as object);
-    for (const c of children) if (c && typeof c === "object") stack.push([c, d + 1]);
+    if (proto !== Object.prototype && proto !== null) continue;
+    for (const k in v) {
+      const c = (v as Record<string, unknown>)[k];
+      if (c !== null && typeof c === "object") { nodes.push(c); depths.push(d + 1); }
+    }
   }
 }
 

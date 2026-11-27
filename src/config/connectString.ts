@@ -11,12 +11,19 @@ import { miraConfigMessages as MSG } from "../shared/messages/miraConfig.message
 // Each part is checked before it is written into the connect string: a host such as
 // "db)(ADDRESS=(HOST=evil)" would otherwise add an address to the descriptor and send
 // the credentials to another server. Values are never echoed back (they come from config).
-const HOST_RE = /^(?:\[[0-9A-Fa-f:.]+\]|[0-9A-Fa-f:]+:[0-9A-Fa-f:.]*|[A-Za-z0-9](?:[A-Za-z0-9._-]{0,252}))$/;
+// One quantifier per branch, so matching is linear (no ReDoS); length is checked first.
+const HOSTNAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$/;
+const IPV6_RE = /^\[?[0-9A-Fa-f:.]{2,45}\]?$/;
+function validHost(h: string): boolean {
+    if (h.length === 0 || h.length > 253) return false;
+    if (h.includes(":") || h.startsWith("[")) return IPV6_RE.test(h) && h.startsWith("[") === h.endsWith("]") && h.includes(":");
+    return HOSTNAME_RE.test(h);
+}
 const SERVICE_RE = /^[A-Za-z0-9_$#][A-Za-z0-9_.$#-]{0,127}$/;
 
 function checkParts(where: string, host: unknown, port: unknown, service: unknown, serviceLabel: string): { host: string; port: number; service: string } {
     const h = typeof host === "string" ? host.trim() : "";
-    if (!HOST_RE.test(h)) throw new TypeError(MSG.CONNECT_PART_INVALID(where, "host", "a host name, an IPv4 address or an IPv6 address"));
+    if (!validHost(h)) throw new TypeError(MSG.CONNECT_PART_INVALID(where, "host", "a host name, an IPv4 address or an IPv6 address"));
     const p = typeof port === "number" ? port : typeof port === "string" && /^\s*\d{1,5}\s*$/.test(port) ? Number(port) : NaN;
     if (!Number.isInteger(p) || p < 1 || p > 65535) throw new TypeError(MSG.CONNECT_PART_INVALID(where, "port", "a whole number from 1 to 65535"));
     const s = typeof service === "string" ? service.trim() : "";
