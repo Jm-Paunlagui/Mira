@@ -22,6 +22,8 @@ export interface Ctx {
   /** Untracked: number of rows in a table, by hand-written SQL. */
   rawCount: (table: string, where?: string, binds?: Record<string, unknown>) => Promise<number>;
   schemaUser: string;
+  /** Where the simulation schema is, for stages that open their own pools (createMira). */
+  conn: { user: string; password: string; host: string; port: string; sid: string };
 }
 
 export async function buildContext(): Promise<Ctx> {
@@ -95,5 +97,12 @@ export async function buildContext(): Promise<Ctx> {
   tracker.trackObject("migrator", mod.createMigrator(rawDb) as object);
 
   const tracked = api as unknown as Api;
-  return { api: tracked, db: tracked.createDb("appDb"), raw, rawCount, schemaUser: U };
+  const conn = {
+    user,
+    password,
+    host: process.env.MIRA_SIM_DB_HOST || process.env.DB_HOST || "",
+    port: process.env.MIRA_SIM_DB_PORT || process.env.DB_PORT || "",
+    sid: process.env.MIRA_SIM_DB_SID || process.env.DB_APP_SERVICE_NAME || "",
+  };
+  return { api: tracked, db: tracked.createDb("appDb"), raw, rawCount, schemaUser: U, conn };
 }
