@@ -39,6 +39,7 @@ const oracleMessages = {
   POOL_CREATE_FAILED_EVICTED: (name: unknown, ms: unknown) =>
     `Pool "${name}" creation failed — cached failure evicted after ${ms}ms; the next acquire will retry creation.`,
   POOL_CLOSED: (name: unknown) => `Pool "${name}" closed.`,
+  POOL_CLOSED_DURING_CREATE: (name: unknown) => `Pool "${name}" was closed while it was being created; not retrying.`,
   POOL_CLOSE_ERROR: (name: unknown, err: unknown) => `Pool "${name}" close error: ${err}`,
   SHUTDOWN_ALREADY: "Shutdown already in progress.",
   CLOSING_ALL_POOLS: "Closing all Oracle pools…",

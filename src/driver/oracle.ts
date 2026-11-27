@@ -585,7 +585,15 @@ function _warnIfThreadPoolTooSmall(name: unknown, poolMax: number) {
     if (poolMax > threads) log().warning(oracleMessages.THREADPOOL_TOO_SMALL(name, poolMax, threads, fromEnv));
 }
 
-async function _createPool(name: unknown, dbConfig: import("oracledb").PoolAttributes, attempt = 0) {
+/**
+ * Bumped by closePool(name): a creation of `name` that started before the close
+ * stops retrying, so close() does not wait out every retry of a pool that cannot
+ * come up (4 attempts with backoff, each up to its connect timeout).
+ */
+const _poolGeneration = new Map<string, number>();
+const _generationOf = (name: string) => _poolGeneration.get(name) ?? 0;
+
+async function _createPool(name: string, dbConfig: import("oracledb").PoolAttributes, attempt = 0, generation = _generationOf(name)) {
     const MAX_RETRIES = 3;
     const delay = Math.min(1000 * 2 ** attempt, 10_000);
 
@@ -628,6 +636,8 @@ async function _createPool(name: unknown, dbConfig: import("oracledb").PoolAttri
             }
         }
 
+        // A pool closed while it was being created does not retry: close() waits on this promise.
+        if (_generationOf(name) !== generation) throw new Error(oracleMessages.POOL_CLOSED_DURING_CREATE(name));
         // A stopping process does not keep retrying: closeAll() would wait
         // its per-pool guard on a creation nobody needs any more.
         if (attempt < MAX_RETRIES && !isShuttingDown) {
@@ -644,7 +654,8 @@ async function _createPool(name: unknown, dbConfig: import("oracledb").PoolAttri
             if (isShuttingDown) {
                 throw new Error("App is shutting down — no new connections.");
             }
-            return _createPool(name, dbConfig, attempt + 1);
+            if (_generationOf(name) !== generation) throw new Error(oracleMessages.POOL_CLOSED_DURING_CREATE(name));
+            return _createPool(name, dbConfig, attempt + 1, generation);
         }
         throw new Error(
             oracleMessages.POOL_COULD_NOT_CREATE(
@@ -1076,6 +1087,7 @@ async function closeAll() {
  * @returns {Promise<void>}
  */
 async function closePool(name: string): Promise<void> {
+    _poolGeneration.set(name, _generationOf(name) + 1); // a creation in progress stops retrying
     const poolPromise = poolRegistry.get(name);
     poolRegistry.delete(name);
     _monitoredNames.delete(name);

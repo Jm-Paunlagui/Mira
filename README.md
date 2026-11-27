@@ -1815,7 +1815,8 @@ bun run test:unit       # or :integration / :performance / :chaos / :security / 
 
 **Continuous integration.** `.github/workflows/ci.yml` runs on every push and pull request:
 - **Build:** type-check, `bun run build`, and `npm pack --dry-run`.
-- **Live tests:** against an Oracle Database Free 23ai container (`gvenzl/oracle-free`), once in **Thin** mode and once in **Thick** mode (Instant Client installed on the runner). Each run does the full suite with coverage, the simulation, and `test/node/smoke.cjs`, which loads the built package under plain Node.
+- **Live tests:** against an Oracle Database Free 23ai container (`gvenzl/oracle-free`), once in **Thin** mode and once in **Thick** mode (Instant Client installed on the runner). Each run does the full suite with coverage, the simulation, `test/node/smoke.cjs` (the built package under plain Node), and the package check below.
+- **Package check** (`bun run test:package`): packs the tarball, installs it into an empty project with no `.env` and no `MIRA_*` variables, type-checks a TypeScript app strictly (the published `.d.ts` files included), runs it under Bun, runs a CommonJS and an ES-module app under Node, and runs the `mira` CLI. It needs `PKG_DB_USER` / `PKG_DB_PASSWORD` / `PKG_DB_CONNECT_STRING`, or copies them from `MIRA_DB_*`.
 - **Setup:** the job creates the `MIRA` and `MIRA_SIM` schemas with `.github/oracle/setup-users.sql`.
 
 To run the Node smoke test yourself: `bun run build && node --env-file=.env test/node/smoke.cjs`.

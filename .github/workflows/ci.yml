@@ -124,3 +124,8 @@ jobs:
         run: |
           bun run build
           node test/node/smoke.cjs
+
+      - name: Package check (the packed tarball in an empty project)
+        # Strict tsc over the published .d.ts, then TypeScript under Bun and CommonJS / ES
+        # modules under Node, with no .env and no MIRA_* variables (see test/package/run.sh).
+        run: bun run test:package

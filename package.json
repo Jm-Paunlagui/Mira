@@ -47,6 +47,7 @@
     "clean": "bun -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "prepack": "bun run build",
     "smoke:node": "node test/node/smoke.cjs",
+    "test:package": "bash test/package/run.sh",
     "test": "bun test/run.ts",
     "test:coverage": "bun test/run.ts --coverage",
     "test:unit": "bun test/run.ts test/unit",

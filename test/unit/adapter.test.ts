@@ -728,3 +728,39 @@ describe("unit/adapter: driver mode — configureDriver / initDriver (2.2)", () 
     expect(() => b.configureDriver({ mode: "thick" })).toThrow("already initialised as thin (/ic); it cannot change to thick");
   });
 });
+
+describe("unit/adapter: closePool during pool creation (3.0)", () => {
+  it("an attempt still in flight is not retried once the pool is closed", async () => {
+    const a = await loadAdapter(makeDriver());
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let creates = 0;
+    register("s_close_inflight", { create: async () => { creates++; await gate; throw new Error("ORA-12541: TNS:no listener"); } });
+    const pending = a.withConnection("s_close_inflight", async () => 1).catch((e: Error) => e);
+    await wait(5);
+    const closing = a.closePool("s_close_inflight");
+    release();
+    await closing;
+    expect(((await pending) as Error).message).toMatch(/"s_close_inflight" was closed while it was being created; not retrying/);
+    expect(creates).toBe(1);
+  });
+
+  it("a creation waiting out its backoff stops there", async () => {
+    const a = await loadAdapter(makeDriver());
+    const realRandom = Math.random;
+    Math.random = () => 0.5; // backoff sleep = 500 ms, long enough to close during it
+    let creates = 0;
+    register("s_close_backoff", { create: () => { creates++; throw new Error("ORA-12541: TNS:no listener"); } });
+    try {
+      const pending = a.withConnection("s_close_backoff", async () => 1).catch((e: Error) => e);
+      await wait(50); // attempt 1 has failed; the retry is sleeping
+      const started = Date.now();
+      await a.closePool("s_close_backoff");
+      expect(((await pending) as Error).message).toMatch(/was closed while it was being created/);
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(creates).toBe(1);
+    } finally {
+      Math.random = realRandom;
+    }
+  });
+});

@@ -1,6 +1,6 @@
 # Mira 3.0 Roadmap
 
-**Status:** step 3 in progress (3a–3d done) · **Base:** v2.1.0 · **Branches (stacked):** `feature/v3-config` (#34) → `feature/v3-driver` (#35) → `feature/v3-restructure`
+**Status:** step 3 in progress (3a–3e done; 3f is the merge and release) · **Base:** v2.1.0 · **Branches (stacked):** `feature/v3-config` (#34) → `feature/v3-driver` (#35) → `feature/v3-restructure`
 
 Mira grew inside an app template (CATHERINE / eMeal), so `config/`, `constants/` and `utils/logger` were app code that ended up in the library. An app that installed `@jm-paunlagui/mira` from npm could use only the two built-in pools (`appDb`, `appDbBulk`), through Mira's own env names, and adding a pool meant editing `node_modules`. 3.0 makes Mira a standalone library: the app passes its config in, and Mira reads no env variable, writes no log file and initialises no driver unless asked.
 
@@ -36,7 +36,8 @@ Update this file as each item lands: tick the box and add the PR number.
   - README: new Setup (install, connect, pool options, several pools, health and readiness, `fromEnv`, Thin/Thick, logging); later sections and Testing / Simulation updated. The old wrapper guide (`docs/QUERY-GUIDE.md`, a stale copy) is deleted after folding in its one unique section (`$lookup` `select`).
   - CHANGELOG 3.0.0; `docs/MIGRATION-3.0.md` (CATHERINE-oriented).
   - **Gap found and closed:** CATHERINE's readiness, alerting and shutdown code calls the adapter's lifecycle and health functions (`initializePools`, `closeAll`, `onPoolHealthChange`, `setPoolHealthWatched`, `recordProbeSuccess` …), none public in 3.0. Added `mira.open()`, `mira.stats()` and `mira.health.*`, scoped to the instance's pools (§3). Sim: 177/177 functions, 366 checks.
-- [ ] **3e. Verify as a user would.** `npm pack`, install the tarball into an empty temp project with no `.env`, define its own pool, run a query under Node and Bun.
+- [x] **3e. Verify as a user would.** `test/package/run.sh` (`bun run test:package`, also a CI step in both driver modes): packs the tarball, installs it with `@types/node` into an empty temp project with no `.env`, unsets every `MIRA_*` and 2.x variable, and gives the app its own pool name (`shop`) and variables (`PKG_DB_*`). Then: strict `tsc` (`skipLibCheck: false`) over a TypeScript app and the published `.d.ts`, the app under Bun (typed table create / insert / find, exact money, `MiraConfigError`, `open`, health, stats, close, no `logs/`), a CommonJS app and an ES-module app (named imports from the CommonJS build, `fromEnv` with a custom prefix) under Node, and the `mira` CLI binary. Checked that a wrong password fails it.
+  - Found on the way: `mira.close()` waited out every retry of a pool that could not come up (4 attempts plus backoff; up to a minute with long connect timeouts). `closePool()` now stops a creation in progress at the current attempt or backoff. The test that exposed it took 5 s and only passed under the runner's 180 s timeout; it now takes ~0.1 s. 561 tests at 100%.
 - [ ] **3f. Merge order:** #34 → #35 → step 3 PR → tag `v3.0.0` → publish.
 
 ---

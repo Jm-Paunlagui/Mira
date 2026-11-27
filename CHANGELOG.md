@@ -19,6 +19,7 @@ Theme: Mira is a standalone library. The app passes its config in; Mira reads no
 
 - **Default log sink:** warnings go to `console.warn` and failures to `console.error`, prefixed `[mira]`; notices are dropped. `logger: console` shows everything, `logger: false` nothing.
 - In `"auto"` driver mode, no Oracle Client on the library path is an ordinary Thin start: a one-line notice instead of a multi-line DPI-1047 warning. A `libDir` you named that fails to load is still a warning.
+- **`mira.close()` no longer waits out the retries of a pool that cannot come up.** A pool still being created when its instance closes stops at the current attempt or backoff ("was closed while it was being created; not retrying"). Before, close waited for all 4 attempts and their backoff, each up to its connect timeout.
 - **A handle kept after `mira.close()`** reports `isHealthy() === false` and rejects `withConnection` / `withTransaction` / `withBatchConnection` with "This Mira instance is closed". It used to stay "healthy" and fail with "Unknown connection".
 - The bare handle's `closePool()` (close every pool in the process) is gone; `mira.db().closePool()` closes that instance, as in 2.2.
 - **Layout:** `src/` is `index.ts`, `config/`, `driver/`, `core/`, `parsers/`, `pipeline/`, `joins/`, `schema/`, `typed/`, `migrate/`, `advanced/`, `shared/`, `cli/` (was `src/utils/oracle-mongo-wrapper/…`). The package entry is `dist/index.js`; only the package root is public.
@@ -37,7 +38,8 @@ Theme: Mira is a standalone library. The app passes its config in; Mira reads no
 - Tests build their pool with `createMira(fromEnv())` (`test/helpers/db.ts`); CI sets `MIRA_DB_*` and connects by service name, so the listener's SID-as-service tweak is gone.
 - The simulation runs on its own `createMira` pool and also counts `mira.*` and `mira.health.*` methods; stage 17 exercises the config, lifecycle and health API. 177 of 177 public functions, 366 checks.
 - Fixed races: the chaos leak check now waits for the health monitor's ping to return its connection; the flashback test waits until its timestamp maps behind the current SCN and restores its fixture on failure.
-- 559 tests at 100% line and function coverage.
+- New package check (`bun run test:package`, a CI step in both driver modes): the packed tarball in an empty project, strict `tsc` over the published types, TypeScript under Bun, CommonJS and ES modules under Node, the CLI.
+- 561 tests at 100% line and function coverage.
 
 
 ## [Unreleased] — 2.2.0
