@@ -6,12 +6,14 @@
  *   mira migrate new <name> [--dir migrations]
  *   mira migrate status | up [--to <name>] [--dry-run] | down [--steps n | --to <name> | --all] [--dry-run]
  *
- * Commands that touch the database connect with the appDb credentials (DB_* /
- * APP_DB_* in the environment, or in the .env file given by --env, default
- * ./.env when present).
+ * Commands that touch the database connect with MIRA_DB_USER, MIRA_DB_PASSWORD
+ * and MIRA_DB_CONNECT_STRING (or MIRA_DB_HOST + MIRA_DB_SERVICE), read by
+ * fromEnv() from the environment or from the .env file given by --env
+ * (default ./.env when present).
  */
 import fs from "node:fs";
 import path from "node:path";
+import { setLogger } from "../shared/log";
 
 const USAGE = `Usage:
   mira generate types [--out <file>] [--tables A,B,PREFIX_%] [--import <module>]
@@ -31,7 +33,10 @@ Options:
   --dry-run          print the SQL each migration would run; change nothing
   --table <name>     migration history table (default MIRA_MIGRATIONS)
   --env <file>       .env file to load (default: ./.env if it exists; existing variables win)
-  --verbose          show Mira's log lines (they go to stdout)
+  --verbose          show all of Mira's log lines on stderr (default: warnings and errors only)
+
+Connection: MIRA_DB_USER, MIRA_DB_PASSWORD, and MIRA_DB_CONNECT_STRING
+(or MIRA_DB_HOST + MIRA_DB_SERVICE [+ MIRA_DB_PORT]), from the environment or --env.
 `;
 
 type Args = { command: string[]; flags: Record<string, string> };
@@ -71,21 +76,22 @@ function loadEnv(file: string, required: boolean): void {
   }
 }
 
-type Api = typeof import("../utils/oracle-mongo-wrapper");
+type Api = typeof import("..");
+type MiraDb = import("..").MiraDb;
 const say = (text: string) => process.stdout.write(`${text}\n`);
 
 /** Run `fn` with a db handle; the pool is closed afterwards. */
-async function withDb(flags: Record<string, string>, fn: (api: Api, db: ReturnType<Api["createDb"]>) => Promise<number>): Promise<number> {
+async function withDb(flags: Record<string, string>, fn: (api: Api, db: MiraDb) => Promise<number>): Promise<number> {
   loadEnv(path.resolve(flags.env ?? ".env"), flags.env !== undefined);
-  // The logger writes to stdout, where generated code and reports go: quiet unless --verbose.
-  process.env.ENABLE_CONSOLE_LOGS = flags.verbose ? "true" : "false";
-  // Loaded after the environment is in place: the adapter reads it at load time.
-  const api = require("../utils/oracle-mongo-wrapper") as Api;
-  const db = api.createDb("appDb");
+  // stdout carries generated code and reports. By default only Mira's warnings and errors
+  // reach the console, on stderr; --verbose sends every line there.
+  if (flags.verbose) setLogger({ debug: console.error, info: console.error, warn: console.error, error: console.error });
+  const api = require("..") as Api;
+  const mira = api.createMira(api.fromEnv()); // MIRA_DB_* → the appDb pool
   try {
-    return await fn(api, db);
+    return await fn(api, mira.db());
   } finally {
-    await db.closePool();
+    await mira.close();
   }
 }
 
@@ -106,7 +112,7 @@ async function generateTypes(flags: Record<string, string>): Promise<number> {
 async function migrate(sub: string, rest: string[], flags: Record<string, string>): Promise<number> {
   const dir = path.resolve(flags.dir ?? "migrations");
   if (sub === "new") {
-    const { migrationFileName, migrationTemplate } = require("../utils/oracle-mongo-wrapper/migrate/migrator") as typeof import("../utils/oracle-mongo-wrapper/migrate/migrator");
+    const { migrationFileName, migrationTemplate } = require("../migrate/migrator") as typeof import("../migrate/migrator");
     const file = path.join(dir, migrationFileName(rest.join(" ")));
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(file, migrationTemplate(flags.import));

@@ -3,7 +3,7 @@
  * against the live MIRA schema.
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { OracleCollection, QueryBuilder, Transaction, withCTE, withRecursiveCTE } from "../../src/utils/oracle-mongo-wrapper";
+import { OracleCollection, QueryBuilder, Transaction, withCTE, withRecursiveCTE } from "../../src";
 import { db, coll, createUsers, createOrders, createEmployees, dropIfExists, rawExec, sleep, USERS } from "../helpers/db";
 
 const U = "MIRA_IQ_USERS";
@@ -106,14 +106,30 @@ describe("integration: QueryBuilder terminals", () => {
     if (wait > 0) await sleep(wait);
     const scnRow = await rawExec<{ SCN: number; TS: string }>("SELECT TIMESTAMP_TO_SCN(SYSTIMESTAMP) AS SCN, TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS') AS TS FROM DUAL");
     const { SCN, TS } = scnRow.rows![0];
+    // AS OF TIMESTAMP resolves TS through the SCN↔time map (~3 s granularity), so TS can map
+    // to an SCN after an update made right away. Wait, bounded, until TS maps to an SCN
+    // behind the current one; a fixed 1.5 s sleep lost this race in full runs.
+    const deadline = Date.now() + 15000;
+    for (;;) {
+      const r = await rawExec<{ BEHIND: number }>(
+        "SELECT CASE WHEN TIMESTAMP_TO_SCN(TO_TIMESTAMP(:ts, 'YYYY-MM-DD HH24:MI:SS')) < TIMESTAMP_TO_SCN(SYSTIMESTAMP) THEN 1 ELSE 0 END AS BEHIND FROM DUAL",
+        { ts: TS },
+      );
+      if (Number(r.rows![0].BEHIND) === 1 || Date.now() > deadline) break;
+      await sleep(250);
+    }
     await sleep(1500);
     await users.updateMany({ NAME: "Ana" }, { $set: { CITY: "Changed" } });
-    const past = await new QueryBuilder(U, { NAME: "Ana" }, db, null, { asOf: { scn: SCN } }).next<{ CITY: string }>();
-    expect(past?.CITY).toBe("Manila");
-    const pastTs = await new QueryBuilder(U, { NAME: "Ana" }, db, null, { asOf: { timestamp: TS } }).next<{ CITY: string }>();
-    expect(pastTs?.CITY).toBe("Manila");
-    expect((await users.findOne<{ CITY: string }>({ NAME: "Ana" }))?.CITY).toBe("Changed");
-    await users.updateMany({ NAME: "Ana" }, { $set: { CITY: "Manila" } });
+    try {
+      const past = await new QueryBuilder(U, { NAME: "Ana" }, db, null, { asOf: { scn: SCN } }).next<{ CITY: string }>();
+      expect(past?.CITY).toBe("Manila");
+      const pastTs = await new QueryBuilder(U, { NAME: "Ana" }, db, null, { asOf: { timestamp: TS } }).next<{ CITY: string }>();
+      expect(pastTs?.CITY).toBe("Manila");
+      expect((await users.findOne<{ CITY: string }>({ NAME: "Ana" }))?.CITY).toBe("Changed");
+    } finally {
+      // Restore the fixture even on failure: later suites count Manila rows.
+      await users.updateMany({ NAME: "Ana" }, { $set: { CITY: "Manila" } });
+    }
   }, 30000);
 });
 

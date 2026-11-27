@@ -6,7 +6,7 @@
  * statement fail on cue — no need to break the real database to reach a catch.
  */
 import { EventEmitter } from "node:events";
-import { oracledb } from "../../src/config/adapters/oracle";
+import { oracledb } from "../../src/driver/oracle";
 
 export type ExecCall = { sql: string; binds: unknown; opts: unknown };
 type Handler = (sql: string, binds: unknown) => unknown;
@@ -53,7 +53,7 @@ export function stubConn(handler: Handler = () => { throw oraError(942, "table o
   return conn;
 }
 
-/** A fake db handle (same shape createDb returns) running every callback on `conn`. */
+/** A fake db handle (same shape as mira.db()) running every callback on `conn`. */
 export function stubDb(conn = stubConn()) {
   return {
     connectionName: "stub",

@@ -9,9 +9,11 @@
  * Identifiers are passed upper-case: the wrapper quotes them verbatim, so a
  * lower-case name would create a case-sensitive object.
  */
-import { createDb, OracleCollection, OracleSchema } from "../../src/utils/oracle-mongo-wrapper";
+import { createMira, fromEnv, OracleCollection, OracleSchema } from "../../src";
 
-export const db = createDb("appDb");
+/** The test schema's pool, "appDb", from MIRA_DB_* (CI sets them; locally, .env). */
+export const mira = createMira(fromEnv());
+export const db = mira.db();
 export const schema = new OracleSchema(db);
 export const coll = (name: string) => new OracleCollection(name, db);
 

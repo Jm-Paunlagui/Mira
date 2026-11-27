@@ -1,7 +1,8 @@
 /**
  * TYPE TESTS for model conveniences (Mira 2.1). Checked by `bun run typecheck`, never run.
  */
-import { defineTable, t, relations, hasMany, createDb, type HookContext } from "../../src/utils/oracle-mongo-wrapper";
+import { defineTable, t, relations, hasMany, type HookContext } from "../../src";
+import { db } from "./_db";
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 const assert = <T extends true>(_ok?: T) => {};
@@ -38,9 +39,8 @@ const Plain = defineTable("PLAIN", { ID: t.id(), NAME: t.text(10), CREATED_AT: t
 const Versioned = defineTable("VERSIONED", { ID: t.id(), REV: t.version() });
 assert<Equal<typeof Versioned.$row, { ID: number; REV: number }>>();
 assert<Equal<typeof Versioned.$insert, { REV?: number }>>();
-void Versioned.on(createDb("appDb")).updateOne({ ID: 1, REV: 3 }, { $inc: { REV: 1 } });
+void Versioned.on(db).updateOne({ ID: 1, REV: 3 }, { $inc: { REV: 1 } });
 
-const db = createDb("appDb");
 const posts = Posts.on(db);
 const plain = Plain.on(db);
 

@@ -5,7 +5,7 @@
  * MiraConcurrencyError instead of silently matching nothing.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "bun:test";
-import { defineTable, t, Transaction, MiraConcurrencyError, MiraValidationError } from "../../src/utils/oracle-mongo-wrapper";
+import { defineTable, t, Transaction, MiraConcurrencyError, MiraValidationError } from "../../src";
 import { db, dropIfExists, rawExec } from "../helpers/db";
 
 const D = "MIRA_OL_DOCS";

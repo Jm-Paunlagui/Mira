@@ -7,10 +7,10 @@
  * each is a separate pool in the same schema.
  */
 import { describe, it, expect, afterAll } from "bun:test";
-import { createMira, MiraConfigError, OracleCollection, OracleSchema, OracleDCL, Transaction } from "../../src/utils/oracle-mongo-wrapper";
-import database from "../../src/config/database";
-import config from "../../src/config";
-import { getLogger, setLogger } from "../../src/config/log";
+import { createMira, MiraConfigError, OracleCollection, OracleSchema, OracleDCL, Transaction } from "../../src";
+import database from "../../src/driver/registry";
+import * as config from "../../src/driver/oracle";
+import { getLogger, setLogger } from "../../src/shared/log";
 import { rawExec, dropIfExists } from "../helpers/db";
 
 const T = "MIRA_V3_ITEMS";
@@ -50,7 +50,15 @@ describe("integration: createMira", () => {
     expect(config.isPoolOpen("miraV3Spare")).toBe(false);
 
     // The db handle's closePool() closes this instance, not every pool in the process.
-    await mira.db().closePool();
+    const kept = mira.db();
+    expect(kept.isHealthy()).toBe(true);
+    await kept.closePool();
+    // A handle kept past close() reports unhealthy and refuses work, whatever the call.
+    const closedMsg = "[mira] This Mira instance is closed; create a new one with createMira().";
+    expect(kept.isHealthy()).toBe(false);
+    await expect(kept.withConnection(async () => 1)).rejects.toThrow(closedMsg);
+    await expect(kept.withTransaction(async () => 1)).rejects.toThrow(closedMsg);
+    await expect(kept.withBatchConnection([async () => 1])).rejects.toThrow(closedMsg);
     await mira.close(); // idempotent
     expect(mira.closed).toBe(true);
     expect(config.isPoolOpen("miraV3")).toBe(false);
@@ -83,32 +91,34 @@ describe("integration: createMira", () => {
   });
 
   it("logger option: Mira's lines go to the app logger until close(); conflicts are refused", async () => {
-    const lines: string[] = [];
-    const appLog = { info: (m: string) => void lines.push(`info ${m}`), warn: (m: string) => void lines.push(`warn ${m}`), error: (m: string) => void lines.push(`error ${m}`) };
-    const mira = createMira({ pools: { miraLog: { ...creds, poolMin: 0, poolMax: 1 } }, logger: appLog });
-    expect(getLogger()).toBe(appLog);
-    await mira.db().withConnection(async (c) => c.execute("SELECT 1 FROM DUAL"));
-    expect(lines.some((l) => l.startsWith("info ") && l.includes('"miraLog"'))).toBe(true);
-
-    // Another instance with a different logger is refused and registers nothing; the same logger is fine.
-    expect(() => createMira({ pools: { miraLog2: creds }, logger: console })).toThrow("[mira] Another logger is already set");
-    expect(() => database.getConnectionConfig("miraLog2")).toThrow(/Unknown connection/);
-    const same = createMira({ pools: { miraLog3: creds }, logger: appLog });
-    await same.close();
-    expect(getLogger()).toBe(appLog); // not its to reset
-
-    await mira.close();
-    expect(getLogger()).toBeNull();
-    expect(lines.some((l) => l.includes('Pool "miraLog" closed'))).toBe(true);
-
-    // A logger set by the app itself is left alone by close().
-    setLogger(false);
+    const preload = getLogger(); // the test preload's sink; this test starts from the default
+    setLogger(null);
     try {
+      const lines: string[] = [];
+      const appLog = { info: (m: string) => void lines.push(`info ${m}`), warn: (m: string) => void lines.push(`warn ${m}`), error: (m: string) => void lines.push(`error ${m}`) };
+      const mira = createMira({ pools: { miraLog: { ...creds, poolMin: 0, poolMax: 1 } }, logger: appLog });
+      expect(getLogger()).toBe(appLog);
+      await mira.db().withConnection(async (c) => c.execute("SELECT 1 FROM DUAL"));
+      expect(lines.some((l) => l.startsWith("info ") && l.includes('"miraLog"'))).toBe(true);
+
+      // Another instance with a different logger is refused and registers nothing; the same logger is fine.
+      expect(() => createMira({ pools: { miraLog2: creds }, logger: console })).toThrow("[mira] Another logger is already set");
+      expect(() => database.getConnectionConfig("miraLog2")).toThrow(/Unknown connection/);
+      const same = createMira({ pools: { miraLog3: creds }, logger: appLog });
+      await same.close();
+      expect(getLogger()).toBe(appLog); // not its to reset
+
+      await mira.close();
+      expect(getLogger()).toBeNull();
+      expect(lines.some((l) => l.includes('Pool "miraLog" closed'))).toBe(true);
+
+      // A logger set by the app itself is left alone by close().
+      setLogger(false);
       const quiet = createMira({ pools: { miraLog4: creds }, logger: false });
       await quiet.close();
       expect(getLogger()).toBe(false);
     } finally {
-      setLogger(null);
+      setLogger(preload);
     }
   });
 
@@ -119,6 +129,60 @@ describe("integration: createMira", () => {
     const other = running.mode === "thin" ? "thick" : "thin";
     expect(() => createMira({ pools: { miraDrv2: creds }, driver: { mode: other } })).toThrow(`already initialised as ${running.mode}`);
     expect(() => database.getConnectionConfig("miraDrv2")).toThrow(/Unknown connection/);
+  });
+
+  it("open(), stats() and health are scoped to the instance's own pools", async () => {
+    const mira = createMira({ pools: { miraH: { ...creds, poolMin: 0, poolMax: 1 }, miraH2: { ...creds, poolMin: 0, poolMax: 1 } }, defaultPool: "miraH" });
+    expect(await mira.open()).toEqual([{ name: "miraH", success: true }, { name: "miraH2", success: true }]);
+    await rawExec("SELECT 1 FROM DUAL"); // appDb is open too, but is not this instance's
+    expect(Object.keys((await mira.stats()).pools).sort()).toEqual(["miraH", "miraH2"]);
+    expect(mira.health.isHealthy()).toBe(true);
+    expect(mira.health.isHealthy("miraH2")).toBe(true);
+    expect(mira.health.allHealthy()).toBe(true);
+    expect(() => mira.health.isHealthy("appDb" as "miraH")).toThrow('[mira] Unknown pool "appDb"');
+
+    mira.health.recordProbeSuccess();
+    mira.health.recordProbeSuccess("miraH2");
+    config.recordProbeSuccess("appDb");
+    expect(Object.keys(mira.health.metrics()).sort()).toEqual(["miraH", "miraH2"]);
+    expect(Object.keys((await mira.stats()).healthMetrics).sort()).toEqual(["miraH", "miraH2"]);
+
+    // onCheck: only this instance's pools reach the listener.
+    const checks: Array<{ name: string; ok: boolean }> = [];
+    const offCheck = mira.health.onCheck((c) => void checks.push(c));
+    mira.health.nudge();
+    config.nudgePoolHealth("appDb");
+    for (let i = 0; i < 100 && !checks.some((c) => c.name === "miraH"); i++) await new Promise((r) => setTimeout(r, 50));
+    expect(checks.some((c) => c.name === "miraH" && c.ok)).toBe(true);
+    expect(checks.every((c) => c.name === "miraH" || c.name === "miraH2")).toBe(true);
+    offCheck();
+
+    // onChange: a breaker flip on this instance's pool is reported; another pool's is not.
+    const changes: Array<{ name: string; healthy: boolean }> = [];
+    const offChange = mira.health.onChange((c) => void changes.push(c));
+    config.__setPoolHealthForTest("miraNotMine", false);
+    config.__setPoolHealthForTest("miraH2", false);
+    expect(mira.health.isHealthy("miraH2")).toBe(false);
+    expect(mira.health.allHealthy()).toBe(false);
+    config.__setPoolHealthForTest("miraH2", true);
+    config.__setPoolHealthForTest("miraNotMine", true);
+    expect(changes).toEqual([{ name: "miraH2", healthy: false }, { name: "miraH2", healthy: true }]);
+    offChange();
+    config.__setPoolHealthForTest("miraH2", false);
+    config.__setPoolHealthForTest("miraH2", true);
+    expect(changes).toHaveLength(2); // unsubscribed
+
+    // close() removes listeners still subscribed and turns a watch it started off.
+    const late: unknown[] = [];
+    mira.health.onChange((c) => void late.push(c));
+    mira.health.watch(true);
+    await mira.close();
+    config.__setPoolHealthForTest("miraH2", false);
+    config.__setPoolHealthForTest("miraH2", true);
+    expect(late).toEqual([]);
+    expect(mira.health.isHealthy()).toBe(false);
+    expect(mira.health.allHealthy()).toBe(false);
+    await expect(mira.open()).rejects.toThrow("[mira] This Mira instance is closed");
   });
 
   it("close() after a pool that never came up logs and still unregisters", async () => {

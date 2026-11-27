@@ -4,7 +4,7 @@
  * asserts the CORRECT behaviour; each one failed before its fix.
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { OracleCollection, Transaction, createPerformance, withCTE } from "../../src/utils/oracle-mongo-wrapper";
+import { OracleCollection, Transaction, createPerformance, withCTE } from "../../src";
 import { db, schema, coll, createUsers, createOrders, createEmployees, dropIfExists, rawExec, USERS } from "../helpers/db";
 
 const U = "MIRA_SD_USERS";

@@ -4,10 +4,11 @@
  * The compile-time side is tested in test/types/typedTables.types.ts.
  */
 import { describe, it, expect } from "bun:test";
-import { defineTable, t, TypedTable, generateTableTypes, createDb, OracleCollection, QueryBuilder } from "../../src/utils/oracle-mongo-wrapper";
-import { exportName } from "../../src/utils/oracle-mongo-wrapper/typed/generate";
+import { defineTable, t, TypedTable, generateTableTypes, OracleCollection, QueryBuilder } from "../../src";
+import { createDb } from "../../src/driver/db";
+import { exportName } from "../../src/typed/generate";
 
-const db = createDb("appDb");
+const db = createDb("appDb"); // the test schema pool registered by test/helpers/db.ts
 
 describe("unit: column builders", () => {
   it("each builder's Oracle type", () => {

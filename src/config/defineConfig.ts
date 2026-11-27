@@ -7,9 +7,9 @@
  * would otherwise silently fall back to the default.
  */
 
-import { miraConfigMessages as MSG } from "../constants/messages/miraConfig.messages";
+import { miraConfigMessages as MSG } from "../shared/messages/miraConfig.messages";
 import type { DriverOptions, MiraConfig, PoolConfig, ResolvedMiraConfig } from "./types";
-import { isMiraLogger } from "./log";
+import { isMiraLogger } from "../shared/log";
 
 /** A pool name: a letter, then up to 63 letters, digits or `_`. */
 const POOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
@@ -78,11 +78,12 @@ function checkDriver(driver: unknown, issues: string[]): void {
     return;
   }
   for (const key of Object.keys(driver)) {
-    if (key !== "mode" && key !== "libDir") issues.push(MSG.DRIVER_UNKNOWN_KEY(key));
+    if (key !== "mode" && key !== "libDir" && key !== "binaryDir") issues.push(MSG.DRIVER_UNKNOWN_KEY(key));
   }
   if (driver.mode !== undefined && !DRIVER_MODES.has(driver.mode as string)) issues.push(MSG.DRIVER_MODE_INVALID);
-  if (driver.libDir !== undefined && (typeof driver.libDir !== "string" || driver.libDir.trim() === "")) {
-    issues.push(MSG.DRIVER_LIBDIR_INVALID);
+  for (const key of ["libDir", "binaryDir"] as const) {
+    const v = driver[key];
+    if (v !== undefined && (typeof v !== "string" || v.trim() === "")) issues.push(MSG.DRIVER_DIR_INVALID(key));
   }
 }
 

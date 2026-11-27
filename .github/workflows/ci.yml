@@ -37,14 +37,70 @@ jobs:
       # What npm would publish (prepack rebuilds dist/).
       - run: npm pack --dry-run
 
+  windows:
+    # CATHERINE runs on Windows under Bun, in Thick mode, as a compiled executable.
+    # GitHub's Windows runners cannot run the Oracle service container, so this job
+    # covers what needs no database: type-check, unit tests (and the test runner's
+    # Windows paths), loading Thick mode, and a compiled executable loading it from
+    # binaryDir. The database suites on Windows are run by hand (docs/HANDOVER-WINDOWS.md).
+    name: Windows (Bun, Thick load, compiled executable)
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The unit tests open no connection; fromEnv() still wants the variables.
+      MIRA_DB_USER: ci
+      MIRA_DB_PASSWORD: ci
+      MIRA_DB_CONNECT_STRING: 127.0.0.1:1/NONE
+      MIRA_SKIP_PERSIST: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.5
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+
+      - name: Unit tests (and the scorecard's categories)
+        run: |
+          bun run test:unit | tee unit.log
+          # test/run.ts once split the file path on "/" only, so on Windows every test was "unknown".
+          grep -q "│ unit " unit.log || { echo "scorecard has no 'unit' category"; exit 1; }
+
+      - name: Install Oracle Instant Client (Windows)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://download.oracle.com/otn_software/nt/instantclient/instantclient-basiclite-windows.zip -OutFile "$env:RUNNER_TEMP\ic.zip"
+          Expand-Archive "$env:RUNNER_TEMP\ic.zip" -DestinationPath C:\oracle
+          $ic = (Get-ChildItem C:\oracle -Directory -Filter "instantclient_*" | Select-Object -First 1).FullName
+          "IC_DIR=$ic" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Thick mode loads (libDir)
+        run: |
+          bun -e 'const m = require("./src"); m.configureDriver({ mode: "thick", libDir: process.env.IC_DIR }); const i = m.initDriver(); console.log(i); if (i.mode !== "thick") process.exit(1); process.exit(0);'
+
+      - name: Compiled executable loads Thick mode (binaryDir)
+        run: |
+          bun build .github/windows/exe-smoke.ts --compile --outfile dist-exe/exe-smoke.exe
+          mkdir -p dist-exe/node_modules/oracledb/build/Release
+          cp node_modules/oracledb/build/Release/*win32-x64.node dist-exe/node_modules/oracledb/build/Release/
+          # Run from elsewhere so nothing resolves against the repo; it must exit by itself.
+          cd "$RUNNER_TEMP" && timeout 60 "$GITHUB_WORKSPACE/dist-exe/exe-smoke.exe"
+
   test:
-    name: Oracle 23ai (${{ matrix.driver }} mode)
+    name: Oracle 23ai (${{ matrix.driver }} mode, ${{ matrix.connect }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         driver: [thin, thick]
+        # failover: the TNS descriptor 2.x always used (dedicated server, SELECT failover, whose
+        #   transparent reconnect can hide a dead session). easy: plain Easy Connect, as most 3.0
+        #   apps will connect; a Thick-mode call timeout there really closes the session.
+        connect: [failover, easy]
     services:
       oracle:
         image: gvenzl/oracle-free:23-slim-faststart
@@ -59,25 +115,28 @@ jobs:
           --health-timeout 5s
           --health-retries 30
     env:
-      DB_TYPE: oracle
-      DB_HOST: localhost
-      DB_PORT: "1521"
-      # Mira connects with (SID=...); the listener is told below to accept the PDB name as one.
-      DB_APP_SERVICE_NAME: FREEPDB1
-      APP_DB_USERNAME: MIRA
-      APP_DB_PASSWORD: MiraCi_app_2026
-      APP_TEST_DB_USERNAME: ""
+      # The test schema's pool: fromEnv() → appDb, by the PDB's service name (see matrix.connect).
+      MIRA_DB_USER: MIRA
+      MIRA_DB_PASSWORD: MiraCi_app_2026
+      MIRA_DB_CONNECT_STRING: ${{ matrix.connect == 'easy' && 'localhost:1521/FREEPDB1' || '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=1521))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=FREEPDB1)(FAILOVER_MODE=(TYPE=SELECT)(METHOD=BASIC)(RETRIES=180)(DELAY=5))))' }}
+      MIRA_DB_POOL_MIN: "5"
+      MIRA_DB_POOL_MAX: "20"
+      MIRA_DB_QUEUE_MAX: "40"
+      MIRA_DB_POOL_TIMEOUT: "30"
+      # The simulation's schema; it connects through MIRA_DB_CONNECT_STRING too.
       MIRA_SIM_DB_USERNAME: MIRA_SIM
       MIRA_SIM_DB_PASSWORD: MiraCi_app_2026
       MIRA_SIM_GRANTEE: MIRA
-      ORACLE_INSTANT_CLIENT: ""
-      ENABLE_CONSOLE_LOGS: "false"
       # Thick mode runs every database call on a native worker thread. A call waiting
       # on a row lock holds its thread, so with fewer threads than such calls the lock
       # holder never gets one to commit and the client hangs (seen on this 4-core
       # runner: "concurrent transfers" ran 8 at once). node-oracledb's advice: at
       # least as many threads as pooled connections. Thin mode is unaffected.
       UV_THREADPOOL_SIZE: "32"
+      # Runners are on UTC, where a session that ignores the configured time zone still looks
+      # right. Run in +08:00 (no daylight saving) so a Date that moves by the machine's offset
+      # fails the time-zone tests (Thick mode under Bun did, unseen, until 3.0).
+      TZ: Asia/Manila
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
@@ -88,14 +147,12 @@ jobs:
           node-version: 22
       - run: bun install --frozen-lockfile
 
-      - name: Prepare the database (listener, MIRA and MIRA_SIM schemas)
+      - name: Prepare the database (MIRA and MIRA_SIM schemas)
         env:
           ORACLE: ${{ job.services.oracle.id }}
         run: |
-          # Mira builds (CONNECT_DATA=(SID=...)): let the listener take FREEPDB1 as a SID.
-          docker exec "$ORACLE" bash -c 'echo "USE_SID_AS_SERVICE_LISTENER = ON" >> "$ORACLE_HOME/network/admin/listener.ora" && lsnrctl reload'
           docker cp .github/oracle/setup-users.sql "$ORACLE":/tmp/setup-users.sql
-          docker exec "$ORACLE" sqlplus -s / as sysdba @/tmp/setup-users.sql "$APP_DB_PASSWORD"
+          docker exec "$ORACLE" sqlplus -s / as sysdba @/tmp/setup-users.sql "$MIRA_DB_PASSWORD"
 
       - name: Install Oracle Instant Client (Thick mode)
         if: matrix.driver == 'thick'
@@ -107,7 +164,7 @@ jobs:
           curl -sSLo /tmp/ic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip
           sudo unzip -q /tmp/ic.zip -d /opt/oracle
           IC_DIR=$(ls -d /opt/oracle/instantclient_*)
-          # On Linux the client is found through the library path, not ORACLE_INSTANT_CLIENT.
+          # On Linux the client is found through the library path (configureDriver's default).
           echo "LD_LIBRARY_PATH=$IC_DIR" >> "$GITHUB_ENV"
 
       - name: Test suite (with coverage)
@@ -116,7 +173,7 @@ jobs:
       - name: Driver mode check
         run: |
           # The driver initialises lazily (2.2); initDriver() does it now and reports the mode.
-          bun -e 'const { initDriver } = require("./src/utils/oracle-mongo-wrapper"); const { mode } = initDriver(); console.log("driver mode:", mode); if (mode !== process.env.EXPECTED_MODE) process.exit(1); process.exit(0);'
+          bun -e 'const { initDriver } = require("./src"); const { mode } = initDriver(); console.log("driver mode:", mode); if (mode !== process.env.EXPECTED_MODE) process.exit(1); process.exit(0);'
         env:
           EXPECTED_MODE: ${{ matrix.driver }}
 
@@ -127,3 +184,8 @@ jobs:
         run: |
           bun run build
           node test/node/smoke.cjs
+
+      - name: Package check (the packed tarball in an empty project)
+        # Strict tsc over the published .d.ts, then TypeScript under Bun and CommonJS / ES
+        # modules under Node, with no .env and no MIRA_* variables (see test/package/run.sh).
+        run: bun run test:package

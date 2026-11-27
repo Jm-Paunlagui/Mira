@@ -1,11 +1,11 @@
-# Oracle MongoDB-Style Wrapper Library
+# Mira
 
 Write MongoDB-style JavaScript. Get Oracle SQL. Never write raw SQL again.
 
 ```
-Your JavaScript Code (MongoDB-style)
+Your JavaScript / TypeScript (MongoDB-style)
         ↓
-oracle-mongo-wrapper (this library)
+Mira
         ↓
 Oracle SQL with bind variables (safe from SQL injection)
         ↓
@@ -13,14 +13,22 @@ Oracle Database
 ```
 
 > **This guide is organized by difficulty.** Start from the top. Each section builds on the previous one.
+>
+> **Upgrading from 2.x?** See [docs/MIGRATION-3.0.md](docs/MIGRATION-3.0.md).
 
 ---
 
 ## Table of Contents
 
 - [Setup](#setup)
-    - [Prerequisites — Database Configuration](#prerequisites--database-configuration)
-    - [Imports & Connection](#imports--connection)
+    - [Install](#install)
+    - [Connect](#connect)
+    - [Pool options](#pool-options)
+    - [Several pools](#several-pools)
+    - [Health and readiness](#health-and-readiness)
+    - [Config from environment variables](#config-from-environment-variables)
+    - [Thin or Thick mode](#thin-or-thick-mode)
+    - [Logging](#logging)
     - [Typed Tables (2.1)](#typed-tables-21)
     - [Relations and include (2.1)](#relations-and-include-21)
     - [JSON Columns (2.1)](#json-columns-21)
@@ -40,219 +48,159 @@ Oracle Database
 
 ## Setup
 
+### Install
+
 Mira runs on **Node.js 20+** and on **Bun 1.4+**. Install it from npm (it brings `oracledb`):
 
 ```bash
 npm install @jm-paunlagui/mira    # or: bun add @jm-paunlagui/mira
 ```
 
-```js
-const { createDb, OracleCollection } = require("@jm-paunlagui/mira"); // CommonJS
-// import { createDb, OracleCollection } from "@jm-paunlagui/mira";   // TypeScript / ESM
-```
+The package ships compiled CommonJS with `.d.ts` types, so editors and `tsc` type-check your calls. `import { … } from "@jm-paunlagui/mira"` and `require("@jm-paunlagui/mira")` both work; everything public is on the package root.
 
-The package ships compiled JavaScript with `.d.ts` types, so editors and `tsc` type-check your calls.
+### Connect
 
-**Loading `.env`.** Bun reads `.env` by itself. Node does not: start it with `node --env-file=.env app.js` (Node 20.6+), or call `require("dotenv").config()` before you first use Mira. Mira reads `DB_*` / `APP_DB_*` from `process.env` when a pool is first created.
-
-**Thin or Thick mode.** By default (`"auto"`) Mira tries node-oracledb Thick mode first, from `ORACLE_INSTANT_CLIENT` or any Oracle Client on the system library path, and falls back to Thin mode. Choose it yourself with `configureDriver({ mode: "thin" | "thick" | "auto", libDir })` or the `driver` option of `createMira()`, before the first pool opens. `"thick"` fails instead of falling back. Importing Mira initialises nothing; the driver is set up when the first pool opens, or when you call `initDriver()` (it returns `{ mode, clientVersion }`, so call it at startup to fail fast). The log says which mode loaded. Both modes are tested in CI.
-
-> ⚠️ **Thick mode needs enough worker threads.** In Thick mode every database call runs on a native worker thread from a small pool (`UV_THREADPOOL_SIZE`; Node's default is 4, and Bun's depends on the machine: a 4-core GitHub runner hung where a 12-core PC did not). A call waiting on a row lock keeps its thread. If more calls wait at once than there are threads, the transaction holding the lock never gets a thread to commit, and the process hangs with no error. Set `UV_THREADPOOL_SIZE` to at least your largest `poolMax` (Mira's default `APP_POOL_MAX` is 20) **in the environment before the process starts**, e.g. `UV_THREADPOOL_SIZE=24 node app.js`. Setting it in code after startup has no effect. Thin mode does not use these threads. When Thick mode creates a pool whose `poolMax` is above the thread count, Mira logs a warning naming both numbers.
-
-**Session time zone.** Mira opens every session at UTC (`ORA_SDTZ=+00:00`, set before the Oracle client loads) in both modes. Thin mode does this by itself. In Thick mode the client used the operating system's zone, and a JS `Date` written to a `TIMESTAMP WITH TIME ZONE` or `TIMESTAMP WITH LOCAL TIME ZONE` column moved by that zone's offset. `CURRENT_TIMESTAMP` and `LOCALTIMESTAMP` in your own SQL are therefore UTC; `SYSTIMESTAMP` / `SYSDATE` (the database server's clock) are unchanged. To choose another session zone, set `ORA_SDTZ` yourself. Use a numeric offset such as `+08:00`: a region name such as `Asia/Manila` needs the client's time-zone file, and an older client on a newer server fails with `ORA-01805`.
-
-Working from a clone of this repository instead, `bun run build` writes the same package to `dist/`.
-
-### Config object: `createMira()` (new in 2.2, the 3.0 entry point)
-
-Pass your pools in as values. Mira reads no environment variable for them, so credentials can come from anywhere: `.env`, a secrets manager, or a config file. Name as many pools as you need.
+Pass your pools to `createMira()`. Mira reads no environment variable, writes no file and initialises no driver until you use it, so the credentials can come from anywhere: `.env`, a secrets manager, a config file.
 
 ```ts
 import { createMira } from "@jm-paunlagui/mira";
 
 const mira = createMira({
-  pools: {
-    appDb:     { user: "APP", password: secret, connectString: "db-host:1521/APP", poolMax: 20, queueMax: 40 },
-    reporting: { user: "RPT", password: rptSecret, connectString: "rpt-host:1521/RPT", poolMax: 10 },
-  },
-  defaultPool: "appDb", // required with more than one pool
+    pools: {
+        appDb: { user: "APP", password: secret, connectString: "db-host:1521/ORCLPDB1", poolMin: 2, poolMax: 10 },
+    },
 });
 
-const users = mira.collection("USERS");                // appDb
-const sales = mira.collection("SALES", "reporting");   // pool names are type-checked
-const schema = mira.schema();                          // also: mira.dcl(), mira.transaction(), mira.db()
+const db = mira.db();                    // the db handle every example in this guide uses
+const users = mira.collection("USERS");  // same as new OracleCollection("USERS", db)
+const schema = mira.schema();            // also: mira.dcl(), mira.transaction()
 
-await mira.close(); // closes this instance's pools only
+// On shutdown: close this instance's pools.
+process.on("SIGTERM", () => void mira.close());
 ```
 
-- Pool options: `user`, `password`, `connectString` (required), and `poolMin`, `poolMax`, `poolIncrement`, `queueMax`, `queueTimeout` (ms), `poolTimeout` (s), `connectTimeout` (ms), `poolPingInterval` (s), `stmtCacheSize`. Left-out options use Mira's pool defaults.
-- A bad config throws one `MiraConfigError` listing every problem (`err.issues`). Unknown keys are refused, so a typo such as `poolmax` is not silently ignored. Messages name keys, never values.
-- `mira.db()` returns the same handle `createDb()` does, so it works with everything that takes one (`new OracleCollection(name, db)`, `defineTable(...).on(db)` and so on).
-- Pools open on first use. A name already open in the process (for example `appDb` after `createDb("appDb")` was used) is refused.
-- `driver: { mode, libDir }` picks Thin or Thick mode (see below). It is process-wide: once the first pool has opened, only a setting compatible with the running driver is accepted.
-- `logger` sends Mira's log lines to your logger: any object with `info`, `warn` and `error` (and optionally `debug`), such as `console` or pino. `false` silences Mira. Without it, Mira uses its own logger, which writes files under `./logs`. The logger is process-wide too, and `close()` puts the default back. `setLogger(logger)` does the same for apps on `createDb()`.
+- Pools open on first use. Call `await mira.db().withConnection((c) => c.ping())` at startup to fail fast.
+- `connectString` takes Easy Connect (`host:port/service_name`), a TNS descriptor, or a tnsnames alias. `buildSimpleConnectString(host, port, service)` and `buildTNSConnectString(host, port, sid)` (two addresses, load balancing, SELECT failover) build the common forms.
+- `mira.db()` is the handle the rest of the API takes: `new OracleCollection(name, db)`, `Orders.on(db)`, `new Transaction(db)`, `createPerformance(db)`, `createMigrator(db)` …. Its type is exported as `MiraDb`. After `mira.close()` a kept handle reports `isHealthy() === false` and refuses work.
 
-**From environment variables, if you want them.** `fromEnv()` reads `MIRA_DB_USER`, `MIRA_DB_PASSWORD` and `MIRA_DB_CONNECT_STRING` (or `MIRA_DB_HOST` + `MIRA_DB_SERVICE` + `MIRA_DB_PORT`) plus optional `MIRA_DB_POOL_MAX`, `MIRA_DB_QUEUE_MAX`, … into one pool, `appDb`. Give more pools their own prefixes:
+### Pool options
+
+| Option | Default | |
+| --- | --- | --- |
+| `user`, `password`, `connectString` | required | |
+| `poolMin` | 10 | Connections kept open. Oracle holds a server process for each, idle or not: keep it small. |
+| `poolMax` | 50 | Most connections. Size it by concurrent operations: each `withConnection` call borrows one. |
+| `poolIncrement` | 5 | Connections opened at a time when the pool grows. |
+| `queueMax` | 40 | Most callers waiting for a connection; one more fails at once with NJS-076. `0` disables queuing. |
+| `queueTimeout` | 15000 | Milliseconds a caller waits in the queue (NJS-040). `0` waits forever. |
+| `poolTimeout` | 30 | Seconds an idle connection above `poolMin` stays open. `0` keeps it. |
+| `connectTimeout` | 15000 | Milliseconds to open one connection (Thin mode). |
+| `poolPingInterval` | 30 | Seconds idle before a connection is pinged on checkout; negative never pings. |
+| `stmtCacheSize` | 50 | Statements cached per connection. |
+
+A config that cannot work throws one `MiraConfigError` listing every problem (`err.issues`), before anything connects. Unknown keys are refused, so a typo such as `poolmax` is not silently ignored. Messages name keys, never values. `defineConfig(config)` runs the same checks and returns the config frozen, for apps that build it in one place and use it in another.
+
+### Several pools
+
+Name as many pools as you need; with more than one, say which is the default. Pool names are type-checked from the config's keys.
+
+```ts
+const mira = createMira({
+    pools: {
+        appDb:     { user: "APP", password: appSecret, connectString: "db-host:1521/APP", poolMax: 20, queueMax: 40 },
+        appDbBulk: { user: "APP", password: appSecret, connectString: "db-host:1521/APP", poolMin: 1, poolMax: 6, queueTimeout: 30000 },
+        reporting: { user: "RPT", password: rptSecret, connectString: "rpt-host:1521/RPT", poolMax: 10 },
+    },
+    defaultPool: "appDb",
+});
+
+mira.collection("ORDERS");                 // appDb
+mira.collection("SALES", "reporting");     // reporting
+await mira.transaction("appDbBulk").withReadOnlyTransaction(async (s) => s.collection("ORDERS").countDocuments());
+```
+
+A separate pool for long-held work (exports, bulk loads) keeps it from starving interactive traffic. Several `createMira()` instances can live in one process, each closing only its own pools; two live instances cannot use the same pool name.
+
+### Health and readiness
+
+Each open pool is pinged by a health monitor (every 30 s; every 5 s while one is failing, or while watched). Three failed checks open that pool's circuit breaker: `withConnection` then fails fast with `NJS-503` until a check, or your own probe, succeeds. A Mira instance sees only its own pools:
+
+```ts
+const results = await mira.open();          // open every pool now: [{ name, success, error? }]; a pool that fails is reported, not thrown
+const ready = mira.health.allHealthy();      // or mira.health.isHealthy("reporting")
+const usage = await mira.stats();            // { pools: { appDb: { connectionsOpen, connectionsInUse, queueLength, … } }, healthMetrics }
+
+const off = mira.health.onChange(({ name, healthy }) => notify(name, healthy));   // breaker flips
+mira.health.onCheck(({ name, ok }) => record(name, ok));                       // every check
+mira.health.watch(true);                     // check every 5 s while, say, a readiness stream has listeners
+mira.health.recordProbeSuccess("appDb");     // your own probe reached the pool: close its breaker now
+mira.health.nudge("appDb");                  // check soon, outside the cadence
+```
+
+`close()` removes the listeners an instance added and turns off a watch it started.
+
+### Config from environment variables
+
+`fromEnv()` reads a config from variables, if you want them. One pool, `appDb`, under the prefix `MIRA_DB`:
+
+| Variable | |
+| --- | --- |
+| `MIRA_DB_USER`, `MIRA_DB_PASSWORD` | required |
+| `MIRA_DB_CONNECT_STRING` | or `MIRA_DB_HOST` + `MIRA_DB_SERVICE` (+ `MIRA_DB_PORT`, default 1521) |
+| `MIRA_DB_POOL_MIN`, `_POOL_MAX`, `_POOL_INCREMENT`, `_QUEUE_MAX`, `_QUEUE_TIMEOUT`, `_POOL_TIMEOUT`, `_CONNECT_TIMEOUT`, `_POOL_PING_INTERVAL`, `_STMT_CACHE_SIZE` | optional whole numbers |
+| `MIRA_DRIVER_MODE`, `MIRA_DRIVER_LIB_DIR` | optional, see [Thin or Thick mode](#thin-or-thick-mode) |
 
 ```ts
 import { createMira, fromEnv } from "@jm-paunlagui/mira";
 
-const mira = createMira(fromEnv());                                   // MIRA_DB_* → appDb
+const mira = createMira(fromEnv());   // MIRA_DB_* → appDb
 const both = createMira(fromEnv({ pools: { appDb: "MIRA_DB", reporting: "MIRA_RPT" }, defaultPool: "appDb" }));
+const fromFile = createMira(fromEnv({ env: parsedSecrets }));   // any object, not only process.env
 ```
 
-`MIRA_DRIVER_MODE` and `MIRA_DRIVER_LIB_DIR` set the driver option when present. A missing variable or a number that does not parse throws, naming the variable. `createDb()` and the 2.x variables below still work unchanged.
+A missing variable or a number that does not parse throws, naming the variable. Bun reads `.env` by itself; Node does not: start it with `node --env-file=.env app.js` (Node 20.6+), or load it yourself first. `.env.example` lists every variable.
 
-### Prerequisites — Database Configuration
+### Thin or Thick mode
 
-Before using `oracle-mongo-wrapper`, you need 3 config files and a `.env` file. These handle connection pooling, credentials, and adapter selection so the wrapper can talk to Oracle.
-
-```
-src/config/
-├── adapters/
-│   └── oracle.ts       ← Pool management: creates/reuses connection pools,
-│                          withConnection(), withTransaction(), health monitoring
-├── database.ts          ← Connection registry: maps names like "appDb"
-│                          to { user, password, connectString } credentials
-└── index.ts             ← Adapter factory: exports everything from the active
-                           adapter + database.ts as one unified import
-```
-
-**How it flows:**
-
-```
-.env  →  database.ts (reads credentials)  →  oracle.ts (creates pools)  →  config/index.ts (exports API)
-                                                                                    ↓
-                                                                           oracle-mongo-wrapper/db.ts
-                                                                           createDb("appDb")
-```
-
-#### Step 1 — Set Up Your `.env` File
-
-Copy `.env.example` to `.env` and fill in your Oracle details. The essentials:
-
-```env
-DB_TYPE=oracle
-DB_HOST=your-oracle-host.example.com
-DB_PORT=1521
-# Used as the Oracle SID: (CONNECT_DATA=(SID=<value>)). Typical SIDs: XE, ORCL.
-DB_APP_SERVICE_NAME=ORCL
-
-# Credentials shared by the appDb and appDbBulk pools
-APP_DB_USERNAME=your_schema_user
-APP_DB_PASSWORD=your_schema_password
-
-# Optional: Instant Client directory for Thick mode. Blank = Mira still tries
-# an Oracle Client found on the system PATH, and uses Thin mode only if none loads.
-# The startup log line "oracledb driver loaded (Thick|Thin mode)" shows which one ran.
-ORACLE_INSTANT_CLIENT=
-```
-
-Pool sizing (`APP_POOL_*`, `APP_BULK_*`) and logging (`LOG_*`) are documented in `.env.example`.
-
-**Test database (optional):** with `NODE_ENV=development` and `APP_TEST_DB_USERNAME` set, both pools connect with `APP_TEST_DB_USERNAME` / `APP_TEST_DB_PASSWORD` instead. `DB_TEST_HOST` / `DB_TEST_PORT` / `DB_TEST_SID` fall back to the main values, so a test schema on the same server needs only its credentials.
-
-#### Step 2 — Register Connections in `database.ts`
-
-Each connection gets a name and its credentials from `.env`. You never hardcode passwords here — only `process.env` references. Two pools ship, on the same credentials:
-
-- **`appDb`** — interactive work; the default for `createDb("appDb")`.
-- **`appDbBulk`** — long-held work (exports, backups, bulk loads) so it cannot starve `appDb`.
+node-oracledb runs in Thin mode (pure JavaScript) or Thick mode (through an Oracle Client). The mode is process-wide and fixed when the first pool opens.
 
 ```ts
-// src/config/database.ts (already set up — add new connections as needed)
-
-const connections = {
-    appDb: {
-        ...appDbCredentials, // APP_DB_USERNAME / APP_DB_PASSWORD / DB_HOST:DB_PORT, SID DB_APP_SERVICE_NAME
-        poolMin: parseInt(process.env.APP_POOL_MIN ?? "", 10) || 5,
-        poolMax: parseInt(process.env.APP_POOL_MAX ?? "", 10) || 20,
-        queueMax: parseInt(process.env.APP_QUEUE_MAX ?? "", 10) || 40,
-        poolTimeout: nonNegativeInt(process.env.APP_POOL_TIMEOUT, 30),
-    },
-
-    appDbBulk: { ...appDbCredentials, poolMin: 1, poolMax: 6 /* APP_BULK_* in .env */ },
-
-    // Add more connections as needed:
-    // reportingDb: {
-    //     user:          process.env.RPT_DB_USERNAME,
-    //     password:      process.env.RPT_DB_PASSWORD,
-    //     connectString: buildSimpleConnectString(
-    //         process.env.RPT_DB_HOST,
-    //         process.env.RPT_DB_PORT,
-    //         process.env.RPT_DB_SERVICE_NAME,
-    //     ),
-    //     poolMax: 10, // optional — override default pool size
-    // },
-};
+createMira({ pools, driver: { mode: "thick", libDir: "/opt/oracle/instantclient_23" } });
+// or, before any pool opens: configureDriver({ mode: "thin" });
+const { mode, clientVersion } = initDriver();   // set the driver up now; returns what loaded
 ```
 
-> **To add a new connection:** Add env vars to `.env`, add one entry to `connections`, then use `createDb("yourNewName")`. No other file needs to change.
+- `"auto"` (default): try Thick mode from `libDir` or the system library path, fall back to Thin. Without a client this is an ordinary Thin start.
+- `"thin"`: never load an Oracle Client.
+- `"thick"`: load the Oracle Client or throw. Thick mode supports every password verifier; Thin mode rejects some older ones (e.g. 0x939).
+- `binaryDir`: where node-oracledb's Thick binary is, when it is not beside the installed package, e.g. staged next to a `bun build --compile` executable.
+- Once the driver is up, a setting compatible with it is accepted and a different one throws.
 
-#### Step 3 — The Adapter (`oracle.ts`) Handles the Rest
+> ⚠️ **Thick mode needs enough worker threads.** In Thick mode every database call runs on a native worker thread from a small pool (`UV_THREADPOOL_SIZE`; Node's default is 4, and Bun's depends on the machine: a 4-core GitHub runner hung where a 12-core PC did not). A call waiting on a row lock keeps its thread. If more calls wait at once than there are threads, the transaction holding the lock never gets a thread to commit, and the process hangs with no error. Set `UV_THREADPOOL_SIZE` to at least your largest `poolMax` **in the environment before the process starts**, e.g. `UV_THREADPOOL_SIZE=24 node app.js`. Setting it in code after startup has no effect. Thin mode does not use these threads. When Thick mode creates a pool whose `poolMax` is above the thread count, Mira logs a warning naming both numbers.
 
-You don't need to edit `oracle.ts` — it automatically:
+**Session time zone.** node-oracledb writes a JS `Date` in the process's time zone and Oracle reads it in the session's, so Mira opens every pooled session in the process's zone: its region (e.g. `Asia/Manila`) in Thin mode, its UTC offset in Thick mode. A `Date` then keeps its instant in every date column type, under Node and Bun. `CURRENT_TIMESTAMP` and `LOCALTIMESTAMP` in your own SQL are in that zone; `SYSTIMESTAMP` / `SYSDATE` (the database server's clock) are unchanged. To choose another session zone, set `ORA_SDTZ` yourself, to the same zone as the process (`TZ`), or Dates move by the difference; a value that is not an offset, a region, `LOCAL` or `DBTIMEZONE` is refused with a warning. **Thick mode in a zone with daylight saving:** the session takes the offset in force when it opens (a region would make the client fetch with its own time-zone file, which fails with `ORA-01805` when it differs from the server's), so a `Date` from the other season moves by an hour. Run such a process on UTC (`TZ=UTC`).
 
-- Creates connection pools on first use (lazy initialization)
-- Retries failed connections up to 3 times with exponential backoff
-- Monitors pool health in the background
-- Releases connections automatically after each operation
-- Handles graceful shutdown
+### Logging
 
-**Key pool defaults** (configurable per-connection in `database.ts`):
+By default Mira writes only warnings (`console.warn`) and errors (`console.error`), prefixed `[mira]`, and never a file. Send its lines to your own logger, or silence them:
 
-| Setting          | Default | What it means                          |
-| ---------------- | ------- | -------------------------------------- |
-| `poolMin`        | 10      | Minimum connections kept open          |
-| `poolMax`        | 50      | Maximum connections allowed            |
-| `poolIncrement`  | 5       | How many to add when pool is exhausted |
-| `poolTimeout`    | 30s     | Idle connection timeout                |
-| `connectTimeout` | 15s     | Max wait to establish a connection     |
-| `queueMax`       | 40      | Acquire-queue depth before NJS-076     |
-| `callTimeout`    | 60s     | Documentation only: node-oracledb ignores it at pool level; set `conn.callTimeout` per connection |
-| `stmtCacheSize`  | 50      | Cached prepared statements per conn    |
-
-#### Step 4 — `config/index.ts` Ties It Together
-
-This file auto-detects the adapter from `DB_TYPE` env var (defaults to `"oracle"`) and exports everything:
-
-```js
-// src/config/index.ts — you usually don't need to edit this
-// It exports: withConnection, withTransaction, withBatchConnection,
-//             closeAll, getPoolStats, isPoolHealthy, getConnectionConfig,
-//             oracledb, and more.
+```ts
+createMira({ pools, logger: console });   // everything: pool lifecycle notices too
+createMira({ pools, logger: pino() });    // any object with info, warn and error (debug optional)
+createMira({ pools, logger: false });     // nothing
+setLogger(myLogger);                      // the same, process-wide, without an instance
 ```
 
-The wrapper's `db.ts` imports from this file, so when you call `createDb("appDb")`, it flows through:
-`createDb() → config/index.ts → config/adapters/oracle.ts → database.ts credentials → Oracle pool`
+Mira's levels map onto yours: pool-lifecycle detail → `debug`, notices → `info`, warnings → `warn`, failures → `error`. The logger is process-wide; a second, different logger is refused while another instance's is set, and `close()` puts the default back.
 
-### Imports & Connection
-
-```js
-// Import what you need
-const {
-    createDb,
-    OracleCollection,
-    OracleSchema,
-    OracleDCL,
-    Transaction,
-    withCTE,
-    withRecursiveCTE,
-    createPerformance,
-} = require("@jm-paunlagui/mira");
-
-// Connect to your database pool (configured in src/config/database.ts)
-const db = createDb("appDb");
-```
-
-That's it. `db` is your gateway to everything.
+Working from a clone of this repository instead, `bun run build` writes the same package to `dist/`.
 
 ### Typed Tables (2.1)
 
 Describe a table once and TypeScript checks every query on it: filter keys and values, inserts, updates, sorts and projections. The row types follow what Mira really returns.
 
 ```ts
-import { defineTable, t, createDb, Transaction } from "@jm-paunlagui/mira";
+import { defineTable, t, Transaction } from "@jm-paunlagui/mira";
 
 export const Orders = defineTable("ORDERS", {
     ID: t.id(),                                   // NUMBER identity PK: Oracle assigns it
@@ -264,7 +212,7 @@ export const Orders = defineTable("ORDERS", {
 });
 export type Order = typeof Orders.$row;          // { ID: number; TOTAL: string; NOTE: string | null; … }
 
-const db = createDb("appDb");
+const db = mira.db();                            // from Setup → Connect
 const orders = Orders.on(db);                    // a typed collection (the same OracleCollection underneath)
 
 await orders.insertOne({ CUSTOMER_ID: 7, TOTAL: 9.5 });      // ID, NOTE, STATUS, CREATED_AT may be left out
@@ -308,7 +256,7 @@ npx mira generate types --tables ORDERS,CUSTOMERS,SIM_%         # names, or LIKE
 bun run mira generate types --import ../my-mira-path            # in this repository
 ```
 
-The command reads `DB_*` / `APP_DB_*` from the environment or from `.env` (`--env <file>` to pick another), and writes one `defineTable()` and one `…Row` type per table. In code: `await generateTableTypes(db, { tables, importFrom })` returns the same source text. CHECK constraints and multi-column keys are not written; they do not change the row types.
+The command connects with `MIRA_DB_*` (see [Config from environment variables](#config-from-environment-variables)) from the environment or from `.env` (`--env <file>` to pick another), and writes one `defineTable()` and one `…Row` type per table. In code: `await generateTableTypes(db, { tables, importFrom })` returns the same source text. CHECK constraints and multi-column keys are not written; they do not change the row types.
 
 ### Relations and include (2.1)
 
@@ -1050,6 +998,64 @@ await employees.aggregate([
 ]);
 ```
 
+#### `select` — Avoid ORA-00918 When Tables Share Column Names
+
+When two tables have a column with the same name (e.g. both have `USERID`), the default
+`SELECT left.*, right.*` produces a duplicate column in the result set. Oracle then raises
+**ORA-00918: column ambiguously defined** when a later `$project` references that column.
+
+Use `select` to list only the columns you need from the **right-hand (joined) table**.
+The left table is always included in full.
+
+```js
+// Without select — raises ORA-00918 if T_USERS and T_USER_PROFILES both have USERID
+await users.aggregate([
+    { $match: { USERID: "48022603" } },
+    {
+        $lookup: {
+            from: "T_USER_PROFILES",
+            localField: "USERID",
+            foreignField: "USERID",
+            as: "pi",
+            joinType: "left",
+            // ← no select: both tables expose USERID → ambiguous
+        },
+    },
+    { $project: { USERID: 1, EMAILADDRESS: 1 } }, // ORA-00918 ❌
+]);
+
+// With select — only EMAILADDRESS is pulled from T_USER_PROFILES
+await users.aggregate([
+    { $match: { USERID: "48022603" } },
+    {
+        $lookup: {
+            from: "T_USER_PROFILES",
+            localField: "USERID",
+            foreignField: "USERID",
+            as: "pi",
+            joinType: "left",
+            select: ["EMAILADDRESS"], // ← pull only this column from the right side
+        },
+    },
+    { $project: { USERID: 1, EMAILADDRESS: 1 } }, // unambiguous
+]);
+```
+
+Generated SQL comparison:
+
+```sql
+-- Without select (ambiguous USERID):
+SELECT "stage_0".*, "pi".*
+FROM "stage_0" LEFT OUTER JOIN "T_USER_PROFILES" "pi" ON "stage_0"."USERID" = "pi"."USERID"
+
+-- With select: ["EMAILADDRESS"] (no duplicate columns):
+SELECT "stage_0".*, "pi"."EMAILADDRESS"
+FROM "stage_0" LEFT OUTER JOIN "T_USER_PROFILES" "pi" ON "stage_0"."USERID" = "pi"."USERID"
+```
+
+> **Rule of thumb:** Any time the joined table shares a column name with the left table,
+> use `select` to list only the columns you actually need from the right side.
+
 ### Transactions with Savepoints
 
 Transactions ensure **all-or-nothing** execution. If anything fails, everything rolls back.
@@ -1786,11 +1792,11 @@ await employees.merge(
 
 ## Testing
 
-The suite runs on `bun test` against a real Oracle schema (the `appDb` connection in `.env`). It is split into six categories, one folder each under `test/`:
+The suite runs on `bun test` against a real Oracle schema: the `appDb` pool that `test/helpers/db.ts` builds with `createMira(fromEnv())`, so set `MIRA_DB_*` in `.env`. It is split into six categories, one folder each under `test/`:
 
 | Category | What it proves |
 | --- | --- |
-| `unit` | SQL builders, error paths (stub connections), config, and the adapter (stub driver: pool lifecycle, retries, health monitor, shutdown) |
+| `unit` | SQL builders, error paths (stub connections), config validation, `fromEnv`, the pool registry, the log sink, and the adapter (stub driver: pool lifecycle, retries, health monitor, shutdown) |
 | `integration` | Every collection, query, transaction, DDL, DCL and performance-utility method against the live schema |
 | `performance` | Throughput / latency floors; numbers recorded per run |
 | `chaos` | Dead host, bad credentials, pool exhaustion, cancelled calls, dropped connections, deadlocks, injected mid-transaction crashes, fuzzed filters |
@@ -1799,7 +1805,7 @@ The suite runs on `bun test` against a real Oracle schema (the `appDb` connectio
 
 ```bash
 bun run test            # all six categories
-bun run test:coverage   # + coverage (threshold 100% lines/functions for src/config and the wrapper)
+bun run test:coverage   # + coverage (threshold 100% lines and functions for everything under src/)
 bun run test:unit       # or :integration / :performance / :chaos / :security / :reliability
 ```
 
@@ -1809,7 +1815,8 @@ bun run test:unit       # or :integration / :performance / :chaos / :security / 
 
 **Continuous integration.** `.github/workflows/ci.yml` runs on every push and pull request:
 - **Build:** type-check, `bun run build`, and `npm pack --dry-run`.
-- **Live tests:** against an Oracle Database Free 23ai container (`gvenzl/oracle-free`), once in **Thin** mode and once in **Thick** mode (Instant Client installed on the runner). Each run does the full suite with coverage, the simulation, and `test/node/smoke.cjs`, which loads the built package under plain Node.
+- **Live tests:** against an Oracle Database Free 23ai container (`gvenzl/oracle-free`), once in **Thin** mode and once in **Thick** mode (Instant Client installed on the runner). Each run does the full suite with coverage, the simulation, `test/node/smoke.cjs` (the built package under plain Node), and the package check below.
+- **Package check** (`bun run test:package`): packs the tarball, installs it into an empty project with no `.env` and no `MIRA_*` variables, type-checks a TypeScript app strictly (the published `.d.ts` files included), runs it under Bun, runs a CommonJS and an ES-module app under Node, and runs the `mira` CLI. It needs `PKG_DB_USER` / `PKG_DB_PASSWORD` / `PKG_DB_CONNECT_STRING`, or copies them from `MIRA_DB_*`.
 - **Setup:** the job creates the `MIRA` and `MIRA_SIM` schemas with `.github/oracle/setup-users.sql`.
 
 To run the Node smoke test yourself: `bun run build && node --env-file=.env test/node/smoke.cjs`.
@@ -1832,7 +1839,10 @@ To run the Node smoke test yourself: `bun run build && node --env-file=.env test
 12. **Kitchen production:** multi-level recipes (bill of materials): explosion, where-used, MRP net requirements, cost roll-up, cycle detection
 13. **Finance:** FX at the rate in force, loan and depreciation schedules checked against the ledger, `CUBE` / `GROUPING SETS`, an allocation exact to the cent
 14. **Audit:** Benford, journals without lines, split payments
-15. **Operations:** pool stats, health, shutdown
+15. **Members:** a typed model table: timestamps, soft delete and restore, audit hooks, validation, optimistic locking
+16. **Exports:** keyset-paged and streamed exports, raw SQL, query events
+17. **Config:** a second service with its own pool: `createMira`, `fromEnv`, `defineConfig`, the driver mode, its own logger
+18. **Operations:** pool stats, health, shutdown
 
 Every business query runs through Mira's API (50 of 50 today). A query Mira could not express would run as hand-written SQL, still be checked, and be listed at the end as a **coverage gap** with the reason, so any new gap shows up as a measured item for what Mira should support next.
 
@@ -1848,10 +1858,10 @@ MIRA_SIM_DB_USERNAME=MIRA_SIM
 MIRA_SIM_DB_PASSWORD=<password>
 ```
 
-The simulation drops and rebuilds its `SIM_*` objects on every run. It refuses to start when `MIRA_SIM_DB_USERNAME` is the app or test schema, or when the connection is not that user.
+The simulation drops and rebuilds its `SIM_*` objects on every run. It refuses to start when `MIRA_SIM_DB_USERNAME` is the test schema (`MIRA_DB_USER`), or when the connection is not that user.
 
-- **`MIRA_SIM_DB_HOST` / `_PORT` / `_SID`:** default to the main `DB_*` values.
-- **`MIRA_SIM_GRANTEE`:** the schema the DCL checks grant to (default `APP_DB_USERNAME`).
+- **Connection:** `MIRA_SIM_DB_CONNECT_STRING`, else a TNS descriptor from `MIRA_SIM_DB_HOST` / `_PORT` / `_SID`, else the main `MIRA_DB_*` connection.
+- **`MIRA_SIM_GRANTEE`:** the schema the DCL checks grant to (default `MIRA_DB_USER`).
 - **`MIRA_SIM_KEEP=1`:** leaves the `SIM_*` objects in place for inspection.
 - **`MIRA_LOGS=1`:** shows Mira's own logs.
 
@@ -1861,4 +1871,4 @@ Unlike `bun test`, which always runs with `TZ=UTC`, the simulation runs in the m
 
 `sim/RESEARCH.md` collects the Oracle 19c query research (a catalog from basic to expert, plus accounting and inventory patterns), a map of what SQL Mira's API can express, the defects confirmed so far, and the plan for growing the simulation.
 
-## Apache License 2.0 © 2026 John Moises Paunlagui. All rights reserved. See LICENSE.txt for details.
+## Apache License 2.0 © 2026 John Moises Paunlagui. All rights reserved. See LICENSE for details.

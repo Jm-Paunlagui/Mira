@@ -39,8 +39,8 @@ interface PoolConfig {
 
 /**
  * How node-oracledb runs. Process-wide: the first pool fixes it.
- * - `"auto"` (default, the 2.x behaviour): try Thick mode from `libDir`,
- *   ORACLE_INSTANT_CLIENT or the system library path; fall back to Thin.
+ * - `"auto"` (default): try Thick mode from `libDir` or
+ *   the system library path; fall back to Thin.
  * - `"thin"`: never load an Oracle Client.
  * - `"thick"`: load the Oracle Client or fail.
  */
@@ -48,8 +48,14 @@ type DriverMode = "auto" | "thin" | "thick";
 
 interface DriverOptions {
   mode?: DriverMode;
-  /** Oracle Instant Client directory for Thick mode. Default: ORACLE_INSTANT_CLIENT, then the system library path. */
+  /** Oracle Instant Client directory for Thick mode. Default: the system library path. */
   libDir?: string;
+  /**
+   * Where node-oracledb's Thick binary (oracledb/build/Release) is, when it is not
+   * beside the installed package — e.g. staged next to a `bun build --compile`
+   * executable, whose baked-in paths point at the build machine.
+   */
+  binaryDir?: string;
 }
 
 /**
@@ -72,7 +78,7 @@ interface MiraConfig<P extends string = string> {
   defaultPool?: NoInfer<P>;
   /** Thin / Thick mode. Left out: whatever configureDriver() set, else "auto". */
   driver?: DriverOptions;
-  /** Log sink; `false` silences Mira. Left out: Mira's own logger (files under ./logs). */
+  /** Log sink; `false` silences Mira. Left out: the console, warnings and errors only. */
   logger?: MiraLogger | false;
 }
 

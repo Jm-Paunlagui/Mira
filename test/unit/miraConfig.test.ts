@@ -1,9 +1,6 @@
 /**
- * UNIT — the createMira() config layer: defineConfig (src/config/defineConfig.ts),
- * fromEnv (src/config/fromEnv.ts) and the runtime registry added to
- * src/config/database.ts (registerConnection / unregisterConnection).
- * Registry tests use a fresh copy of database.ts so the shared registry the
- * adapter reads is never touched here.
+ * UNIT — the createMira() config layer: defineConfig (src/config/defineConfig.ts)
+ * and fromEnv (src/config/fromEnv.ts). The pool registry is in registry.test.ts.
  */
 import { describe, it, expect } from "bun:test";
 import { defineConfig, MiraConfigError } from "../../src/config/defineConfig";
@@ -149,7 +146,8 @@ describe("unit: fromEnv", () => {
     try {
       Object.assign(process.env, { MIRA_PE_USER: "U", MIRA_PE_PASSWORD: "P", MIRA_PE_CONNECT_STRING: "h:1/s" });
       expect(fromEnv({ pools: { pe: "MIRA_PE" } }).pools.pe.user).toBe("U");
-      expect(() => fromEnv()).toThrow(MiraConfigError); // no MIRA_DB_* in the test env
+      expect(fromEnv().poolNames).toEqual(["appDb"]); // the suite's own MIRA_DB_* (test/helpers/db.ts)
+      expect(() => fromEnv({ pools: { none: "MIRA_NOT_SET_ANYWHERE" } })).toThrow(MiraConfigError);
     } finally {
       for (const k of ["MIRA_PE_USER", "MIRA_PE_PASSWORD", "MIRA_PE_CONNECT_STRING"]) if (saved[k] === undefined) delete process.env[k];
     }
@@ -195,40 +193,5 @@ describe("unit: fromEnv", () => {
 
   it("parsed numbers still go through defineConfig's ranges", () => {
     expect(issuesOf(() => fromEnv({ env: { ...base, MIRA_DB_POOL_MAX: "0" } }))).toEqual(["pools.appDb.poolMax must be an integer >= 1"]);
-  });
-});
-
-describe("unit: runtime connection registry", () => {
-  it("register adds a pool; unregister removes it", async () => {
-    const m = await import("../../src/config/database.ts?registry-add");
-    m.registerConnection("extraDb", { user: "u", password: "p", connectString: "h:1/s", poolMax: 3 });
-    expect(m.getConnectionConfig("extraDb").poolMax).toBe(3);
-    expect(m.getConnectionNames()).toEqual(["appDb", "appDbBulk", "extraDb"]);
-    expect(m.POOL_NAMES).toEqual(["appDb", "appDbBulk"]);
-    expect(() => m.registerConnection("extraDb", {})).toThrow('Connection "extraDb" is already registered by a live createMira() instance. Close that instance first.');
-    expect(m.unregisterConnection("extraDb")).toBe(true);
-    expect(m.unregisterConnection("extraDb")).toBe(false);
-    expect(() => m.getConnectionConfig("extraDb")).toThrow(/Unknown connection "extraDb"/);
-  });
-
-  it("a built-in name is shadowed, then restored; built-ins cannot be unregistered", async () => {
-    const m = await import("../../src/config/database.ts?registry-shadow");
-    const original = m.getConnectionConfig("appDbBulk");
-    m.registerConnection("appDbBulk", { user: "mine", password: "p", connectString: "h:1/s" });
-    expect(m.getConnectionConfig("appDbBulk").user).toBe("mine");
-    expect(m.unregisterConnection("appDbBulk")).toBe(true);
-    expect(m.getConnectionConfig("appDbBulk")).toBe(original);
-    expect(m.unregisterConnection("appDb")).toBe(false);
-    expect(m.getConnectionConfig("appDb")).toBeDefined();
-  });
-
-  it("refuses bad names; lookups see own keys only", async () => {
-    const m = await import("../../src/config/database.ts?registry-names");
-    for (const bad of ["", "1x", "a-b", "__proto__", 5 as unknown as string]) {
-      expect(() => m.registerConnection(bad, {})).toThrow(/^Invalid connection name/);
-    }
-    for (const inherited of ["constructor", "toString", "hasOwnProperty"]) {
-      expect(() => m.getConnectionConfig(inherited)).toThrow(`Unknown connection "${inherited}"`);
-    }
   });
 });

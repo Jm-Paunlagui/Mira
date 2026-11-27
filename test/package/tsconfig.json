@@ -1,0 +1,13 @@
+{
+    // The consumer project's own settings: strict, and the package's .d.ts files are checked too.
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "nodenext",
+        "moduleResolution": "nodenext",
+        "strict": true,
+        "skipLibCheck": false,
+        "noEmit": true,
+        "types": ["node"]
+    },
+    "files": ["app.ts"]
+}

@@ -6,12 +6,12 @@
  *   bun run build && node --env-file=.env test/node/smoke.cjs
  *
  * Node does not read .env by itself (Bun does): pass --env-file, or set the
- * DB_* / APP_DB_* variables in the environment as CI does.
+ * MIRA_DB_* variables in the environment as CI does.
  */
 "use strict";
 const assert = require("node:assert/strict");
 const sdtzBefore = process.env.ORA_SDTZ;
-const { createDb, createMira, initDriver, buildTNSConnectString, OracleCollection, OracleSchema } = require("@jm-paunlagui/mira");
+const { createMira, fromEnv, initDriver, OracleCollection } = require("@jm-paunlagui/mira");
 // Importing the package initialises nothing: no session time zone, no Oracle Client.
 assert.equal(process.env.ORA_SDTZ, sdtzBefore, "import must not touch ORA_SDTZ");
 
@@ -23,9 +23,10 @@ async function main() {
 
   const driver = initDriver();
   assert.ok(driver.mode === "thin" || driver.mode === "thick");
-  const db = createDb("appDb");
-  const schema = new OracleSchema(db);
-  const t = new OracleCollection(T, db);
+  const app = createMira(fromEnv()); // MIRA_DB_* → appDb
+  const schema = app.schema();
+  const t = app.collection(T);
+  assert.ok(t instanceof OracleCollection);
   await schema.dropTable(T, { ifExists: true });
   try {
     await schema.createTable(T, { ID: { type: "NUMBER", primaryKey: true }, CITY: { type: "VARCHAR2(20)" }, AMT: { type: "NUMBER(12,2)" }, NOTE: { type: "CLOB" } });
@@ -42,22 +43,22 @@ async function main() {
     assert.equal(Number(g.N), 3);
     assert.equal(Number(g.TOTAL), 60.75);
 
-    // createMira(): a pool passed in as a config object, closed on its own.
-    const env = process.env;
+    // A second instance with its own pool, closed on its own; appDb keeps serving.
     const mira = createMira({
-      pools: { nodeSmoke: { user: env.APP_DB_USERNAME, password: env.APP_DB_PASSWORD, connectString: buildTNSConnectString(env.DB_HOST, env.DB_PORT, env.DB_APP_SERVICE_NAME), poolMin: 0, poolMax: 1 } },
+      pools: { nodeSmoke: { ...app.config.pools.appDb, poolMin: 0, poolMax: 1 } },
       driver: { mode: driver.mode },
       logger: false,
     });
     assert.equal(await mira.collection(T).countDocuments(), 3);
     await mira.close();
     assert.equal(mira.closed, true);
+    assert.equal(await t.countDocuments(), 3);
 
-    const mode = db.oracledb.oracleClientVersion ? "Thick" : "Thin";
+    const mode = app.db().oracledb.oracleClientVersion ? "Thick" : "Thin";
     console.log(`node smoke OK (${process.version}, ${mode} mode)`);
   } finally {
     await schema.dropTable(T, { ifExists: true });
-    await db.closePool();
+    await app.close();
   }
 }
 

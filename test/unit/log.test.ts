@@ -1,18 +1,35 @@
 /**
- * UNIT — src/config/log.ts: the adapter's log sink. Default is Mira's own
- * logger; setLogger swaps in an app logger (levels mapped) or silence.
- * Every test puts the default back: the sink is process-wide.
+ * UNIT — src/shared/log.ts: Mira's log sink. Default is the console, warnings
+ * and errors only; setLogger swaps in an app logger (levels mapped) or silence.
+ * The sink is process-wide, so each test starts from the default and puts back
+ * what the test preload set.
  */
-import { describe, it, expect, afterEach } from "bun:test";
-import { log, setLogger, getLogger, isMiraLogger } from "../../src/config/log";
-import { logger as miraOwn } from "../../src/utils/logger";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { log, setLogger, getLogger, isMiraLogger } from "../../src/shared/log";
 
-afterEach(() => setLogger(null));
+const preload = getLogger();
+beforeEach(() => setLogger(null));
+afterEach(() => setLogger(preload));
 
 describe("unit: log sink", () => {
-  it("defaults to Mira's own logger object (so its call-site capture still works)", () => {
+  it("defaults to the console: warnings and errors only, prefixed; no files", () => {
     expect(getLogger()).toBeNull();
-    expect(log()).toBe(miraOwn as never);
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    const info = spyOn(console, "info").mockImplementation(() => {});
+    const plain = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      log().info("pool creating");
+      log().notice("pool ready");
+      log().warning("retrying", { n: 1 });
+      log().critical("down");
+      expect(warn.mock.calls).toEqual([["[mira]", "retrying", { n: 1 }]]);
+      expect(error.mock.calls).toEqual([["[mira]", "down"]]);
+      expect(info).not.toHaveBeenCalled();
+      expect(plain).not.toHaveBeenCalled();
+    } finally {
+      for (const s of [warn, error, info, plain]) s.mockRestore();
+    }
   });
 
   it("maps adapter levels onto an app logger: info→debug, notice→info, warning→warn, critical→error", () => {
@@ -41,8 +58,10 @@ describe("unit: log sink", () => {
     setLogger(false);
     expect(getLogger()).toBe(false);
     for (const lvl of ["info", "notice", "warning", "critical"] as const) expect(log()[lvl]("x")).toBeUndefined();
+    const sinkWhenFalse = log();
     setLogger(null);
-    expect(log()).toBe(miraOwn as never);
+    expect(log()).not.toBe(sinkWhenFalse);
+    expect(getLogger()).toBeNull();
   });
 
   it("refuses anything that is not a logger", () => {

@@ -3,8 +3,8 @@
  * demand, against stub connections, plus the new-file helpers.
  */
 import { describe, it, expect } from "bun:test";
-import { createMigrator } from "../../src/utils/oracle-mongo-wrapper";
-import { migrationFileName, migrationTemplate } from "../../src/utils/oracle-mongo-wrapper/migrate/migrator";
+import { createMigrator } from "../../src";
+import { migrationFileName, migrationTemplate } from "../../src/migrate/migrator";
 
 /** A db whose connection runs `onExecute` for each statement. */
 const stubDb = (onExecute: (sql: string) => unknown) =>

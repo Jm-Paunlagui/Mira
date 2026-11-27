@@ -1,5 +1,5 @@
 /**
- * UNIT — src/config/adapters/oracle.ts driven by a scriptable stub driver.
+ * UNIT — src/driver/oracle.ts driven by a scriptable stub driver.
  *
  * Each scenario loads a FRESH copy of the adapter (`import("…oracle.ts?tag")`)
  * with a stub `oracledb` placed in require.cache, so pool creation, acquire
@@ -10,18 +10,12 @@
  * delays (30 s health ticks, 5 s cool-downs, 30 s shutdown guard) to
  * milliseconds while a test needs them to fire.
  */
-import { describe, it, expect, beforeAll, afterAll, mock } from "bun:test";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import database from "../../src/config/database";
-import * as liveRuntime from "../../src/utils/runtimePaths";
-import { logger } from "../../src/utils/logger";
-import * as realAdapter from "../../src/config/adapters/oracle";
+import { describe, it, expect, beforeAll, afterAll } from "bun:test";
+import database from "../../src/driver/registry";
+import { setLogger, getLogger } from "../../src/shared/log";
+import * as realAdapter from "../../src/driver/oracle";
 
-type Adapter = typeof import("../../src/config/adapters/oracle");
-// Snapshot: mock.module rewrites the live namespace, so restoring from it would keep IS_COMPILED: true.
-const realRuntime = { ...liveRuntime };
+type Adapter = typeof import("../../src/driver/oracle");
 const realOracledb = realAdapter.oracledb;
 const realSetTimeout = globalThis.setTimeout;
 const wait = (ms: number) => new Promise((r) => realSetTimeout(r, ms));
@@ -80,14 +74,12 @@ function makeDriver(extra: Record<string, unknown> = {}) {
 // ── fresh-instance loader ──────────────────────────────────────────────────────
 const oracledbKey = require.resolve("oracledb");
 let seq = 0;
-async function loadAdapter(driver: unknown, opts: { compiled?: boolean } = {}): Promise<Adapter> {
+async function loadAdapter(driver: unknown): Promise<Adapter> {
   const saved = require.cache[oracledbKey];
   require.cache[oracledbKey] = { id: oracledbKey, filename: oracledbKey, loaded: true, exports: driver } as never;
-  if (opts.compiled) mock.module("../../src/utils/runtimePaths", () => ({ ...realRuntime, IS_COMPILED: true }));
   try {
-    return (await import(`../../src/config/adapters/oracle.ts?fresh=${++seq}`)) as Adapter;
+    return (await import(`../../src/driver/oracle.ts?fresh=${++seq}`)) as Adapter;
   } finally {
-    if (opts.compiled) mock.module("../../src/utils/runtimePaths", () => ({ ...realRuntime }));
     require.cache[oracledbKey] = saved;
   }
 }
@@ -112,64 +104,48 @@ afterAll(async () => {
 });
 
 // ── load-time branches ─────────────────────────────────────────────────────────
-describe("unit/adapter: driver loading and Oracle client environment", () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mira-ic-"));
-  const envBackup = { ORACLE_INSTANT_CLIENT: process.env.ORACLE_INSTANT_CLIENT, PATH: process.env.PATH };
+describe("unit/adapter: driver loading and Oracle client", () => {
+  const envClient = process.env.ORACLE_INSTANT_CLIENT;
   afterAll(() => {
-    process.env.ORACLE_INSTANT_CLIENT = envBackup.ORACLE_INSTANT_CLIENT;
-    process.env.PATH = envBackup.PATH;
-    fs.rmSync(tmp, { recursive: true, force: true });
+    if (envClient === undefined) delete process.env.ORACLE_INSTANT_CLIENT;
+    else process.env.ORACLE_INSTANT_CLIENT = envClient;
   });
 
-  it("validateOracleClient: unset, missing dir, missing DLLs, complete install (both DLL names)", () => {
-    delete process.env.ORACLE_INSTANT_CLIENT;
-    expect(A.validateOracleClient()).toBe(false);
-    process.env.ORACLE_INSTANT_CLIENT = path.join(tmp, "nope");
-    expect(A.validateOracleClient()).toBe(false);
-    process.env.ORACLE_INSTANT_CLIENT = tmp;
-    expect(A.validateOracleClient()).toBe(false);
-    fs.writeFileSync(path.join(tmp, "oci.dll"), "");
-    fs.writeFileSync(path.join(tmp, "oraociei.dll"), "");
-    expect(A.validateOracleClient()).toBe(true);
-    fs.writeFileSync(path.join(tmp, "oraociei23.dll"), "");
-    expect(A.validateOracleClient()).toBe(true);
-  });
-
-  it("setupOracleEnvironment prepends the client dir to PATH exactly once", () => {
-    process.env.ORACLE_INSTANT_CLIENT = tmp;
-    process.env.PATH = "/usr/bin";
-    A.setupOracleEnvironment();
-    expect(process.env.PATH).toBe(`${tmp};/usr/bin`);
-    A.setupOracleEnvironment();
-    expect(process.env.PATH).toBe(`${tmp};/usr/bin`);
-    delete process.env.PATH;
-    process.env.ORACLE_INSTANT_CLIENT = tmp + "x";
-    A.setupOracleEnvironment();
-    process.env.ORACLE_INSTANT_CLIENT = tmp;
-    A.setupOracleEnvironment();
-    expect(process.env.PATH).toBe(`${tmp};`);
-    process.env.PATH = envBackup.PATH;
-  });
-
-  it("Thick mode: valid ORACLE_INSTANT_CLIENT → initOracleClient({ libDir })", async () => {
-    process.env.ORACLE_INSTANT_CLIENT = tmp;
+  it("auto: importing touches nothing; initDriver tries the system library path once; ORACLE_INSTANT_CLIENT is not read", async () => {
+    process.env.ORACLE_INSTANT_CLIENT = "/env/should/not/be/read";
     let got: unknown;
     const a = await loadAdapter(makeDriver({ initOracleClient: (o: unknown) => { got = o; } }));
     expect(got).toBeUndefined(); // importing the adapter no longer touches the driver
     expect(a.initDriver()).toEqual({ mode: "thin" }); // the stub reports no client version
-    expect(got).toEqual({ libDir: tmp });
+    expect(got).toEqual({});
     expect(a.initDriver()).toBe(a.initDriver()); // once per process
     await a.closeAll();
   });
 
-  it("Thick mode from PATH when no valid client dir; non-NJS-077 init errors are logged, not thrown", async () => {
-    delete process.env.ORACLE_INSTANT_CLIENT;
+  it("auto: the system path again; non-NJS-077 init errors are logged, not thrown", async () => {
     let got: unknown = "unset";
     const a = await loadAdapter(makeDriver({ initOracleClient: (o: unknown) => { got = o; } }));
     a.initDriver();
     expect(got).toEqual({});
-    const b = await loadAdapter(makeDriver({ initOracleClient: () => { throw new Error("DPI-1047: cannot locate a 64-bit Oracle Client library"); } }));
-    expect(b.initDriver().mode).toBe("thin");
+    // No client: an ordinary Thin start, so a one-line notice, not a warning. A libDir that fails is a warning.
+    const before = getLogger();
+    const seen: string[] = [];
+    setLogger({ info: (m: string) => void seen.push(`info ${m}`), warn: (m: string) => void seen.push(`warn ${m}`), error() {} });
+    let b: Adapter;
+    try {
+      const dpi = () => { throw new Error("DPI-1047: cannot locate a 64-bit Oracle Client library\nNode-oracledb installation instructions: …"); };
+      b = await loadAdapter(makeDriver({ initOracleClient: dpi }));
+      expect(b.initDriver().mode).toBe("thin");
+      const withDir = await loadAdapter(makeDriver({ initOracleClient: dpi }));
+      withDir.configureDriver({ libDir: "/opt/missing" });
+      expect(withDir.initDriver().mode).toBe("thin");
+    } finally {
+      setLogger(before);
+    }
+    expect(seen.filter((l) => /Oracle Client|Oracle client/.test(l))).toEqual([
+      "info No Oracle Client on the library path; using Thin mode (DPI-1047: cannot locate a 64-bit Oracle Client library).",
+      "warn Oracle client init from /opt/missing failed; using Thin mode: DPI-1047: cannot locate a 64-bit Oracle Client library\nNode-oracledb installation instructions: …",
+    ]);
     const c = await loadAdapter(makeDriver({ oracleClientVersion: 1903000000 }));
     expect(c.initDriver()).toEqual({ mode: "thick", clientVersion: 1903000000 });
     expect(c.oracledb.oracleClientVersion).toBe(1903000000);
@@ -184,48 +160,6 @@ describe("unit/adapter: driver loading and Oracle client environment", () => {
     expect(() => a.initDriver()).toThrow("driver exploded"); // not cached: retried next time
   });
 
-  it("compiled exe: reads .env from the working directory (existing keys win)", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mira-env-"));
-    fs.writeFileSync(path.join(dir, ".env"), "# comment\n\nNOEQUALS\nMIRA_COMPILED_PROBE = yes\nAPP_DB_USERNAME=should-not-override\n");
-    const cwd = process.cwd();
-    const userBefore = process.env.APP_DB_USERNAME;
-    process.chdir(dir);
-    try {
-      delete process.env.MIRA_COMPILED_PROBE;
-      // The existing value is whatever this machine set (.env locally, the job env in CI).
-      process.env.APP_DB_USERNAME = "existing-user";
-      const a = await loadAdapter(makeDriver(), { compiled: true });
-      expect(process.env.MIRA_COMPILED_PROBE).toBe("yes");
-      expect(process.env.APP_DB_USERNAME).toBe("existing-user");
-      await a.closeAll();
-    } finally {
-      process.chdir(cwd);
-      process.env.APP_DB_USERNAME = userBefore;
-      delete process.env.MIRA_COMPILED_PROBE;
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("compiled exe: unreadable .env is skipped and the absence is reported; connect string is collapsed", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mira-env-"));
-    fs.mkdirSync(path.join(dir, ".env")); // exists, but reading it throws EISDIR
-    const cwd = process.cwd();
-    process.chdir(dir);
-    let seen = "";
-    try {
-      const a = await loadAdapter(
-        makeDriver({ async createPool(cfg: { connectString: string; poolAlias: string }) { seen = cfg.connectString; return { poolAlias: cfg.poolAlias, getConnection: async () => conn(), close: async () => {} }; } }),
-        { compiled: true },
-      );
-      register("s_compiled", {}, { connectString: "  (DESCRIPTION=\n   (ADDRESS=x))  " });
-      await a.withConnection("s_compiled", async () => 1);
-      expect(seen).toBe("(DESCRIPTION= (ADDRESS=x))");
-      await a.closeAll();
-    } finally {
-      process.chdir(cwd);
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
 });
 
 // ── pure helpers ───────────────────────────────────────────────────────────────
@@ -260,17 +194,17 @@ describe("unit/adapter: pure helpers", () => {
 
 // ── pool lifecycle ─────────────────────────────────────────────────────────────
 describe("unit/adapter: pool creation", () => {
-  it("missing credentials throw; dev-mode placeholder only warns", async () => {
+  it("missing credentials throw, in every environment", async () => {
     register("s_nopw", {}, { password: "" });
     await expect(A.withConnection("s_nopw", async () => 1)).rejects.toThrow(/Missing config fields for "s_nopw": password/);
     const env = process.env.NODE_ENV;
     process.env.NODE_ENV = "development";
-    register("s_placeholder", {}, { user: "placeholder_user", password: "", connectString: "" });
-    scripts.placeholder_user = {};
-    expect(await A.withConnection("s_placeholder", async () => "ran")).toBe("ran");
-    process.env.NODE_ENV = env;
-    register("s_prodplaceholder", {}, { user: "placeholder_x", password: "" });
-    await expect(A.withConnection("s_prodplaceholder", async () => 1)).rejects.toThrow(/Missing config fields/);
+    try {
+      register("s_placeholder", {}, { user: "placeholder_user", password: "", connectString: "" });
+      await expect(A.withConnection("s_placeholder", async () => "ran")).rejects.toThrow(/Missing config fields for "s_placeholder": password, connectString/);
+    } finally {
+      process.env.NODE_ENV = env;
+    }
   });
 
   it("unknown pool name is refused", async () => {
@@ -321,7 +255,7 @@ describe("unit/adapter: pool creation", () => {
     expect(byName.appDb).toBe(true);
     expect(byName.s_njs116).toBe(false);
     expect(byName.s_njs046).toBe(false);
-    for (const n of ["s_njs116", "s_njs046", "s_dead", "s_nopw", "s_prodplaceholder", "s_placeholder"]) delete conns[n];
+    for (const n of ["s_njs116", "s_njs046", "s_dead", "s_nopw", "s_placeholder"]) delete conns[n];
     const ok = await B.initializePools();
     expect(ok.every((r) => r.success)).toBe(true);
     await B.closeAll();
@@ -551,15 +485,12 @@ describe("unit/adapter: health monitor and circuit breaker", () => {
     register("s_throwcheck", { getConnection: async () => { if (warm) return conn(); throw new Error("ORA-12541"); } });
     await A.withConnection("s_throwcheck", async () => 1);
     warm = false;
-    const realWarning = logger.warning;
+    const before = getLogger();
     let thrown = 0;
-    (logger as { warning: unknown }).warning = (...a: unknown[]) => {
-      if (thrown++ === 0) throw new Error("logger down");
-      return (realWarning as (...x: unknown[]) => unknown).apply(logger, a);
-    };
+    setLogger({ info() {}, warn: () => { if (thrown++ === 0) throw new Error("logger down"); }, error() {} });
     A.nudgePoolHealth("s_throwcheck"); // check fails → its failure log throws → checkPool rejects → _runCheck logs it
     await wait(50);
-    (logger as { warning: unknown }).warning = realWarning;
+    setLogger(before);
     expect(thrown).toBeGreaterThan(1);
     A.setPoolHealthWatched(false);
     timeScale = 1;
@@ -636,13 +567,13 @@ describe("unit/adapter: stats and shutdown", () => {
 
 describe("unit/adapter: Thick-mode safety (2.1)", () => {
   const captureWarnings = async (fn: () => Promise<void>) => {
-    const real = logger.warning;
+    const before = getLogger();
     const seen: string[] = [];
-    (logger as { warning: unknown }).warning = (msg: unknown) => void seen.push(String(msg));
+    setLogger({ info() {}, warn: (msg: string) => void seen.push(String(msg)), error() {} });
     try {
       await fn();
     } finally {
-      (logger as { warning: unknown }).warning = real;
+      setLogger(before);
     }
     return seen;
   };
@@ -656,21 +587,13 @@ describe("unit/adapter: Thick-mode safety (2.1)", () => {
     }
   };
 
-  it("sets ORA_SDTZ=+00:00 before the client loads, unless it is already set", async () => {
-    await withEnv({ ORA_SDTZ: undefined }, async () => {
-      const a = await loadAdapter(makeDriver());
-      expect(process.env.ORA_SDTZ).toBeUndefined(); // not at import
-      a.initDriver();
-      expect(process.env.ORA_SDTZ).toBe("+00:00");
-    });
-    await withEnv({ ORA_SDTZ: "  " }, async () => {
-      (await loadAdapter(makeDriver())).initDriver();
-      expect(process.env.ORA_SDTZ).toBe("+00:00");
-    });
-    await withEnv({ ORA_SDTZ: "-05:00" }, async () => {
-      (await loadAdapter(makeDriver())).initDriver();
-      expect(process.env.ORA_SDTZ).toBe("-05:00");
-    });
+  it("never writes ORA_SDTZ (forcing +00:00 moved Dates on a process not on UTC)", async () => {
+    for (const value of [undefined, "  ", "-05:00"]) {
+      await withEnv({ ORA_SDTZ: value }, async () => {
+        (await loadAdapter(makeDriver())).initDriver();
+        expect(process.env.ORA_SDTZ).toBe(value);
+      });
+    }
   });
 
   it("warns when a Thick-mode pool can outgrow UV_THREADPOOL_SIZE; never in Thin mode", async () => {
@@ -704,9 +627,6 @@ describe("unit/adapter: driver mode — configureDriver / initDriver (2.2)", () 
     const d = makeDriver({ initOracleClient: (o: unknown) => void calls.push(o), ...extra });
     return { d: d as typeof d & { fetchTypeHandler?: unknown; fetchArraySize?: number }, calls };
   };
-  const envClient = process.env.ORACLE_INSTANT_CLIENT;
-  const restoreClient = () => (envClient === undefined ? delete process.env.ORACLE_INSTANT_CLIENT : (process.env.ORACLE_INSTANT_CLIENT = envClient));
-
   it("thin: never loads an Oracle Client; driver-wide settings apply at init, not import", async () => {
     const { d, calls } = spyDriver();
     const a = await loadAdapter(d);
@@ -728,41 +648,35 @@ describe("unit/adapter: driver mode — configureDriver / initDriver (2.2)", () 
     await a.closeAll();
   });
 
-  it("thick: libDir, else ORACLE_INSTANT_CLIENT, else the system path; NJS-077 is fine, other errors throw", async () => {
-    try {
-      process.env.ORACLE_INSTANT_CLIENT = "/env/ic";
-      let x = spyDriver();
-      let a = await loadAdapter(x.d);
-      a.configureDriver({ mode: "thick" });
-      a.initDriver();
-      expect(x.calls).toEqual([{ libDir: "/env/ic" }]);
+  it("thick: libDir, else the system path; NJS-077 is fine, other errors throw", async () => {
+    let x = spyDriver();
+    let a = await loadAdapter(x.d);
+    a.configureDriver({ mode: "thick", libDir: "/opt/ic" });
+    a.initDriver();
+    expect(x.calls).toEqual([{ libDir: "/opt/ic" }]);
 
-      delete process.env.ORACLE_INSTANT_CLIENT;
-      x = spyDriver();
-      a = await loadAdapter(x.d);
-      a.configureDriver({ mode: "thick" });
-      a.initDriver();
-      expect(x.calls).toEqual([{}]);
+    x = spyDriver();
+    a = await loadAdapter(x.d);
+    a.configureDriver({ mode: "thick" });
+    a.initDriver();
+    expect(x.calls).toEqual([{}]);
 
-      x = spyDriver({ oracleClientVersion: 2300000000 });
-      a = await loadAdapter(x.d);
-      a.configureDriver({ mode: "thick" });
-      expect(a.initDriver()).toEqual({ mode: "thick", clientVersion: 2300000000 });
-      expect(x.calls).toEqual([]); // already loaded
+    x = spyDriver({ oracleClientVersion: 2300000000 });
+    a = await loadAdapter(x.d);
+    a.configureDriver({ mode: "thick" });
+    expect(a.initDriver()).toEqual({ mode: "thick", clientVersion: 2300000000 });
+    expect(x.calls).toEqual([]); // already loaded
 
-      a = await loadAdapter(makeDriver()); // stub init throws NJS-077
-      a.configureDriver({ mode: "thick" });
-      expect(a.initDriver().mode).toBe("thin");
+    a = await loadAdapter(makeDriver()); // stub init throws NJS-077
+    a.configureDriver({ mode: "thick" });
+    expect(a.initDriver().mode).toBe("thin");
 
-      a = await loadAdapter(makeDriver({ initOracleClient: () => { throw new Error("DPI-1047: no client"); } }));
-      a.configureDriver({ mode: "thick", libDir: "/nope" });
-      expect(() => a.initDriver()).toThrow("DPI-1047: no client");
-    } finally {
-      restoreClient();
-    }
+    a = await loadAdapter(makeDriver({ initOracleClient: () => { throw new Error("DPI-1047: no client"); } }));
+    a.configureDriver({ mode: "thick", libDir: "/nope" });
+    expect(() => a.initDriver()).toThrow("DPI-1047: no client");
   });
 
-  it("auto with libDir: passed as is, no Windows DLL check", async () => {
+  it("auto with libDir: passed as is", async () => {
     const { d, calls } = spyDriver();
     const a = await loadAdapter(d);
     a.configureDriver({ mode: "auto", libDir: "/opt/instantclient_23" });
@@ -770,10 +684,25 @@ describe("unit/adapter: driver mode — configureDriver / initDriver (2.2)", () 
     expect(calls).toEqual([{ libDir: "/opt/instantclient_23" }]);
   });
 
+  it("binaryDir (compiled executables) is passed to initOracleClient in every Thick path", async () => {
+    let x = spyDriver();
+    let a = await loadAdapter(x.d);
+    a.configureDriver({ mode: "thick", libDir: "/ic", binaryDir: "/app/oracledb" });
+    a.initDriver();
+    expect(x.calls).toEqual([{ libDir: "/ic", binaryDir: "/app/oracledb" }]);
+    x = spyDriver();
+    a = await loadAdapter(x.d);
+    a.configureDriver({ binaryDir: "/app/oracledb" }); // auto, no client dir → system path
+    a.initDriver();
+    expect(x.calls).toEqual([{ binaryDir: "/app/oracledb" }]);
+    a.configureDriver({ binaryDir: "/app/oracledb" });
+    expect(() => a.configureDriver({ binaryDir: "/elsewhere" })).toThrow("already initialised as thin (binaryDir /app/oracledb); it cannot change to auto (binaryDir /elsewhere)");
+  });
+
   it("configureDriver validates; after init it accepts compatible options only", async () => {
     const a = await loadAdapter(makeDriver({ oracleClientVersion: 2300000000 }));
-    expect(() => a.configureDriver({ mode: "fast" as "thin", libDir: "", extra: 1 } as never)).toThrow(
-      '[mira] Invalid config:\n  - driver.extra is not a driver option\n  - driver.mode must be "auto", "thin" or "thick"\n  - driver.libDir must be a non-empty string',
+    expect(() => a.configureDriver({ mode: "fast" as "thin", libDir: "", binaryDir: 3, extra: 1 } as never)).toThrow(
+      '[mira] Invalid config:\n  - driver.extra is not a driver option\n  - driver.mode must be "auto", "thin" or "thick"\n  - driver.libDir must be a non-empty string\n  - driver.binaryDir must be a non-empty string',
     );
     a.configureDriver(); // defaults to auto
     a.initDriver();
@@ -789,5 +718,181 @@ describe("unit/adapter: driver mode — configureDriver / initDriver (2.2)", () 
     b.initDriver();
     b.configureDriver({ libDir: "/ic", mode: "thin" });
     expect(() => b.configureDriver({ mode: "thick" })).toThrow("already initialised as thin (/ic); it cannot change to thick");
+  });
+});
+
+describe("unit/adapter: closePool during pool creation (3.0)", () => {
+  it("an attempt still in flight is not retried once the pool is closed", async () => {
+    const a = await loadAdapter(makeDriver());
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let creates = 0;
+    register("s_close_inflight", { create: async () => { creates++; await gate; throw new Error("ORA-12541: TNS:no listener"); } });
+    const pending = a.withConnection("s_close_inflight", async () => 1).catch((e: Error) => e);
+    await wait(5);
+    const closing = a.closePool("s_close_inflight");
+    release();
+    await closing;
+    expect(((await pending) as Error).message).toMatch(/"s_close_inflight" was closed while it was being created; not retrying/);
+    expect(creates).toBe(1);
+  });
+
+  it("a creation waiting out its backoff stops there", async () => {
+    const a = await loadAdapter(makeDriver());
+    const realRandom = Math.random;
+    Math.random = () => 0.5; // backoff sleep = 500 ms, long enough to close during it
+    let creates = 0;
+    register("s_close_backoff", { create: () => { creates++; throw new Error("ORA-12541: TNS:no listener"); } });
+    try {
+      const pending = a.withConnection("s_close_backoff", async () => 1).catch((e: Error) => e);
+      await wait(50); // attempt 1 has failed; the retry is sleeping
+      const started = Date.now();
+      await a.closePool("s_close_backoff");
+      expect(((await pending) as Error).message).toMatch(/was closed while it was being created/);
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(creates).toBe(1);
+    } finally {
+      Math.random = realRandom;
+    }
+  });
+});
+
+describe("unit/adapter: releasing a connection the server already closed (3.0)", () => {
+  it("a reset that throws (dead session) neither replaces the error nor skips the release: the connection is dropped", async () => {
+    const a = await loadAdapter(makeDriver());
+    const closes: unknown[] = [];
+    const dead = conn({ close: async (...args: unknown[]) => void closes.push(args[0] ?? "plain") } as never);
+    Object.defineProperty(dead, "callTimeout", {
+      get: () => 500,
+      set: () => { throw new Error("DPI-1010: not connected"); },
+    });
+    register("s_dead_session", { getConnection: async () => dead });
+    const err = await a
+      .withConnection("s_dead_session", async () => { throw new Error("NJS-500: connection to Oracle Database was closed or broken"); })
+      .catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/NJS-500/);
+    expect((err as Error).message).not.toMatch(/DPI-1010/);
+    expect(closes).toEqual(["plain", { drop: true }]); // the pool's warm-up ping, then the dead session dropped
+
+    // A live session with a callTimeout is reset and returned to the pool as usual.
+    const live = conn({ close: async (...args: unknown[]) => void closes.push(args[0] ?? "plain") } as never) as ReturnType<typeof conn> & { callTimeout: number };
+    live.callTimeout = 500;
+    register("s_live_session", { getConnection: async () => live });
+    expect(await a.withConnection("s_live_session", async () => "ok")).toBe("ok");
+    expect(live.callTimeout).toBe(0);
+    expect(closes).toEqual(["plain", { drop: true }, "plain", "plain"]); // + the new pool's warm-up, then returned
+    await a.closeAll();
+  });
+});
+
+describe("unit/adapter: session time zone per pooled session (3.0)", () => {
+  // node-oracledb writes a Date in the PROCESS's zone and Oracle reads it in the SESSION's zone,
+  // so every pool sets each new session to the process's offset (or the caller's ORA_SDTZ).
+  const capture = (extra: Record<string, unknown> = {}) => {
+    const seen: { cfg?: { sessionCallback?: (c: unknown, tag: string, done: (e?: Error) => void) => void } } = {};
+    const driver = makeDriver({
+      ...extra,
+      async createPool(cfg: { poolAlias: string; sessionCallback?: never }) {
+        seen.cfg = cfg;
+        return { poolAlias: cfg.poolAlias, poolMin: 1, poolMax: 1, connectionsOpen: 0, connectionsInUse: 0, getConnection: async () => conn(), close: async () => {} };
+      },
+    });
+    return { seen, driver };
+  };
+  /** Runs the callback on a stub session; `refuse` makes statements matching it fail (ORA-01882). */
+  const runCallback = (cb: NonNullable<NonNullable<ReturnType<typeof capture>["seen"]["cfg"]>["sessionCallback"]>, refuse: RegExp | null = null) =>
+    new Promise<{ sql: string; sqls: string[]; err?: Error }>((resolve) => {
+      const sqls: string[] = [];
+      const c = { execute: async (q: string) => { sqls.push(q); if (refuse?.test(q)) throw new Error("ORA-01882: timezone region not found"); return {}; } };
+      cb(c, "", (err) => resolve({ sql: sqls[sqls.length - 1], sqls, err }));
+    });
+  const withTz = async (zone: string, fn: () => Promise<void>) => {
+    const tz = process.env.TZ;
+    process.env.TZ = zone;
+    try {
+      await fn();
+    } finally {
+      if (tz === undefined) delete process.env.TZ;
+      else process.env.TZ = tz;
+    }
+  };
+  const withSdtz = async (value: string | undefined, fn: () => Promise<void>) => {
+    const before = process.env.ORA_SDTZ;
+    if (value === undefined) delete process.env.ORA_SDTZ;
+    else process.env.ORA_SDTZ = value;
+    try {
+      await fn();
+    } finally {
+      if (before === undefined) delete process.env.ORA_SDTZ;
+      else process.env.ORA_SDTZ = before;
+    }
+  };
+
+  it("Thin: the process's region (or its offset when it has none); an unknown region falls back to the offset", async () => {
+    await withSdtz(undefined, async () => {
+      const { seen, driver } = capture();
+      const a = await loadAdapter(driver); // the stub reports no client version: Thin mode
+      register("s_tz_thin");
+      await a.withConnection("s_tz_thin", async () => 1);
+      const cb = seen.cfg!.sessionCallback!;
+      for (const [zone, sql] of [
+        ["UTC", "ALTER SESSION SET TIME_ZONE = '+00:00'"],
+        ["Asia/Manila", "ALTER SESSION SET TIME_ZONE = 'Asia/Manila'"],
+        ["America/New_York", "ALTER SESSION SET TIME_ZONE = 'America/New_York'"],
+      ]) {
+        await withTz(zone, async () => expect(await runCallback(cb)).toEqual({ sql, sqls: [sql], err: undefined }));
+      }
+      await withTz("Asia/Kolkata", async () => {
+        const region = Intl.DateTimeFormat().resolvedOptions().timeZone; // ICU may say Asia/Calcutta
+        const r = await runCallback(cb, /Asia\//);
+        expect(r).toEqual({ sql: "ALTER SESSION SET TIME_ZONE = '+05:30'", sqls: [`ALTER SESSION SET TIME_ZONE = '${region}'`, "ALTER SESSION SET TIME_ZONE = '+05:30'"], err: undefined });
+      });
+      await withTz("America/Caracas", async () => {
+        const failed = await runCallback(cb, /./); // region and offset both refused: the driver hears of it
+        expect(failed.sqls).toEqual(["ALTER SESSION SET TIME_ZONE = 'America/Caracas'", "ALTER SESSION SET TIME_ZONE = '-04:00'"]);
+        expect(failed.err?.message).toMatch(/ORA-01882/);
+      });
+      await a.closeAll();
+    });
+  });
+
+  it("Thick: the offset, never a region (the client's time-zone file can differ from the server's: ORA-01805)", async () => {
+    await withSdtz(undefined, async () => {
+      const { seen, driver } = capture({ oracleClientVersion: 2300000000 });
+      const a = await loadAdapter(driver);
+      register("s_tz_thick");
+      await a.withConnection("s_tz_thick", async () => 1);
+      const cb = seen.cfg!.sessionCallback!;
+      await withTz("Asia/Manila", async () => expect((await runCallback(cb)).sqls).toEqual(["ALTER SESSION SET TIME_ZONE = '+08:00'"]));
+      await withTz("America/Caracas", async () => expect((await runCallback(cb)).sqls).toEqual(["ALTER SESSION SET TIME_ZONE = '-04:00'"]));
+      await a.closeAll();
+    });
+  });
+
+  it("an ORA_SDTZ the caller set wins; one that could break out of the SQL literal is refused with a warning", async () => {
+    await withSdtz("Asia/Manila", async () => {
+      const { seen, driver } = capture();
+      const a = await loadAdapter(driver);
+      register("s_tz_own");
+      await a.withConnection("s_tz_own", async () => 1);
+      expect((await runCallback(seen.cfg!.sessionCallback!)).sql).toBe("ALTER SESSION SET TIME_ZONE = 'Asia/Manila'");
+      await a.closeAll();
+    });
+    await withSdtz("+08:00' ; DROP TABLE X --", async () => {
+      const before = getLogger();
+      const warnings: string[] = [];
+      setLogger({ info() {}, warn: (m: string) => void warnings.push(m), error() {} });
+      try {
+        const { seen, driver } = capture();
+        const a = await loadAdapter(driver);
+        register("s_tz_bad");
+        await a.withConnection("s_tz_bad", async () => 1);
+        expect(seen.cfg!.sessionCallback).toBeUndefined();
+        expect(warnings.some((w) => w.startsWith("ORA_SDTZ is not an offset"))).toBe(true);
+        await a.closeAll();
+      } finally {
+        setLogger(before);
+      }
+    });
   });
 });

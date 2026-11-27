@@ -3,7 +3,7 @@
  *
  * Every check compares what Mira did with an independent source of truth:
  * the simulation's own in-memory model of the business, or a hand-written SQL
- * read through `raw()` (a separate createDb handle the tracker never sees, so
+ * read through `raw()` (an untracked mira.db() handle the tracker never sees, so
  * verification reads are not counted as API use and do not go through the
  * query builders being checked).
  */

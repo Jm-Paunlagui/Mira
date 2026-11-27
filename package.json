@@ -1,13 +1,14 @@
 {
   "name": "@jm-paunlagui/mira",
-  "version": "2.1.0",
-  "description": "A production-grade OracleDB wrapper that mirrors MongoDB's core API while leveraging the full power of Oracle SQL.",
+  "version": "3.0.0",
+  "description": "MongoDB-style queries on Oracle: pass your pools to createMira(), get typed collections, pipelines and Oracle SQL with bind variables.",
   "keywords": [
-    "MongoDB",
-    "Oracle",
-    "Wrapper",
-    "MongoDB-Style",
-    "Query-Builder"
+    "oracle",
+    "oracledb",
+    "mongodb-style",
+    "query-builder",
+    "orm",
+    "typescript"
   ],
   "homepage": "https://github.com/Jm-Paunlagui/Mira#readme",
   "bugs": {
@@ -20,25 +21,25 @@
   "license": "Apache-2.0",
   "author": "John Moises Paunlagui",
   "type": "commonjs",
-  "main": "dist/utils/oracle-mongo-wrapper/index.js",
-  "types": "dist/utils/oracle-mongo-wrapper/index.d.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
     "mira": "dist/cli/mira.js"
   },
   "exports": {
     ".": {
-      "types": "./dist/utils/oracle-mongo-wrapper/index.d.ts",
-      "default": "./dist/utils/oracle-mongo-wrapper/index.js"
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
     },
     "./package.json": "./package.json"
   },
   "files": [
     "dist",
-    "src",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
-    ".env.example"
+    ".env.example",
+    "docs/MIGRATION-3.0.md"
   ],
   "scripts": {
     "typecheck": "tsc -p .",
@@ -46,6 +47,7 @@
     "clean": "bun -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "prepack": "bun run build",
     "smoke:node": "node test/node/smoke.cjs",
+    "test:package": "bash test/package/run.sh",
     "test": "bun test/run.ts",
     "test:coverage": "bun test/run.ts --coverage",
     "test:unit": "bun test/run.ts test/unit",
@@ -59,7 +61,6 @@
   },
   "dependencies": {
     "@types/oracledb": "^26.0.1",
-    "dotenv": "^17.4.2",
     "oracledb": "^7.0.0"
   },
   "engines": {
@@ -68,7 +69,6 @@
   },
   "devDependencies": {
     "@types/bun": "^1.4.5",
-    "@types/express": "^5.0.6",
     "@types/node": "^26.6.6",
     "typescript": "~6.0"
   },

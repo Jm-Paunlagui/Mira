@@ -12,7 +12,7 @@ import {
   withCTE,
   withRecursiveCTE,
   createPerformance,
-} from "../../src/utils/oracle-mongo-wrapper";
+} from "../../src";
 import { stubConn, stubDb, oraError } from "../helpers/stubs";
 
 const failing = () => {
@@ -252,7 +252,7 @@ describe("unit/errors: OracleSchema / OracleDCL / performance / CTE / set operat
 
 describe("unit/errors: remaining edges", () => {
   it("read-only transaction ignores a failing final rollback", async () => {
-    const { Transaction } = await import("../../src/utils/oracle-mongo-wrapper");
+    const { Transaction } = await import("../../src");
     const conn = stubConn(() => ({ rows: [] }));
     conn.rollback = async () => { throw new Error("ORA-03113"); };
     expect(await new Transaction(stubDb(conn) as never).withReadOnlyTransaction(async () => "ok")).toBe("ok");
@@ -285,13 +285,13 @@ describe("unit/errors: remaining edges", () => {
   });
 
   it("aggregate expressions that are scalars or empty objects pass through", async () => {
-    const { buildAggregateSQL } = await import("../../src/utils/oracle-mongo-wrapper");
+    const { buildAggregateSQL } = await import("../../src");
     expect(buildAggregateSQL("T", [{ $group: { _id: "$R", n: 5 } }], {}).sql).toBe('SELECT "R", 5 AS "N" FROM "T" GROUP BY "R"');
     expect(buildAggregateSQL("T", [{ $project: { e: {} } }], {}).sql).toBe('SELECT [object Object] AS "E" FROM "T"');
   });
 
   it("db handle exposes pool health and stats", async () => {
-    const { createDb } = await import("../../src/utils/oracle-mongo-wrapper");
+    const { createDb } = await import("../../src/driver/db");
     const d = createDb("appDb");
     expect(d.isHealthy()).toBe(true);
     expect(await d.getPoolStats()).toHaveProperty("pools");

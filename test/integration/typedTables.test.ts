@@ -11,7 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { defineTable, t, generateTableTypes, Transaction, type TypedTable } from "../../src/utils/oracle-mongo-wrapper";
+import { defineTable, t, generateTableTypes, Transaction, type TypedTable } from "../../src";
 import { db, dropIfExists } from "../helpers/db";
 
 const P = "MIRA_TT_PARENT";
@@ -37,7 +37,7 @@ const Orders = defineTable(C, {
 });
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mira-tt-"));
-const srcIndex = path.resolve(import.meta.dir, "../../src/utils/oracle-mongo-wrapper/index.ts").replace(/\\/g, "/");
+const srcIndex = path.resolve(import.meta.dir, "../../src/index.ts").replace(/\\/g, "/");
 
 beforeAll(async () => {
   await dropIfExists(C, P);

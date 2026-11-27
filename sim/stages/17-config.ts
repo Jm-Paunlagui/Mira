@@ -1,13 +1,16 @@
 /**
  * Stage 17 — A second service joins: the reporting job brings its own pool,
- * defined the 2.2 way (createMira) instead of the env-driven appDb.
- *   - its connect string is built with buildTNSConnectString (the shape appDb uses),
+ * next to the simulation's appDb, on the same schema.
+ *   - the connect-string builders produce the forms a deploy would hand it,
  *   - its config is read by fromEnv() from the job's own variables,
  *   - a typo in a hand-written config is caught by defineConfig before anything connects,
  *   - the job asks for the driver mode already running (initDriver / configureDriver),
  *     and a different one is refused, since the Oracle Client is process-wide,
  *   - its log lines go to the job's own logger (setLogger) while it runs,
- *   - it counts the day's sales on its own pool, which match the trading model,
+ *   - it opens its pool up front and watches only its own pool's health, as a
+ *     readiness probe would (open, stats, health.*),
+ *   - it counts the day's sales on its own pool, which match the trading model, once
+ *     through a collection and once inside a read-only transaction,
  *   - closing it leaves appDb, which every other stage uses, serving.
  */
 import type { Ctx } from "../lib/context";
@@ -17,9 +20,10 @@ import { T, type State } from "../lib/data";
 export async function configStage(sim: Sim, ctx: Ctx, state: State) {
   const { api, conn } = ctx;
 
-  sim.eq("buildSimpleConnectString: Easy Connect form", api.buildSimpleConnectString(conn.host, conn.port, "SVC"), `${conn.host}:${conn.port}/SVC`);
-  const connectString = api.buildTNSConnectString(conn.host, conn.port, conn.sid);
-  sim.ok("buildTNSConnectString: a TNS descriptor naming the SID", connectString.startsWith("(DESCRIPTION=") && connectString.includes(`(SID=${conn.sid})`), connectString);
+  sim.eq("buildSimpleConnectString: Easy Connect form", api.buildSimpleConnectString("db.local", 1521, "RPT"), "db.local:1521/RPT");
+  const tns = api.buildTNSConnectString("db.local", 1521, "RPT");
+  sim.ok("buildTNSConnectString: a TNS descriptor naming the SID", tns.startsWith("(DESCRIPTION=") && tns.includes("(HOST=db.local)(PORT=1521)") && tns.includes("(SID=RPT)"), tns);
+  const connectString = conn.connectString; // where the simulation schema really is
 
   // The job's environment, as its deploy would set it. Not process.env: nothing global changes.
   const env = { RPT_USER: conn.user, RPT_PASSWORD: conn.password, RPT_CONNECT_STRING: connectString, RPT_POOL_MIN: "0", RPT_POOL_MAX: "2" };
@@ -51,11 +55,36 @@ export async function configStage(sim: Sim, ctx: Ctx, state: State) {
   api.setLogger({ info: (m) => void lines.push(m), warn: (m) => void lines.push(m), error: (m) => void lines.push(m) });
   const mira = api.createMira(config);
   try {
+    sim.eq("open(): the reporting pool opens up front", await mira.open(), [{ name: "reporting", success: true }]);
+    sim.eq("stats(): only the reporting pool", Object.keys((await mira.stats()).pools), ["reporting"]);
+    const checks: Array<{ name: string; ok: boolean }> = [];
+    const offCheck = mira.health.onCheck((c) => void checks.push(c));
+    const offChange = mira.health.onChange(() => {});
+    mira.health.watch(true);
+    mira.health.recordProbeSuccess();
+    mira.health.nudge();
+    for (let i = 0; i < 100 && checks.length === 0; i++) await new Promise((r) => setTimeout(r, 50));
+    sim.eq("health.onCheck(): a nudged check of the reporting pool passes", checks[0], { name: "reporting", ok: true });
+    sim.ok("health: the reporting pool and the instance are healthy", mira.health.isHealthy() && mira.health.allHealthy());
+    sim.eq("health.metrics(): only the reporting pool", Object.keys(mira.health.metrics()), ["reporting"]);
+    offCheck();
+    offChange();
+    mira.health.watch(false);
+
     const sales = await sim.mira(() => mira.collection(T.ORDERS).countDocuments());
     sim.eq("createMira: the reporting pool sees every sale", sales, state.model.orders.length);
+    const inTx = await sim.mira(() => mira.transaction().withReadOnlyTransaction((s) => s.collection(T.ORDERS).countDocuments()));
+    sim.eq("mira.transaction(): the same count in a read-only transaction", inTx, sales);
+    sim.ok("mira.schema() / mira.dcl(): bound to the reporting pool", mira.schema() instanceof api.OracleSchema && mira.dcl() instanceof api.OracleDCL);
+    const handle = mira.db();
+    sim.eq("mira.db(): the handle names its pool", handle.connectionName, "reporting");
     await mira.close();
+    sim.eq("close(): a kept handle reports unhealthy", handle.isHealthy(), false);
+    let closedErr = "";
+    await handle.withConnection(async () => 1).catch((e: Error) => void (closedErr = e.message));
+    sim.ok("close(): a kept handle refuses work", closedErr.includes("This Mira instance is closed"), closedErr);
   } finally {
-    api.setLogger(null); // back to Mira's own logger
+    api.setLogger(process.env.MIRA_LOGS ? console : false); // back to what the sim context set
   }
   sim.ok("setLogger: the job's logger saw its pool open and close", lines.some((l) => l.includes('"reporting"') && /ready/i.test(l)) && lines.some((l) => l.includes('Pool "reporting" closed')), lines);
   sim.eq("close(): the reporting instance is closed", mira.closed, true);

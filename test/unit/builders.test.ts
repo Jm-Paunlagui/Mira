@@ -27,14 +27,14 @@ import {
   buildOrderBy,
   buildProjection,
   mergeBinds,
-  createDb,
   OracleCollection,
   QueryBuilder,
   withCTE,
   withRecursiveCTE,
-} from "../../src/utils/oracle-mongo-wrapper";
-import { resetBindCounter } from "../../src/utils/oracle-mongo-wrapper/parsers/filterParser";
-import { resetUpdateCounter } from "../../src/utils/oracle-mongo-wrapper/parsers/updateParser";
+} from "../../src";
+import { createDb } from "../../src/driver/db";
+import { resetBindCounter } from "../../src/parsers/filterParser";
+import { resetUpdateCounter } from "../../src/parsers/updateParser";
 
 const db = createDb("appDb");
 const c = new OracleCollection("T_U", db);
@@ -71,10 +71,10 @@ describe("unit: utils", () => {
     expect(convertTypes(null as never)).toBeNull();
   });
 
-  it("createDb validates its name and exposes the pool helpers", async () => {
+  it("the internal db handle validates its name and exposes the pool helpers", async () => {
     expect(() => createDb("" as string)).toThrow(TypeError);
     expect(() => createDb(42 as unknown as string)).toThrow(TypeError);
-    const d = createDb();
+    const d = createDb("appDb");
     expect(d.connectionName).toBe("appDb");
     expect(typeof d.withBatchConnection).toBe("function");
   });

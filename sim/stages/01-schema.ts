@@ -6,7 +6,7 @@
 import type { Ctx } from "../lib/context";
 import type { Sim } from "../lib/harness";
 import { T, type State } from "../lib/data";
-import type { Migration } from "../../src/utils/oracle-mongo-wrapper";
+import type { Migration } from "../../src";
 
 export async function schemaStage(sim: Sim, ctx: Ctx, state: State) {
   const { api, db, raw, schemaUser } = ctx;
@@ -120,7 +120,7 @@ export async function schemaStage(sim: Sim, ctx: Ctx, state: State) {
 
   // DCL: grant read access on the menu to another schema, then take it back.
   // `||`, not `??`: a blank `MIRA_SIM_GRANTEE=` line in .env is "" and must fall through.
-  const grantee = (process.env.MIRA_SIM_GRANTEE?.trim() || process.env.APP_DB_USERNAME?.trim() || "PUBLIC").toUpperCase();
+  const grantee = (process.env.MIRA_SIM_GRANTEE?.trim() || process.env.MIRA_DB_USER?.trim() || "PUBLIC").toUpperCase();
   const dcl = new api.OracleDCL(db as never);
   const grants = async () =>
     (await raw<{ P: string }>("SELECT PRIVILEGE AS P FROM USER_TAB_PRIVS_MADE WHERE TABLE_NAME = :t AND GRANTEE = :g ORDER BY 1", { t: T.PRODUCTS, g: grantee })).map((r) => r.P);

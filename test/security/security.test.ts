@@ -6,9 +6,10 @@
  * "SECURITY:" tests assert the safe behaviour and fail while the hole is open.
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { createDb, OracleCollection, parseFilter } from "../../src/utils/oracle-mongo-wrapper";
-import config from "../../src/config";
-import { db, coll, createUsers, dropIfExists, rawExec, recordMetric, USERS } from "../helpers/db";
+import { OracleCollection, parseFilter } from "../../src";
+import * as config from "../../src/driver/oracle";
+import registry from "../../src/driver/registry";
+import { mira, db, coll, createUsers, dropIfExists, rawExec, recordMetric, USERS } from "../helpers/db";
 
 const U = "MIRA_SC_USERS";
 const S = "MIRA_SC_SECRETS";
@@ -115,13 +116,14 @@ describe("security: identifiers", () => {
   });
 
   it("savepoint names are validated", async () => {
-    const { Transaction } = await import("../../src/utils/oracle-mongo-wrapper");
+    const { Transaction } = await import("../../src");
     await expect(new Transaction(db).withTransaction((s) => s.savepoint("A; DROP TABLE X"))).rejects.toThrow(/Invalid savepoint/);
   });
 
   it("pool names cannot be forged", async () => {
-    expect(() => config.getConnectionConfig("appDb; DROP TABLE X")).toThrow(/Unknown connection/);
-    await expect(createDb("appDb' OR '1'='1").withConnection(async () => 1)).rejects.toThrow(/Unknown connection/);
+    expect(() => registry.getConnectionConfig("appDb; DROP TABLE X")).toThrow(/Unknown connection/);
+    expect(() => mira.db("appDb' OR '1'='1" as "appDb")).toThrow(/Unknown pool/);
+    expect(() => registry.registerConnection("x' OR '1'='1", {})).toThrow(/Invalid connection name/);
   });
 });
 
@@ -183,9 +185,9 @@ describe("security: data exposure", () => {
   });
 
   it("credentials never appear in pool stats or connection errors", async () => {
-    const pw = String(config.getConnectionConfig("appDb").password);
+    const pw = String(registry.getConnectionConfig("appDb").password);
     expect(JSON.stringify(await config.getPoolStats())).not.toContain(pw);
-    const conns = (await import("../../src/config/database")).default.connections as Record<string, Record<string, unknown>>;
+    const conns = (await import("../../src/driver/registry")).default.connections as Record<string, Record<string, unknown>>;
     conns.sec_badpw = { ...conns.appDb, password: "Wr0ng-P@ss-Should-Not-Leak", poolMin: 0 };
     const e = await config.withConnection("sec_badpw", async () => 1).catch((x: Error) => x);
     delete conns.sec_badpw;

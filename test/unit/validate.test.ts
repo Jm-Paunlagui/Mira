@@ -3,8 +3,8 @@
  * No database: each column kind, each size rule, and each update operator.
  */
 import { describe, it, expect } from "bun:test";
-import { defineTable, t, MiraValidationError } from "../../src/utils/oracle-mongo-wrapper";
-import { validateInsert, validateUpdate, checkValue } from "../../src/utils/oracle-mongo-wrapper/typed/validate";
+import { defineTable, t, MiraValidationError } from "../../src";
+import { validateInsert, validateUpdate, checkValue } from "../../src/typed/validate";
 
 const T = defineTable("V", {
   ID: t.id(),

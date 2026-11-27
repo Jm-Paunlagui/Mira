@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import oracledb from "oracledb";
-import { defineTable, t, sql, onQuery, Transaction, type QueryEvent } from "../../src/utils/oracle-mongo-wrapper";
+import { defineTable, t, sql, onQuery, Transaction, type QueryEvent } from "../../src";
 import { db, coll, dropIfExists, rawExec, appDbInUse } from "../helpers/db";
 
 const P = "MIRA_QT_PAGES";

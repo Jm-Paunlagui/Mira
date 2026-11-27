@@ -8,7 +8,7 @@
  *   - bulkWrite on a model table runs the wrapped methods
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "bun:test";
-import { defineTable, t, relations, hasMany, belongsTo, Transaction, MiraValidationError, ModelCollection, OracleCollection } from "../../src/utils/oracle-mongo-wrapper";
+import { defineTable, t, relations, hasMany, belongsTo, Transaction, MiraValidationError, ModelCollection, OracleCollection } from "../../src";
 import { db, dropIfExists, rawExec, sleep } from "../helpers/db";
 
 const N = "MIRA_MD_NOTES";

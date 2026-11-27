@@ -41,8 +41,8 @@
  * function went unused.
  *
  * Env: MIRA_SIM_DB_USERNAME / MIRA_SIM_DB_PASSWORD (required),
- *      MIRA_SIM_DB_HOST / _PORT / _SID (default: the main DB_* values),
- *      MIRA_SIM_GRANTEE (default APP_DB_USERNAME), MIRA_SIM_KEEP=1 to leave the
+ *      MIRA_SIM_DB_CONNECT_STRING or MIRA_SIM_DB_HOST / _PORT / _SID (default: the
+ *      main MIRA_DB_* connection), MIRA_SIM_GRANTEE (default MIRA_DB_USER), MIRA_SIM_KEEP=1 to leave the
  *      SIM_* objects in place for inspection, MIRA_LOGS=1 for Mira's own logs.
  */
 import { Sim } from "./lib/harness";
@@ -122,8 +122,8 @@ await sim.stage("18 operations", async () => {
     await cleanSlate();
     sim.eq("teardown: no SIM_* objects left", await ctx.rawCount("USER_OBJECTS", "WHERE OBJECT_NAME LIKE 'SIM\\_%' ESCAPE '\\'"), 0);
   }
-  await ctx.db.closePool();
-  sim.eq("DEFECT: isHealthy reports false after closePool", ctx.db.isHealthy(), false);
+  await ctx.db.closePool(); // closes the simulation's Mira instance
+  sim.eq("isHealthy reports false after closePool", ctx.db.isHealthy(), false);
 });
 
 // ── Report ───────────────────────────────────────────────────────────────────
