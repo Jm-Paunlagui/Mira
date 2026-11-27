@@ -114,7 +114,8 @@ jobs:
 
       - name: Driver mode check
         run: |
-          bun -e 'const { createDb } = require("./src"); const db = createDb("appDb"); const mode = db.oracledb.oracleClientVersion ? "thick" : "thin"; console.log("driver mode:", mode); if (mode !== process.env.EXPECTED_MODE) process.exit(1); process.exit(0);'
+          # The driver initialises lazily (2.2); initDriver() does it now and reports the mode.
+          bun -e 'const { initDriver } = require("./src"); const { mode } = initDriver(); console.log("driver mode:", mode); if (mode !== process.env.EXPECTED_MODE) process.exit(1); process.exit(0);'
         env:
           EXPECTED_MODE: ${{ matrix.driver }}
 
