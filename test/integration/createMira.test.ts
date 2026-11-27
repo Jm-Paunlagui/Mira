@@ -83,32 +83,34 @@ describe("integration: createMira", () => {
   });
 
   it("logger option: Mira's lines go to the app logger until close(); conflicts are refused", async () => {
-    const lines: string[] = [];
-    const appLog = { info: (m: string) => void lines.push(`info ${m}`), warn: (m: string) => void lines.push(`warn ${m}`), error: (m: string) => void lines.push(`error ${m}`) };
-    const mira = createMira({ pools: { miraLog: { ...creds, poolMin: 0, poolMax: 1 } }, logger: appLog });
-    expect(getLogger()).toBe(appLog);
-    await mira.db().withConnection(async (c) => c.execute("SELECT 1 FROM DUAL"));
-    expect(lines.some((l) => l.startsWith("info ") && l.includes('"miraLog"'))).toBe(true);
-
-    // Another instance with a different logger is refused and registers nothing; the same logger is fine.
-    expect(() => createMira({ pools: { miraLog2: creds }, logger: console })).toThrow("[mira] Another logger is already set");
-    expect(() => database.getConnectionConfig("miraLog2")).toThrow(/Unknown connection/);
-    const same = createMira({ pools: { miraLog3: creds }, logger: appLog });
-    await same.close();
-    expect(getLogger()).toBe(appLog); // not its to reset
-
-    await mira.close();
-    expect(getLogger()).toBeNull();
-    expect(lines.some((l) => l.includes('Pool "miraLog" closed'))).toBe(true);
-
-    // A logger set by the app itself is left alone by close().
-    setLogger(false);
+    const preload = getLogger(); // the test preload's sink; this test starts from the default
+    setLogger(null);
     try {
+      const lines: string[] = [];
+      const appLog = { info: (m: string) => void lines.push(`info ${m}`), warn: (m: string) => void lines.push(`warn ${m}`), error: (m: string) => void lines.push(`error ${m}`) };
+      const mira = createMira({ pools: { miraLog: { ...creds, poolMin: 0, poolMax: 1 } }, logger: appLog });
+      expect(getLogger()).toBe(appLog);
+      await mira.db().withConnection(async (c) => c.execute("SELECT 1 FROM DUAL"));
+      expect(lines.some((l) => l.startsWith("info ") && l.includes('"miraLog"'))).toBe(true);
+
+      // Another instance with a different logger is refused and registers nothing; the same logger is fine.
+      expect(() => createMira({ pools: { miraLog2: creds }, logger: console })).toThrow("[mira] Another logger is already set");
+      expect(() => database.getConnectionConfig("miraLog2")).toThrow(/Unknown connection/);
+      const same = createMira({ pools: { miraLog3: creds }, logger: appLog });
+      await same.close();
+      expect(getLogger()).toBe(appLog); // not its to reset
+
+      await mira.close();
+      expect(getLogger()).toBeNull();
+      expect(lines.some((l) => l.includes('Pool "miraLog" closed'))).toBe(true);
+
+      // A logger set by the app itself is left alone by close().
+      setLogger(false);
       const quiet = createMira({ pools: { miraLog4: creds }, logger: false });
       await quiet.close();
       expect(getLogger()).toBe(false);
     } finally {
-      setLogger(null);
+      setLogger(preload);
     }
   });
 

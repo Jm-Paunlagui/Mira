@@ -16,9 +16,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
-// Bun has already loaded .env (ENABLE_CONSOLE_LOGS=true there); keep the runner's
-// own DB writes quiet unless MIRA_LOGS=1.
-if (!process.env.MIRA_LOGS) process.env.ENABLE_CONSOLE_LOGS = "false";
+// Keep the runner's own DB writes quiet unless MIRA_LOGS=1 (the test preload does the same for the suite).
+if (!process.env.MIRA_LOGS) (require("../src/shared/log") as typeof import("../src/shared/log")).setLogger(false);
 const root = path.resolve(__dirname, "..");
 const junit = path.join(root, "coverage", "junit.xml");
 const runId = `${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14)}_${process.pid}`;

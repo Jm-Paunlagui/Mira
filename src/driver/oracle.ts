@@ -19,8 +19,6 @@
  */
 
 
-import { IS_COMPILED, appPath } from "../utils/runtimePaths";
-
 import fs from "fs";
 import path from "path";
 import { EventEmitter } from "events";
@@ -73,65 +71,16 @@ function validateOracleClient() {
     return true;
 }
 
-function setupOracleEnvironment() {
-    const clientPath = process.env.ORACLE_INSTANT_CLIENT;
-    if (!clientPath || !fs.existsSync(clientPath)) return;
-    const current = process.env.PATH || "";
-    if (!current.includes(clientPath)) {
-        process.env.PATH = `${clientPath};${current}`;
-        log().notice(`Oracle client prepended to PATH: ${clientPath}`);
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 2 — Driver loader  (was: oracleLoader.js)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const isCompiled = IS_COMPILED;
-
-/** Compiled exe: oracledb's Thick binary is staged beside the exe (the baked __dirname is the build box's). */
-const THICK_BINARY_OPTS = IS_COMPILED ? { binaryDir: appPath("node_modules", "oracledb", "build", "Release") } : {};
-
-function _loadEnvForCompiled() {
-    if (!isCompiled) return;
-    // .env is read from DISK only — the working directory, then the directory
-    // containing the exe. Never reference it via path.join(__dirname, ...):
-    // a compile step that follows that pattern can bake the build machine's
-    // .env (real secrets) into every distributed exe (CWE-798/CWE-540 —
-    // confirmed by byte-scanning a pkg-built binary).
-    const candidates = [
-        path.join(process.cwd(), ".env"),
-        path.join(path.dirname(process.execPath), ".env"),
-    ];
-    for (const filePath of candidates) {
-        if (!fs.existsSync(filePath)) continue;
-        try {
-            const lines = fs.readFileSync(filePath, "utf8").split("\n");
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (
-                    !trimmed ||
-                    trimmed.startsWith("#") ||
-                    !trimmed.includes("=")
-                )
-                    continue;
-                const eqIdx = trimmed.indexOf("=");
-                const key = trimmed.slice(0, eqIdx).trim();
-                const value = trimmed.slice(eqIdx + 1).trim();
-                if (!process.env[key]) process.env[key] = value;
-            }
-            log().notice(`Env loaded from: ${filePath}`);
-            return;
-        } catch (err) {
-            log().warning(
-                `Could not read .env at ${filePath}: ${err.message}`,
-            );
-        }
-    }
-    log().warning("No .env found in compiled environment.");
+/** binaryDir for initOracleClient, when configureDriver() was given one (compiled executables). */
+function _binaryOpts(): { binaryDir?: string } {
+    return _driverOptions.binaryDir ? { binaryDir: _driverOptions.binaryDir } : {};
 }
 
-/** The node-oracledb module (loaded lazily below so a compiled exe can stage its environment first). */
+/** The node-oracledb module. */
 type OracleDb = typeof import("oracledb");
 
 /** ORA_SDTZ=+00:00 unless set already (see the note where it is called). */
@@ -146,12 +95,12 @@ function _initOracleClient(db: OracleDb, libDir?: string) {
     const isValid = libDir ? true : validateOracleClient();
     try {
         if (isValid && clientPath) {
-            db.initOracleClient({ libDir: clientPath, ...THICK_BINARY_OPTS });
+            db.initOracleClient({ libDir: clientPath, ..._binaryOpts() });
             log().notice(
                 libDir ? `Oracle client initialised from ${libDir}.` : "Oracle client initialised from ORACLE_INSTANT_CLIENT.",
             );
         } else {
-            db.initOracleClient(THICK_BINARY_OPTS);
+            db.initOracleClient(_binaryOpts());
             log().notice("Oracle client initialised from system PATH.");
         }
     } catch (err) {
@@ -162,24 +111,17 @@ function _initOracleClient(db: OracleDb, libDir?: string) {
 
 // The module is loaded here; nothing is initialised until the first pool (initDriver).
 // Loading it is side-effect free and gives db.oracledb its constants.
-if (isCompiled) {
-    log().notice(
-        "Compiled exe detected — bootstrapping Oracle environment.",
-    );
-    _loadEnvForCompiled();
-    setupOracleEnvironment();
-}
 const oracledb: OracleDb = require("oracledb") as OracleDb;
 
 /** What configureDriver() asked for; read by initDriver(). */
-let _driverOptions: { mode: DriverMode; libDir?: string } = { mode: "auto" };
+let _driverOptions: { mode: DriverMode; libDir?: string; binaryDir?: string } = { mode: "auto" };
 /** Set once initDriver() has run. */
 let _driverInfo: Readonly<{ mode: "thin" | "thick"; clientVersion?: number }> | null = null;
 
 /**
  * Chooses Thin or Thick mode for this process. Must run before the first pool
  * opens. After that, options compatible with the running driver ("auto", or
- * the mode that loaded, with no other libDir) are accepted and anything else
+ * the mode that loaded, with no other libDir or binaryDir) are accepted and anything else
  * throws, because the Oracle Client cannot be unloaded.
  * @param {DriverOptions} [options]
  * @throws {MiraConfigError} for an invalid option.
@@ -189,16 +131,18 @@ function configureDriver(options: DriverOptions = {}): void {
     const issues: string[] = [];
     checkDriver(options, issues);
     if (issues.length) throw new MiraConfigError(issues);
-    const next = { mode: options.mode ?? "auto", libDir: options.libDir };
+    const next = { mode: options.mode ?? "auto", libDir: options.libDir, binaryDir: options.binaryDir };
     if (_driverInfo) {
         // Compatible with what is running: "auto" or the mode that loaded, and no other libDir.
         const modeOk = next.mode === "auto" || next.mode === _driverInfo.mode;
         const dirOk = next.libDir === undefined || next.libDir === _driverOptions.libDir;
-        if (!modeOk || !dirOk) {
-            const show = (mode: string, dir?: string) => (dir ? `${mode} (${dir})` : mode);
-            throw new Error(
-                miraConfigMessages.DRIVER_ALREADY_INITIALISED(show(_driverInfo.mode, _driverOptions.libDir), show(next.mode, next.libDir)),
-            );
+        const binOk = next.binaryDir === undefined || next.binaryDir === _driverOptions.binaryDir;
+        if (!modeOk || !dirOk || !binOk) {
+            const show = (mode: string, o: { libDir?: string; binaryDir?: string }) => {
+                const dirs = [o.libDir, o.binaryDir && `binaryDir ${o.binaryDir}`].filter(Boolean);
+                return dirs.length ? `${mode} (${dirs.join(", ")})` : mode;
+            };
+            throw new Error(miraConfigMessages.DRIVER_ALREADY_INITIALISED(show(_driverInfo.mode, _driverOptions), show(next.mode, next)));
         }
         return;
     }
@@ -239,7 +183,7 @@ function initDriver(): Readonly<{ mode: "thin" | "thick"; clientVersion?: number
         } else if (mode === "thick" && !oracledb.oracleClientVersion) {
             const clientPath = libDir ?? process.env.ORACLE_INSTANT_CLIENT;
             try {
-                oracledb.initOracleClient({ ...(clientPath && { libDir: clientPath }), ...THICK_BINARY_OPTS });
+                oracledb.initOracleClient({ ...(clientPath && { libDir: clientPath }), ..._binaryOpts() });
             } catch (err) {
                 if (!err.message.includes("NJS-077")) throw err;
             }
@@ -719,11 +663,6 @@ async function _createPool(name: unknown, dbConfig: import("oracledb").PoolAttri
 
     let pool;
     try {
-        if (isCompiled)
-            config.connectString = config.connectString
-                ?.replace(/\s+/g, " ")
-                .trim();
-
         pool = await oracledb.createPool(config);
         const conn = await pool.getConnection();
         await conn.ping();
@@ -1322,4 +1261,4 @@ const __export_onPoolHealthCheck = (fn: (check: { name: string; ok: boolean }) =
         return () => healthMonitor.off("check", fn);
     };
 const __export_setPoolHealthWatched = (watched: boolean) => healthMonitor.setWatched(watched);
-export { configureDriver, initDriver, toDriverConnectTimeoutSec, POOL_DEFAULTS, withConnection, withTransaction, withBatchConnection, initializePools, closeAll, closePool, isPoolOpen, getPoolStats, __export_isPoolHealthy as isPoolHealthy, __export_getHealthMetrics as getHealthMetrics, __export___setPoolHealthForTest as __setPoolHealthForTest, __export_onPoolHealthChange as onPoolHealthChange, __export_allPoolsHealthy as allPoolsHealthy, __export_recordProbeSuccess as recordProbeSuccess, __export_nudgePoolHealth as nudgePoolHealth, __export_onPoolHealthCheck as onPoolHealthCheck, __export_setPoolHealthWatched as setPoolHealthWatched, validateOracleClient, setupOracleEnvironment, oracledb, OUT_FORMAT_OBJECT, SYSDBA_PRIVILEGE, EXECUTE_OPTIONS, moneySafeFetchTypeHandler };
+export { configureDriver, initDriver, toDriverConnectTimeoutSec, POOL_DEFAULTS, withConnection, withTransaction, withBatchConnection, initializePools, closeAll, closePool, isPoolOpen, getPoolStats, __export_isPoolHealthy as isPoolHealthy, __export_getHealthMetrics as getHealthMetrics, __export___setPoolHealthForTest as __setPoolHealthForTest, __export_onPoolHealthChange as onPoolHealthChange, __export_allPoolsHealthy as allPoolsHealthy, __export_recordProbeSuccess as recordProbeSuccess, __export_nudgePoolHealth as nudgePoolHealth, __export_onPoolHealthCheck as onPoolHealthCheck, __export_setPoolHealthWatched as setPoolHealthWatched, validateOracleClient, oracledb, OUT_FORMAT_OBJECT, SYSDBA_PRIVILEGE, EXECUTE_OPTIONS, moneySafeFetchTypeHandler };

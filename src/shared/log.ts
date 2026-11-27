@@ -1,14 +1,12 @@
 /**
- * @fileoverview Where the adapter's log lines go.
+ * @fileoverview Where Mira's log lines go.
  *
- * Default: Mira's own logger (src/utils/logger.ts), loaded on the first log
- * line rather than at import, so an app that sets its own logger first never
- * loads it and gets no ./logs folder. setLogger() swaps in any object with
- * info / warn / error (and optionally debug), or `false` for silence.
+ * Default: the console, warnings and errors only (`warning` → console.warn,
+ * `critical` → console.error); pool-lifecycle notices are dropped. Mira writes
+ * no file. setLogger() swaps in any object with info / warn / error (and
+ * optionally debug), or `false` for silence.
  *
- * `log()` returns the sink itself; callers write `log().warning(msg)`. For
- * the default logger that is the logger object, so its call-site capture
- * (which skips logger.ts frames only) still names the adapter function.
+ * Callers write `log().warning(msg)`.
  */
 
 import type { MiraLogger } from "../config/types";
@@ -23,6 +21,12 @@ type AdapterLog = {
 
 const noop = () => {};
 const SILENT: AdapterLog = Object.freeze({ info: noop, notice: noop, warning: noop, critical: noop });
+const CONSOLE_DEFAULT: AdapterLog = Object.freeze({
+  info: noop,
+  notice: noop,
+  warning: (...a: unknown[]) => console.warn("[mira]", ...a),
+  critical: (...a: unknown[]) => console.error("[mira]", ...a),
+});
 
 let current: MiraLogger | false | null = null;
 let sink: AdapterLog | null = null;
@@ -51,7 +55,7 @@ function isMiraLogger(l: unknown): l is MiraLogger | false {
 }
 
 /**
- * Sets the process-wide log sink. `null` goes back to Mira's own logger.
+ * Sets the process-wide log sink. `null` goes back to the console default.
  * @throws {TypeError} for anything that is not a logger, `false` or `null`.
  */
 function setLogger(logger: MiraLogger | false | null): void {
@@ -62,14 +66,14 @@ function setLogger(logger: MiraLogger | false | null): void {
   sink = logger === null ? null : logger === false ? SILENT : mapLogger(logger);
 }
 
-/** The logger last passed to setLogger (null: Mira's own). */
+/** The logger last passed to setLogger (null: the console default). */
 function getLogger(): MiraLogger | false | null {
   return current;
 }
 
 /** The current sink. */
 function log(): AdapterLog {
-  return sink ?? (require("../utils/logger") as typeof import("../utils/logger")).logger;
+  return sink ?? CONSOLE_DEFAULT;
 }
 
 export { log, setLogger, getLogger, isMiraLogger };

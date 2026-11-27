@@ -104,8 +104,17 @@ describe("chaos: pool exhaustion and slow calls", () => {
 
   it("pool recovers after saturation", async () => {
     expect(await config.withConnection("chaos_small", async () => "recovered")).toBe("recovered");
-    const stats = (await config.getPoolStats()).pools as Record<string, { connectionsInUse: number }>;
-    expect(stats.chaos_small.connectionsInUse).toBe(0);
+    // No connection may leak. The health monitor's ping borrows one for a few ms
+    // (checkPool → getConnection → ping → close), and in a full run its 30 s tick
+    // can land on this read: wait for it, bounded, instead of reading once.
+    const inUse = async () => ((await config.getPoolStats()).pools as Record<string, { connectionsInUse: number }>).chaos_small.connectionsInUse;
+    const deadline = Date.now() + 5000;
+    let n = await inUse();
+    while (n !== 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+      n = await inUse();
+    }
+    expect(n).toBe(0);
   }, 30000);
 
   // NOTE: how fast an in-flight call is interrupted depends on out-of-band break support between

@@ -2,6 +2,7 @@
  * bun test preload (see bunfig.toml). Hooks declared here are global: the
  * afterAll below runs once, after every test file.
  *
+ * - Silences Mira's log sink unless MIRA_LOGS=1 (then everything goes to the console).
  * - Prints recorded metrics and persists them to MIRA_TEST_METRICS.
  * - Closes every pool last; closeAll() is one-way, so nothing runs after it.
  *
@@ -11,8 +12,11 @@
  */
 import { afterAll } from "bun:test";
 import { db, metrics, RUN_ID, ensureHistoryTables, coll } from "./db";
+import { setLogger } from "../../src/shared/log";
 
 process.env.NODE_ENV = "test";
+// Tests provoke retries and failures on purpose; their warnings are noise. MIRA_LOGS=1 shows everything.
+setLogger(process.env.MIRA_LOGS ? console : false);
 
 afterAll(async () => {
   if (metrics.length) {

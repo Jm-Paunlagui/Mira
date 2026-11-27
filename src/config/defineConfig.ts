@@ -78,11 +78,12 @@ function checkDriver(driver: unknown, issues: string[]): void {
     return;
   }
   for (const key of Object.keys(driver)) {
-    if (key !== "mode" && key !== "libDir") issues.push(MSG.DRIVER_UNKNOWN_KEY(key));
+    if (key !== "mode" && key !== "libDir" && key !== "binaryDir") issues.push(MSG.DRIVER_UNKNOWN_KEY(key));
   }
   if (driver.mode !== undefined && !DRIVER_MODES.has(driver.mode as string)) issues.push(MSG.DRIVER_MODE_INVALID);
-  if (driver.libDir !== undefined && (typeof driver.libDir !== "string" || driver.libDir.trim() === "")) {
-    issues.push(MSG.DRIVER_LIBDIR_INVALID);
+  for (const key of ["libDir", "binaryDir"] as const) {
+    const v = driver[key];
+    if (v !== undefined && (typeof v !== "string" || v.trim() === "")) issues.push(MSG.DRIVER_DIR_INVALID(key));
   }
 }
 

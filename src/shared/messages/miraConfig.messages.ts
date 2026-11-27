@@ -30,7 +30,7 @@ const miraConfigMessages = {
   DRIVER_NOT_OBJECT: "driver must be an object",
   DRIVER_UNKNOWN_KEY: (key: string) => `driver.${key.slice(0, 80)} is not a driver option`,
   DRIVER_MODE_INVALID: 'driver.mode must be "auto", "thin" or "thick"',
-  DRIVER_LIBDIR_INVALID: "driver.libDir must be a non-empty string",
+  DRIVER_DIR_INVALID: (key: string) => `driver.${key} must be a non-empty string`,
   LOGGER_INVALID: "logger must have info, warn and error functions (debug optional), or be false",
 
   DRIVER_ALREADY_INITIALISED: (was: string, asked: string) =>

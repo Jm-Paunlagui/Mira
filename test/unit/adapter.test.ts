@@ -10,18 +10,15 @@
  * delays (30 s health ticks, 5 s cool-downs, 30 s shutdown guard) to
  * milliseconds while a test needs them to fire.
  */
-import { describe, it, expect, beforeAll, afterAll, mock } from "bun:test";
+import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import database from "../../src/driver/registry";
-import * as liveRuntime from "../../src/utils/runtimePaths";
-import { logger } from "../../src/utils/logger";
+import { setLogger, getLogger } from "../../src/shared/log";
 import * as realAdapter from "../../src/driver/oracle";
 
 type Adapter = typeof import("../../src/driver/oracle");
-// Snapshot: mock.module rewrites the live namespace, so restoring from it would keep IS_COMPILED: true.
-const realRuntime = { ...liveRuntime };
 const realOracledb = realAdapter.oracledb;
 const realSetTimeout = globalThis.setTimeout;
 const wait = (ms: number) => new Promise((r) => realSetTimeout(r, ms));
@@ -80,14 +77,12 @@ function makeDriver(extra: Record<string, unknown> = {}) {
 // ── fresh-instance loader ──────────────────────────────────────────────────────
 const oracledbKey = require.resolve("oracledb");
 let seq = 0;
-async function loadAdapter(driver: unknown, opts: { compiled?: boolean } = {}): Promise<Adapter> {
+async function loadAdapter(driver: unknown): Promise<Adapter> {
   const saved = require.cache[oracledbKey];
   require.cache[oracledbKey] = { id: oracledbKey, filename: oracledbKey, loaded: true, exports: driver } as never;
-  if (opts.compiled) mock.module("../../src/utils/runtimePaths", () => ({ ...realRuntime, IS_COMPILED: true }));
   try {
     return (await import(`../../src/driver/oracle.ts?fresh=${++seq}`)) as Adapter;
   } finally {
-    if (opts.compiled) mock.module("../../src/utils/runtimePaths", () => ({ ...realRuntime }));
     require.cache[oracledbKey] = saved;
   }
 }
@@ -135,22 +130,6 @@ describe("unit/adapter: driver loading and Oracle client environment", () => {
     expect(A.validateOracleClient()).toBe(true);
   });
 
-  it("setupOracleEnvironment prepends the client dir to PATH exactly once", () => {
-    process.env.ORACLE_INSTANT_CLIENT = tmp;
-    process.env.PATH = "/usr/bin";
-    A.setupOracleEnvironment();
-    expect(process.env.PATH).toBe(`${tmp};/usr/bin`);
-    A.setupOracleEnvironment();
-    expect(process.env.PATH).toBe(`${tmp};/usr/bin`);
-    delete process.env.PATH;
-    process.env.ORACLE_INSTANT_CLIENT = tmp + "x";
-    A.setupOracleEnvironment();
-    process.env.ORACLE_INSTANT_CLIENT = tmp;
-    A.setupOracleEnvironment();
-    expect(process.env.PATH).toBe(`${tmp};`);
-    process.env.PATH = envBackup.PATH;
-  });
-
   it("Thick mode: valid ORACLE_INSTANT_CLIENT → initOracleClient({ libDir })", async () => {
     process.env.ORACLE_INSTANT_CLIENT = tmp;
     let got: unknown;
@@ -184,48 +163,6 @@ describe("unit/adapter: driver loading and Oracle client environment", () => {
     expect(() => a.initDriver()).toThrow("driver exploded"); // not cached: retried next time
   });
 
-  it("compiled exe: reads .env from the working directory (existing keys win)", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mira-env-"));
-    fs.writeFileSync(path.join(dir, ".env"), "# comment\n\nNOEQUALS\nMIRA_COMPILED_PROBE = yes\nAPP_DB_USERNAME=should-not-override\n");
-    const cwd = process.cwd();
-    const userBefore = process.env.APP_DB_USERNAME;
-    process.chdir(dir);
-    try {
-      delete process.env.MIRA_COMPILED_PROBE;
-      // The existing value is whatever this machine set (.env locally, the job env in CI).
-      process.env.APP_DB_USERNAME = "existing-user";
-      const a = await loadAdapter(makeDriver(), { compiled: true });
-      expect(process.env.MIRA_COMPILED_PROBE).toBe("yes");
-      expect(process.env.APP_DB_USERNAME).toBe("existing-user");
-      await a.closeAll();
-    } finally {
-      process.chdir(cwd);
-      process.env.APP_DB_USERNAME = userBefore;
-      delete process.env.MIRA_COMPILED_PROBE;
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("compiled exe: unreadable .env is skipped and the absence is reported; connect string is collapsed", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mira-env-"));
-    fs.mkdirSync(path.join(dir, ".env")); // exists, but reading it throws EISDIR
-    const cwd = process.cwd();
-    process.chdir(dir);
-    let seen = "";
-    try {
-      const a = await loadAdapter(
-        makeDriver({ async createPool(cfg: { connectString: string; poolAlias: string }) { seen = cfg.connectString; return { poolAlias: cfg.poolAlias, getConnection: async () => conn(), close: async () => {} }; } }),
-        { compiled: true },
-      );
-      register("s_compiled", {}, { connectString: "  (DESCRIPTION=\n   (ADDRESS=x))  " });
-      await a.withConnection("s_compiled", async () => 1);
-      expect(seen).toBe("(DESCRIPTION= (ADDRESS=x))");
-      await a.closeAll();
-    } finally {
-      process.chdir(cwd);
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
 });
 
 // ── pure helpers ───────────────────────────────────────────────────────────────
@@ -551,15 +488,12 @@ describe("unit/adapter: health monitor and circuit breaker", () => {
     register("s_throwcheck", { getConnection: async () => { if (warm) return conn(); throw new Error("ORA-12541"); } });
     await A.withConnection("s_throwcheck", async () => 1);
     warm = false;
-    const realWarning = logger.warning;
+    const before = getLogger();
     let thrown = 0;
-    (logger as { warning: unknown }).warning = (...a: unknown[]) => {
-      if (thrown++ === 0) throw new Error("logger down");
-      return (realWarning as (...x: unknown[]) => unknown).apply(logger, a);
-    };
+    setLogger({ info() {}, warn: () => { if (thrown++ === 0) throw new Error("logger down"); }, error() {} });
     A.nudgePoolHealth("s_throwcheck"); // check fails → its failure log throws → checkPool rejects → _runCheck logs it
     await wait(50);
-    (logger as { warning: unknown }).warning = realWarning;
+    setLogger(before);
     expect(thrown).toBeGreaterThan(1);
     A.setPoolHealthWatched(false);
     timeScale = 1;
@@ -636,13 +570,13 @@ describe("unit/adapter: stats and shutdown", () => {
 
 describe("unit/adapter: Thick-mode safety (2.1)", () => {
   const captureWarnings = async (fn: () => Promise<void>) => {
-    const real = logger.warning;
+    const before = getLogger();
     const seen: string[] = [];
-    (logger as { warning: unknown }).warning = (msg: unknown) => void seen.push(String(msg));
+    setLogger({ info() {}, warn: (msg: string) => void seen.push(String(msg)), error() {} });
     try {
       await fn();
     } finally {
-      (logger as { warning: unknown }).warning = real;
+      setLogger(before);
     }
     return seen;
   };
@@ -770,10 +704,31 @@ describe("unit/adapter: driver mode — configureDriver / initDriver (2.2)", () 
     expect(calls).toEqual([{ libDir: "/opt/instantclient_23" }]);
   });
 
+  it("binaryDir (compiled executables) is passed to initOracleClient in every Thick path", async () => {
+    let x = spyDriver();
+    let a = await loadAdapter(x.d);
+    a.configureDriver({ mode: "thick", libDir: "/ic", binaryDir: "/app/oracledb" });
+    a.initDriver();
+    expect(x.calls).toEqual([{ libDir: "/ic", binaryDir: "/app/oracledb" }]);
+    x = spyDriver();
+    a = await loadAdapter(x.d);
+    a.configureDriver({ binaryDir: "/app/oracledb" }); // auto, no client dir → system path
+    const envClient = process.env.ORACLE_INSTANT_CLIENT;
+    delete process.env.ORACLE_INSTANT_CLIENT;
+    try {
+      a.initDriver();
+    } finally {
+      if (envClient !== undefined) process.env.ORACLE_INSTANT_CLIENT = envClient;
+    }
+    expect(x.calls).toEqual([{ binaryDir: "/app/oracledb" }]);
+    a.configureDriver({ binaryDir: "/app/oracledb" });
+    expect(() => a.configureDriver({ binaryDir: "/elsewhere" })).toThrow("already initialised as thin (binaryDir /app/oracledb); it cannot change to auto (binaryDir /elsewhere)");
+  });
+
   it("configureDriver validates; after init it accepts compatible options only", async () => {
     const a = await loadAdapter(makeDriver({ oracleClientVersion: 2300000000 }));
-    expect(() => a.configureDriver({ mode: "fast" as "thin", libDir: "", extra: 1 } as never)).toThrow(
-      '[mira] Invalid config:\n  - driver.extra is not a driver option\n  - driver.mode must be "auto", "thin" or "thick"\n  - driver.libDir must be a non-empty string',
+    expect(() => a.configureDriver({ mode: "fast" as "thin", libDir: "", binaryDir: 3, extra: 1 } as never)).toThrow(
+      '[mira] Invalid config:\n  - driver.extra is not a driver option\n  - driver.mode must be "auto", "thin" or "thick"\n  - driver.libDir must be a non-empty string\n  - driver.binaryDir must be a non-empty string',
     );
     a.configureDriver(); // defaults to auto
     a.initDriver();

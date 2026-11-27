@@ -12,6 +12,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { setLogger } from "../shared/log";
 
 const USAGE = `Usage:
   mira generate types [--out <file>] [--tables A,B,PREFIX_%] [--import <module>]
@@ -77,8 +78,9 @@ const say = (text: string) => process.stdout.write(`${text}\n`);
 /** Run `fn` with a db handle; the pool is closed afterwards. */
 async function withDb(flags: Record<string, string>, fn: (api: Api, db: ReturnType<Api["createDb"]>) => Promise<number>): Promise<number> {
   loadEnv(path.resolve(flags.env ?? ".env"), flags.env !== undefined);
-  // The logger writes to stdout, where generated code and reports go: quiet unless --verbose.
-  process.env.ENABLE_CONSOLE_LOGS = flags.verbose ? "true" : "false";
+  // stdout carries generated code and reports. By default only Mira's warnings and errors
+  // reach the console, on stderr; --verbose sends every line there.
+  if (flags.verbose) setLogger({ debug: console.error, info: console.error, warn: console.error, error: console.error });
   // Loaded after the environment is in place: the adapter reads it at load time.
   const api = require("..") as Api;
   const db = api.createDb("appDb");

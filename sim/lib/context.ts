@@ -42,7 +42,8 @@ export async function buildContext(): Promise<Ctx> {
   process.env.DB_TEST_HOST = process.env.MIRA_SIM_DB_HOST ?? "";
   process.env.DB_TEST_PORT = process.env.MIRA_SIM_DB_PORT ?? "";
   process.env.DB_TEST_SID = process.env.MIRA_SIM_DB_SID ?? "";
-  if (!process.env.MIRA_LOGS) process.env.ENABLE_CONSOLE_LOGS = "false";
+  // Quiet unless MIRA_LOGS=1, which sends every Mira log line to the console.
+  (await import("../../src/shared/log")).setLogger(process.env.MIRA_LOGS ? console : false);
 
   const mod = (await import("../../src")) as Api;
   const { Session } = await import("../../src/core/Transaction");
