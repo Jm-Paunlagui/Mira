@@ -55,7 +55,7 @@ export async function configStage(sim: Sim, ctx: Ctx, state: State) {
     sim.eq("createMira: the reporting pool sees every sale", sales, state.model.orders.length);
     await mira.close();
   } finally {
-    api.setLogger(null); // back to Mira's own logger
+    api.setLogger(process.env.MIRA_LOGS ? console : false); // back to what the sim context set
   }
   sim.ok("setLogger: the job's logger saw its pool open and close", lines.some((l) => l.includes('"reporting"') && /ready/i.test(l)) && lines.some((l) => l.includes('Pool "reporting" closed')), lines);
   sim.eq("close(): the reporting instance is closed", mira.closed, true);
