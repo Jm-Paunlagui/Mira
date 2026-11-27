@@ -1,7 +1,8 @@
 /**
  * TYPE TESTS for relations and include() (Mira 2.1). Checked by `bun run typecheck`, never run.
  */
-import { defineTable, t, relations, hasMany, hasOne, belongsTo, createDb, type NestedRow } from "../../src";
+import { defineTable, t, relations, hasMany, hasOne, belongsTo, type NestedRow } from "../../src";
+import { db } from "./_db";
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 const assert = <T extends true>(_ok?: T) => {};
@@ -17,7 +18,6 @@ const OrdersR = relations(Orders, { customer: belongsTo(Customers, { foreignKey:
 type Order = { ID: number; CUSTOMER_ID: number; TOTAL: string }; // PIC (BLOB) is left out of related rows
 assert<Equal<NestedRow<typeof Orders.columns>, Order>>();
 
-const db = createDb("appDb");
 
 async function usage() {
   const withOrders = await CustomersR.on(db).find({ CITY: null }).include("orders", { where: { TOTAL: { $gt: 100 } }, sort: { ID: -1 }, limit: 5 }).toArray();

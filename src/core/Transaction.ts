@@ -75,7 +75,7 @@ class Session {
     declare _conn: DbConnection;
     /**
      * @param {Object} conn - The raw Oracle database connection (from the pool)
-     * @param {Object} db  - The db interface (from createDb) for driver constants
+     * @param {Object} db  - The db handle (mira.db()) for driver constants
      */
     constructor(conn: DbConnection, db: import("../driver/db").WrapperDb) {
         this._conn = conn;
@@ -196,10 +196,10 @@ class Session {
 class Transaction {
     declare db: import("../driver/db").WrapperDb;
     /**
-     * @param {Object} db - The db interface from createDb()
+     * @param {Object} db - The db handle from mira.db()
      *
      * @example
-     *   const db = createDb("appDb");
+     *   const db = mira.db();
      *   const txManager = new Transaction(db);
      */
     constructor(db: import("../driver/db").WrapperDb) {
@@ -247,7 +247,7 @@ class Transaction {
      * @returns {Promise<*>} Whatever your function returns
      *
      * @example
-     *   const counts = await new Transaction(createDb("appDbBulk")).withReadOnlyTransaction(async (session) => ({
+     *   const counts = await mira.transaction("appDbBulk").withReadOnlyTransaction(async (session) => ({
      *     a: await session.collection("T_A").countDocuments({}),
      *     b: await session.collection("T_B").countDocuments({}),
      *   }));

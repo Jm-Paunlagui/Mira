@@ -15,8 +15,7 @@
  * MIRA_DRIVER_LIB_DIR (Instant Client directory).
  *
  * A blank variable counts as unset. A number that does not parse is an error,
- * not a silent default. The 2.x variables (APP_DB_USERNAME, DB_HOST …) are not
- * read here; they still drive createDb("appDb").
+ * not a silent default.
  */
 
 import { miraConfigMessages as MSG } from "../shared/messages/miraConfig.messages";

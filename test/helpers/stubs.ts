@@ -53,7 +53,7 @@ export function stubConn(handler: Handler = () => { throw oraError(942, "table o
   return conn;
 }
 
-/** A fake db handle (same shape createDb returns) running every callback on `conn`. */
+/** A fake db handle (same shape as mira.db()) running every callback on `conn`. */
 export function stubDb(conn = stubConn()) {
   return {
     connectionName: "stub",

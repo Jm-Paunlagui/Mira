@@ -9,7 +9,7 @@
 import { describe, it, expect, afterAll } from "bun:test";
 import { createMira, MiraConfigError, OracleCollection, OracleSchema, OracleDCL, Transaction } from "../../src";
 import database from "../../src/driver/registry";
-import config from "../../src/config";
+import * as config from "../../src/driver/oracle";
 import { getLogger, setLogger } from "../../src/shared/log";
 import { rawExec, dropIfExists } from "../helpers/db";
 
@@ -50,7 +50,15 @@ describe("integration: createMira", () => {
     expect(config.isPoolOpen("miraV3Spare")).toBe(false);
 
     // The db handle's closePool() closes this instance, not every pool in the process.
-    await mira.db().closePool();
+    const kept = mira.db();
+    expect(kept.isHealthy()).toBe(true);
+    await kept.closePool();
+    // A handle kept past close() reports unhealthy and refuses work, whatever the call.
+    const closedMsg = "[mira] This Mira instance is closed; create a new one with createMira().";
+    expect(kept.isHealthy()).toBe(false);
+    await expect(kept.withConnection(async () => 1)).rejects.toThrow(closedMsg);
+    await expect(kept.withTransaction(async () => 1)).rejects.toThrow(closedMsg);
+    await expect(kept.withBatchConnection([async () => 1])).rejects.toThrow(closedMsg);
     await mira.close(); // idempotent
     expect(mira.closed).toBe(true);
     expect(config.isPoolOpen("miraV3")).toBe(false);

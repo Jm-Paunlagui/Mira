@@ -3,7 +3,8 @@
  * Every line marked @ts-expect-error must be a compile error; everything else must
  * compile. An exact-type assertion (`Equal`) fails the build when an inferred type drifts.
  */
-import { defineTable, t, createDb, Transaction, type RowOf, type InsertOf } from "../../src";
+import { defineTable, t, Transaction, type RowOf, type InsertOf } from "../../src";
+import { db } from "./_db";
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 const assert = <T extends true>(_ok?: T) => {};
@@ -44,7 +45,6 @@ const Tickets = defineTable("TICKETS", { NO: t.number(10).identityByDefault().pr
 assert<Equal<typeof Tickets.$insert, { TITLE: string; NO?: number }>>();
 assert<Equal<typeof Tickets.$row, { NO: number; TITLE: string }>>();
 
-const db = createDb("appDb");
 const orders = Orders.on(db);
 
 async function usage() {

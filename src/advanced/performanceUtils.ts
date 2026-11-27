@@ -69,7 +69,7 @@ function _wrapPrivilegeError(method: string, err: Error & { errorNum?: number; c
 /**
  * Create a performance utility instance bound to a database connection.
  *
- * @param {Object} db - db interface from createDb()
+ * @param {Object} db - db handle from mira.db()
  * @returns {Object} Object with: explainPlan(), analyze(),
  *   createMaterializedView(), refreshMaterializedView(), dropMaterializedView()
  *

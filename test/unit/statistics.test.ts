@@ -3,10 +3,11 @@
  * accumulators, window options and sort / paging options. No database round trip.
  */
 import { describe, it, expect } from "bun:test";
-import { buildAggregateSQL, buildWindowExpr, buildOrderBy, createDb, OracleCollection, QueryBuilder } from "../../src";
+import { buildAggregateSQL, buildWindowExpr, buildOrderBy, OracleCollection, QueryBuilder } from "../../src";
+import { createDb } from "../../src/driver/db";
 import { sortTerm } from "../../src/shared/utils";
 
-const db = createDb("appDb");
+const db = createDb("appDb"); // the test schema pool registered by test/helpers/db.ts
 const c = new OracleCollection("T_U", db);
 const agg = (p: unknown[]) => buildAggregateSQL("T", p as never[], {});
 const group = (acc: Record<string, unknown>) => agg([{ $group: { _id: null, X: acc } }]);

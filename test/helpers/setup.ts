@@ -11,8 +11,9 @@
  * Set MIRA_SKIP_PERSIST=1 to skip writing run history.
  */
 import { afterAll } from "bun:test";
-import { db, metrics, RUN_ID, ensureHistoryTables, coll } from "./db";
+import { metrics, RUN_ID, ensureHistoryTables, coll } from "./db";
 import { setLogger } from "../../src/shared/log";
+import { closeAll } from "../../src/driver/oracle";
 
 process.env.NODE_ENV = "test";
 // Tests provoke retries and failures on purpose; their warnings are noise. MIRA_LOGS=1 shows everything.
@@ -42,5 +43,6 @@ afterAll(async () => {
       }
     }
   }
-  await db.closePool();
+  // Every pool, including the ones suites register directly (chaos_*, sec_* …).
+  await closeAll();
 });

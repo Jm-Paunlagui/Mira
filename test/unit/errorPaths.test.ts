@@ -291,7 +291,7 @@ describe("unit/errors: remaining edges", () => {
   });
 
   it("db handle exposes pool health and stats", async () => {
-    const { createDb } = await import("../../src");
+    const { createDb } = await import("../../src/driver/db");
     const d = createDb("appDb");
     expect(d.isHealthy()).toBe(true);
     expect(await d.getPoolStats()).toHaveProperty("pools");

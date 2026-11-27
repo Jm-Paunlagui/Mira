@@ -21,21 +21,19 @@
  * that differs from one already in force, or a second, different logger while
  * another instance's is set, is refused rather than silently overridden.
  *
- * Each pool is added to the same registry createDb() uses, so everything that
- * takes a db handle (OracleCollection, OracleSchema, Transaction, models)
- * works with mira.db(). A name that is a 2.x built-in (appDb, appDbBulk)
- * replaces the env-driven entry until close(), as long as that pool has not
- * been opened yet in this process.
+ * Each pool is added to the process-wide registry under its name, so everything
+ * that takes a db handle (OracleCollection, OracleSchema, Transaction, models)
+ * works with mira.db(). Two live instances cannot use the same pool name.
  * ============================================================================
  */
 
-import config from "../config";
+import * as config from "./oracle";
 import database from "./registry";
 import { defineConfig } from "../config/defineConfig";
 import { getLogger, setLogger } from "../shared/log";
 import type { MiraConfig, ResolvedMiraConfig } from "../config/types";
 import { miraConfigMessages as MSG } from "../shared/messages/miraConfig.messages";
-import { createDb, type WrapperDb } from "./db";
+import { createDb, type DbConnection, type MiraDb } from "./db";
 import { OracleCollection } from "../core/OracleCollection";
 import { OracleSchema } from "../schema/OracleSchema";
 import { OracleDCL } from "../schema/OracleDCL";
@@ -45,8 +43,8 @@ import { Transaction } from "../core/Transaction";
 interface Mira<P extends string = string> {
   /** The validated, frozen config. */
   readonly config: ResolvedMiraConfig<P>;
-  /** Db handle for a pool (default: config.defaultPool). Its closePool() closes this instance. */
-  db(pool?: P): WrapperDb;
+  /** Db handle for a pool (default: config.defaultPool). Its closePool() closes this instance; after close() it refuses work. */
+  db(pool?: P): MiraDb;
   /** A table on a pool. */
   collection(table: string, pool?: P): OracleCollection;
   /** DDL helper on a pool. */
@@ -94,7 +92,7 @@ function createMira<P extends string>(input: MiraConfig<P> | ResolvedMiraConfig<
   if (ownsLogger) setLogger(logger);
 
   let closed = false;
-  const handles = new Map<string, WrapperDb>();
+  const handles = new Map<string, MiraDb>();
 
   const close = async () => {
     if (closed) return;
@@ -107,13 +105,24 @@ function createMira<P extends string>(input: MiraConfig<P> | ResolvedMiraConfig<
     if (ownsLogger && getLogger() === logger) setLogger(null);
   };
 
-  const db = (pool: P = resolved.defaultPool): WrapperDb => {
+  const db = (pool: P = resolved.defaultPool): MiraDb => {
     if (closed) throw new Error(MSG.MIRA_CLOSED);
     if (!names.includes(pool)) throw new Error(MSG.MIRA_UNKNOWN_POOL(pool, names));
     let handle = handles.get(pool);
     if (!handle) {
-      // createDb's closePool() would close every pool in the process; here it closes this instance.
-      handle = { ...createDb(pool), closePool: close };
+      const base = createDb(pool);
+      // A handle kept after close() reports unhealthy and refuses work with MIRA_CLOSED,
+      // instead of reaching a pool name that is no longer registered.
+      const live = <T>(run: () => Promise<T>): Promise<T> => (closed ? Promise.reject(new Error(MSG.MIRA_CLOSED)) : run());
+      handle = {
+        ...base,
+        withConnection: <T>(cb: (conn: DbConnection) => T | Promise<T>) => live(() => base.withConnection(cb)),
+        withTransaction: <T>(cb: (conn: DbConnection) => T | Promise<T>) => live(() => base.withTransaction(cb)),
+        withBatchConnection: (ops: ((...args: unknown[]) => unknown)[]) => live(() => base.withBatchConnection(ops)),
+        isHealthy: () => !closed && base.isHealthy(),
+        // The bare handle's closePool() would close every pool in the process; here it closes this instance.
+        closePool: close,
+      };
       handles.set(pool, handle);
     }
     return handle;

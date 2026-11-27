@@ -73,7 +73,7 @@ type AlterOperation = {
 class OracleSchema {
   declare db: import("../driver/db").WrapperDb;
   /**
-   * @param {Object} db - db interface from createDb
+   * @param {Object} db - db handle from mira.db()
    */
   constructor(db: import("../driver/db").WrapperDb) {
     this.db = db;

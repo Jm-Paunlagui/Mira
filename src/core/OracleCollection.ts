@@ -166,7 +166,7 @@ function _firstRowWhere(whereClause: string): string {
     return whereClause ? `${whereClause} AND ROWNUM = 1` : "WHERE ROWNUM = 1";
 }
 
-/** The db handle createDb() returns. */
+/** The db handle mira.db() returns. */
 type WrapperDb = ReturnType<typeof import("../driver/db").createDb>;
 /** RETURNING column names; values come back as the `returning` object/array. */
 type ReturningOption = { returning?: string[] };
@@ -209,7 +209,7 @@ class OracleCollection {
      * Create an OracleCollection instance for a specific table.
      *
      * @param {string} tableName - The Oracle table name (e.g. "users", "orders")
-     * @param {Object} db - The db interface from createDb()
+     * @param {Object} db - The db handle from mira.db()
      * @param {Object} [_conn] - Raw connection (internal use).
      *   When null → standalone mode (borrows connections from pool).
      *   When set → transaction mode (reuses this connection for all operations).

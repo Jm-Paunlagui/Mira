@@ -1,6 +1,6 @@
 # Mira 3.0 Roadmap
 
-**Status:** step 3 in progress · **Base:** v2.1.0 · **Branches (stacked):** `feature/v3-config` (#34) → `feature/v3-driver` (#35) → `feature/v3-restructure`
+**Status:** step 3 in progress (3a–3c done) · **Base:** v2.1.0 · **Branches (stacked):** `feature/v3-config` (#34) → `feature/v3-driver` (#35) → `feature/v3-restructure`
 
 Mira grew inside an app template (CATHERINE / eMeal), so `config/`, `constants/` and `utils/logger` were app code that ended up in the library. An app that installed `@jm-paunlagui/mira` from npm could use only the two built-in pools (`appDb`, `appDbBulk`), through Mira's own env names, and adding a pool meant editing `node_modules`. 3.0 makes Mira a standalone library: the app passes its config in, and Mira reads no env variable, writes no log file and initialises no driver unless asked.
 
@@ -22,7 +22,15 @@ Update this file as each item lands: tick the box and add the PR number.
 - [x] **3a. Move files** to the target layout (§2). Import paths only; no behaviour change; full suite green at 100% (567 tests). 39 files moved with `git mv`; `package.json` entry is `dist/index.js`. Still to do: `config/index.ts` (adapter factory) stays until 3c, and `driver/registry.ts` still holds the connect-string builders until 3c splits out `config/connectString.ts`.
 - [x] **3b. Drop app-template code.** Removed `logger.ts`, `logRedaction.ts`, `requestContext.ts`, `runtimePaths.ts`, `types/express.d.ts` and `@types/express`. Default log sink is the console, warnings and errors only (§4 D1). `driver.binaryDir` added (§4 D4); the compiled-exe `.env` loader, the PATH set-up and the compiled connect-string tweak are gone. Tests, `sim`, the CLI and the runner use `setLogger` instead of `ENABLE_CONSOLE_LOGS`; `LOG_*` left `.env.example`. 565 tests at 100%. Also fixed a chaos-test race (health ping holding a connection during the leak check).
 - [x] **Blocker found during 3b — CI red on #34 and #35 (fixed):** `bun run sim` fails its rule that every public function is called by the simulation (all 345 checks pass). Not called: `createMira`, `defineConfig`, `fromEnv`, `buildSimpleConnectString`, `buildTNSConnectString` (#34) and `configureDriver`, `initDriver`, `setLogger` (#35). Fixed with sim stage 17 ("config": a reporting job with its own `createMira` pool): `cd529b0` on `feature/v3-config`, `3d8917f` on `feature/v3-driver`, merged forward into this branch. Sim: 162/162 functions, 356 checks.
-- [ ] **3c. Remove the 2.x API** (§3 "Removed"). Tests, `sim/`, the CLI and the Node smoke test move to `createMira()`. CI and `.env.example` move to `MIRA_DB_*`.
+- [x] **3c. Remove the 2.x API** (§3 "Removed"). Done:
+  - `createDb` is internal; the built-in env pools, the `APP_TEST_DB_*` switch, `POOL_NAMES`, `READINESS_GATING_POOLS`, `DB_TYPE` / `createAdapter` (`config/index.ts`) and the `ORACLE_INSTANT_CLIENT` / Windows-DLL check are gone. Mira reads no env variable except node's `UV_THREADPOOL_SIZE` (for a warning) and Oracle's `ORA_SDTZ`.
+  - `driver/registry.ts` starts empty; the builders moved to `config/connectString.ts`; 21 unused adapter message templates removed.
+  - New public type `MiraDb` (what `mira.db()` returns) and `DbConnection`. A handle kept after `close()` reports unhealthy and refuses work with `MIRA_CLOSED` (it used to reach an unregistered pool name).
+  - `"auto"` mode with no client on the library path logs a one-line notice instead of a multi-line DPI-1047 warning (a named `libDir` that fails is still a warning).
+  - Tests use `createMira(fromEnv())` in `test/helpers/db.ts`; `config.test.ts` became `registry.test.ts`; type tests share `test/types/_db.ts`. The sim runs on its own `createMira` pool and counts `mira.*` methods. CLI, Node smoke test, CI and `.env.example` use `MIRA_DB_*`; CI no longer needs the listener's SID-as-service tweak.
+  - Fixed a flashback test race (AS OF TIMESTAMP granularity); it now restores its fixture on failure.
+  - 558 tests at 100%; sim 167/167 functions, 361 checks.
+  - **Local `.env` still needs `MIRA_DB_USER`, `MIRA_DB_PASSWORD`, `MIRA_DB_CONNECT_STRING`** (see `.env.example`).
 - [ ] **3d. Package.** Version 3.0.0; `main` / `types` / `exports` → `dist/index.js`; drop `dotenv` and `@types/express`; publish `dist` only. Rewrite the README setup section; CHANGELOG 3.0.0; `docs/MIGRATION-3.0.md`.
 - [ ] **3e. Verify as a user would.** `npm pack`, install the tarball into an empty temp project with no `.env`, define its own pool, run a query under Node and Bun.
 - [ ] **3f. Merge order:** #34 → #35 → step 3 PR → tag `v3.0.0` → publish.
@@ -69,8 +77,8 @@ The query layer's folders sit at the top level, so the old `oracle-mongo-wrapper
 | `src/utils/oracle-mongo-wrapper/createMira.ts` | `src/driver/createMira.ts` |
 | `src/utils/oracle-mongo-wrapper/db.ts` | `src/driver/db.ts` |
 | `src/config/adapters/oracle.ts` | `src/driver/oracle.ts` |
-| `src/config/database.ts` | `src/driver/registry.ts` (built-ins removed in 3c) + `src/config/connectString.ts` |
-| `src/config/index.ts` (`DB_TYPE` adapter factory) | removed in 3c |
+| `src/config/database.ts` | `src/driver/registry.ts` (built-ins removed) + `src/config/connectString.ts` |
+| `src/config/index.ts` (`DB_TYPE` adapter factory) | removed |
 | `src/config/log.ts` | `src/shared/log.ts` |
 | `src/config/{types,defineConfig,fromEnv}.ts` | unchanged |
 | `src/constants/messages/*` | `src/shared/messages/*` |

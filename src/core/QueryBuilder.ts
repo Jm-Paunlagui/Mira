@@ -151,7 +151,7 @@ class QueryBuilder {
      *
      * @param {string} tableName - The table to query
      * @param {Object} filter - MongoDB-style filter (e.g. { status: "active" })
-     * @param {Object} db - The db interface from createDb()
+     * @param {Object} db - The db handle from mira.db()
      * @param {Object} [conn] - Raw connection (if inside a transaction/session)
      * @param {Object} [options] - Initial options: sort, limit, skip, projection, etc.
      */

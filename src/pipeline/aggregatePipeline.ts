@@ -110,7 +110,7 @@ function _createCounter(): Counter {
  *
  * @param {string} tableName - The base table name
  * @param {Array} pipeline - Array of stage objects (e.g. [{ $match: {...} }, ...])
- * @param {Object} db - db interface from createDb() (needed for oracledb constants)
+ * @param {Object} db - db handle from mira.db() (needed for oracledb constants)
  * @returns {{ sql: string, binds: Object, arrays?: Object }} The SQL, its bind variables and, when
  *   $push / $addToSet / $percentile (list of p) produce JSON arrays, those output
  *   columns ("array", or "set" to de-duplicate) for aggregate() to parse.

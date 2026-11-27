@@ -59,18 +59,18 @@ jobs:
           --health-timeout 5s
           --health-retries 30
     env:
-      DB_TYPE: oracle
-      DB_HOST: localhost
-      DB_PORT: "1521"
-      # Mira connects with (SID=...); the listener is told below to accept the PDB name as one.
-      DB_APP_SERVICE_NAME: FREEPDB1
-      APP_DB_USERNAME: MIRA
-      APP_DB_PASSWORD: MiraCi_app_2026
-      APP_TEST_DB_USERNAME: ""
+      # The test schema's pool: fromEnv() → appDb. FREEPDB1 is the PDB's service name.
+      MIRA_DB_USER: MIRA
+      MIRA_DB_PASSWORD: MiraCi_app_2026
+      MIRA_DB_CONNECT_STRING: localhost:1521/FREEPDB1
+      MIRA_DB_POOL_MIN: "5"
+      MIRA_DB_POOL_MAX: "20"
+      MIRA_DB_QUEUE_MAX: "40"
+      MIRA_DB_POOL_TIMEOUT: "30"
+      # The simulation's schema; it connects through MIRA_DB_CONNECT_STRING too.
       MIRA_SIM_DB_USERNAME: MIRA_SIM
       MIRA_SIM_DB_PASSWORD: MiraCi_app_2026
       MIRA_SIM_GRANTEE: MIRA
-      ORACLE_INSTANT_CLIENT: ""
       # Thick mode runs every database call on a native worker thread. A call waiting
       # on a row lock holds its thread, so with fewer threads than such calls the lock
       # holder never gets one to commit and the client hangs (seen on this 4-core
@@ -87,14 +87,12 @@ jobs:
           node-version: 22
       - run: bun install --frozen-lockfile
 
-      - name: Prepare the database (listener, MIRA and MIRA_SIM schemas)
+      - name: Prepare the database (MIRA and MIRA_SIM schemas)
         env:
           ORACLE: ${{ job.services.oracle.id }}
         run: |
-          # Mira builds (CONNECT_DATA=(SID=...)): let the listener take FREEPDB1 as a SID.
-          docker exec "$ORACLE" bash -c 'echo "USE_SID_AS_SERVICE_LISTENER = ON" >> "$ORACLE_HOME/network/admin/listener.ora" && lsnrctl reload'
           docker cp .github/oracle/setup-users.sql "$ORACLE":/tmp/setup-users.sql
-          docker exec "$ORACLE" sqlplus -s / as sysdba @/tmp/setup-users.sql "$APP_DB_PASSWORD"
+          docker exec "$ORACLE" sqlplus -s / as sysdba @/tmp/setup-users.sql "$MIRA_DB_PASSWORD"
 
       - name: Install Oracle Instant Client (Thick mode)
         if: matrix.driver == 'thick'
@@ -106,7 +104,7 @@ jobs:
           curl -sSLo /tmp/ic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip
           sudo unzip -q /tmp/ic.zip -d /opt/oracle
           IC_DIR=$(ls -d /opt/oracle/instantclient_*)
-          # On Linux the client is found through the library path, not ORACLE_INSTANT_CLIENT.
+          # On Linux the client is found through the library path (configureDriver's default).
           echo "LD_LIBRARY_PATH=$IC_DIR" >> "$GITHUB_ENV"
 
       - name: Test suite (with coverage)

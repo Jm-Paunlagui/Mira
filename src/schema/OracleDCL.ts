@@ -35,7 +35,7 @@ const PRIVILEGE_ERROR_CODES = [1031, 942, 1917, 1919];
 class OracleDCL {
     declare db: Record<string, any>;
     /**
-     * @param {Object} db - db interface from createDb
+     * @param {Object} db - db handle from mira.db()
      */
     constructor(db: Record<string, unknown>) {
         this.db = db;

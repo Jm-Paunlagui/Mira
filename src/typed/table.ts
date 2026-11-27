@@ -233,7 +233,7 @@ export interface TableOptions<C extends Columns> {
   hooks?: TableHooks<C>;
 }
 
-/** What on() accepts: the db handle from createDb(), or a transaction session. */
+/** What on() accepts: a db handle (mira.db()), or a transaction session. */
 export type TableTarget = WrapperDb | { collection(tableName: string): OracleCollection };
 
 // ─── defineTable ────────────────────────────────────────────────────────────

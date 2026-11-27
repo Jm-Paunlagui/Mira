@@ -1,17 +1,17 @@
 /**
- * Builds the simulation context: points Mira's pools at the simulation's own
+ * Builds the simulation context: opens Mira's pool on the simulation's own
  * schema, refuses to run anywhere else, and hands the stages a TRACKED copy of
  * the public API plus an untracked raw-SQL handle for verification.
  *
- * Schema switch: Mira already redirects appDb / appDbBulk to APP_TEST_DB_* when
- * NODE_ENV=development and APP_TEST_DB_USERNAME is set (src/driver/registry.ts).
- * The simulation sets those from MIRA_SIM_DB_* before Mira is first imported,
- * so the library is exercised through its normal configuration path.
+ * The pool is a createMira() pool named "appDb" on MIRA_SIM_DB_USERNAME /
+ * MIRA_SIM_DB_PASSWORD. Its connect string is MIRA_SIM_DB_CONNECT_STRING, else
+ * a TNS descriptor from MIRA_SIM_DB_HOST / _PORT / _SID, else the main
+ * database's (MIRA_DB_CONNECT_STRING, or MIRA_DB_HOST + MIRA_DB_SERVICE).
  */
 import * as tracker from "./tracker";
 
 export type Api = typeof import("../../src");
-type Db = ReturnType<Api["createDb"]>;
+type Db = import("../../src").MiraDb;
 
 export interface Ctx {
   api: Api;
@@ -23,7 +23,7 @@ export interface Ctx {
   rawCount: (table: string, where?: string, binds?: Record<string, unknown>) => Promise<number>;
   schemaUser: string;
   /** Where the simulation schema is, for stages that open their own pools (createMira). */
-  conn: { user: string; password: string; host: string; port: string; sid: string };
+  conn: { user: string; password: string; connectString: string };
 }
 
 export async function buildContext(): Promise<Ctx> {
@@ -32,26 +32,30 @@ export async function buildContext(): Promise<Ctx> {
   if (!user || !password) {
     throw new Error("MIRA_SIM_DB_USERNAME / MIRA_SIM_DB_PASSWORD are not set. Create the schema with sim/setup-schema.sql and add both to .env.");
   }
-  for (const other of [process.env.APP_DB_USERNAME, process.env.APP_TEST_DB_USERNAME]) {
-    if (other && other.trim().toUpperCase() === user.toUpperCase()) {
-      throw new Error(`Refusing to run: MIRA_SIM_DB_USERNAME (${user}) is also the app or test schema. The simulation drops and rebuilds its SIM_* objects, so it needs a schema of its own.`);
-    }
+  const testUser = process.env.MIRA_DB_USER?.trim();
+  if (testUser && testUser.toUpperCase() === user.toUpperCase()) {
+    throw new Error(`Refusing to run: MIRA_SIM_DB_USERNAME (${user}) is also the test schema (MIRA_DB_USER). The simulation drops and rebuilds its SIM_* objects, so it needs a schema of its own.`);
   }
 
-  process.env.NODE_ENV = "development";
-  process.env.APP_TEST_DB_USERNAME = user;
-  process.env.APP_TEST_DB_PASSWORD = password;
-  process.env.DB_TEST_HOST = process.env.MIRA_SIM_DB_HOST ?? "";
-  process.env.DB_TEST_PORT = process.env.MIRA_SIM_DB_PORT ?? "";
-  process.env.DB_TEST_SID = process.env.MIRA_SIM_DB_SID ?? "";
   // Quiet unless MIRA_LOGS=1, which sends every Mira log line to the console.
   (await import("../../src/shared/log")).setLogger(process.env.MIRA_LOGS ? console : false);
 
   const mod = (await import("../../src")) as Api;
   const { Session } = await import("../../src/core/Transaction");
 
-  // Untracked handle for verification, created before anything is wrapped.
-  const rawDb = mod.createDb("appDb");
+  const e = process.env;
+  const val = (k: string) => e[k]?.trim() || "";
+  const connectString =
+    val("MIRA_SIM_DB_CONNECT_STRING") ||
+    (val("MIRA_SIM_DB_HOST") && val("MIRA_SIM_DB_SID") ? mod.buildTNSConnectString(val("MIRA_SIM_DB_HOST"), val("MIRA_SIM_DB_PORT") || "1521", val("MIRA_SIM_DB_SID")) : "") ||
+    val("MIRA_DB_CONNECT_STRING") ||
+    (val("MIRA_DB_HOST") && val("MIRA_DB_SERVICE") ? `${val("MIRA_DB_HOST")}:${val("MIRA_DB_PORT") || "1521"}/${val("MIRA_DB_SERVICE")}` : "");
+  if (!connectString) throw new Error("No connect string: set MIRA_SIM_DB_CONNECT_STRING, MIRA_SIM_DB_HOST + MIRA_SIM_DB_SID, or the main MIRA_DB_* connection.");
+  const conn = { user, password, connectString };
+
+  // Untracked: the sim's own instance, and a handle for verification, created before anything is wrapped.
+  const mira = mod.createMira({ pools: { appDb: { ...conn, poolMin: 5, poolMax: 20, queueMax: 40, poolTimeout: 30 } } });
+  const rawDb = mira.db();
   const raw = async <T = Record<string, unknown>>(sql: string, binds: Record<string, unknown> | unknown[] = {}) =>
     (await rawDb.withConnection((c) => c.execute<T>(sql, binds, { outFormat: rawDb.oracledb.OUT_FORMAT_OBJECT, autoCommit: true }))).rows ?? [];
   const rawCount = async (table: string, where = "", binds: Record<string, unknown> = {}) =>
@@ -86,24 +90,18 @@ export async function buildContext(): Promise<Ctx> {
   const api: Record<string, unknown> = { ...mod };
   for (const [name, v] of Object.entries(mod)) {
     if (typeof v !== "function" || /^[A-Z]/.test(name)) continue; // classes are tracked by prototype
-    if (name === "createDb") api[name] = tracker.trackFn(name, v as never, (d) => tracker.trackObject("db", d as object));
+    if (name === "createMira") api[name] = tracker.trackFn(name, v as never, (m) => tracker.trackMira(m as object));
     else if (name === "createPerformance") api[name] = tracker.trackFn(name, v as never, (p) => tracker.trackObject("performance", p as object));
     else if (name === "createMigrator") api[name] = tracker.trackFn(name, v as never, (m) => tracker.trackObject("migrator", m as object));
     else api[name] = tracker.trackFn(name, v as never);
     Object.assign(api[name] as object, v); // keep a function's own properties (sql.ident)
   }
-  // Register the db-handle and performance methods up front, so an unused one is reported.
+  // Register the mira, db-handle and performance methods up front, so an unused one is reported.
+  tracker.trackMira(mira);
   tracker.trackObject("db", rawDb);
   tracker.trackObject("performance", mod.createPerformance(rawDb) as object);
   tracker.trackObject("migrator", mod.createMigrator(rawDb) as object);
 
   const tracked = api as unknown as Api;
-  const conn = {
-    user,
-    password,
-    host: process.env.MIRA_SIM_DB_HOST || process.env.DB_HOST || "",
-    port: process.env.MIRA_SIM_DB_PORT || process.env.DB_PORT || "",
-    sid: process.env.MIRA_SIM_DB_SID || process.env.DB_APP_SERVICE_NAME || "",
-  };
-  return { api: tracked, db: tracked.createDb("appDb"), raw, rawCount, schemaUser: U, conn };
+  return { api: tracked, db: tracker.trackObject("db", rawDb), raw, rawCount, schemaUser: U, conn };
 }

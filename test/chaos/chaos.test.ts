@@ -8,7 +8,7 @@
  * so appDb is never put at risk; each test also checks appDb still works.
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import config from "../../src/config";
+import * as config from "../../src/driver/oracle";
 import database from "../../src/driver/registry";
 import { Transaction, parseFilter } from "../../src";
 import { db, schema, coll, dropIfExists, recordMetric, timeIt, sleep, appDbInUse } from "../helpers/db";

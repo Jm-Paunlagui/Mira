@@ -55,7 +55,7 @@ import { oracleMongoWrapperMessages as MSG } from "../shared/messages";
  * Create a regular CTE from named QueryBuilder instances.
  * Returns a chainable CTEResult with .from(), .join(), .sort(), .limit(), .skip(), .toArray().
  *
- * @param {Object} db - db interface from createDb()
+ * @param {Object} db - db handle from mira.db()
  * @param {Object} cteDefs - Map of CTE names to QueryBuilder instances
  *                           e.g. { active: users.find({...}), recent: orders.find({...}) }
  * @returns {CTEResult} Chainable CTE result
@@ -93,7 +93,7 @@ function withCTE(db: import("../driver/db").WrapperDb, cteDefs: Record<string, Q
  * Create a recursive CTE for hierarchical/tree-structured data.
  * Automatically adds a LVL column tracking depth.
  *
- * @param {Object} db - db interface from createDb()
+ * @param {Object} db - db handle from mira.db()
  * @param {string} cteName - Name for the recursive CTE
  * @param {Object} def - Recursive definition
  * @param {QueryBuilder} def.anchor - The starting query (root nodes)

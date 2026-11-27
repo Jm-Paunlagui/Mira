@@ -1,13 +1,13 @@
 /**
  * TYPE TESTS for after(), for await, sql`…` and onQuery (Mira 2.1). Checked by `bun run typecheck`, never run.
  */
-import { defineTable, t, createDb, sql, onQuery, type QueryEvent, type SqlStatement } from "../../src";
+import { defineTable, t, sql, onQuery, type QueryEvent, type SqlStatement } from "../../src";
+import { db } from "./_db";
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 const assert = <T extends true>(_ok?: T) => {};
 
 const Orders = defineTable("ORDERS", { ID: t.id(), TOTAL: t.money(), NOTE: t.text(20).nullable() });
-const db = createDb("appDb");
 const orders = Orders.on(db);
 
 async function usage() {

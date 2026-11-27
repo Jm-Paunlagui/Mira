@@ -2,8 +2,9 @@
  * Oracle Adapter
  * Merges: oracleEnvironment.js + oracleLoader.js + oracleConnectionPool.js
  *
- * Pools are lazy — created on first use, registered by name from database.js.
- * Adding a new DB never requires touching this file.
+ * Pools are lazy — created on first use, by name, from the registry that
+ * createMira() fills (src/driver/registry.ts). Mira reads no environment
+ * variable for them.
  *
  * Public API:
  *   withConnection(name, cb)          acquire → run → release
@@ -14,13 +15,10 @@
  *   isPoolHealthy(name)               health probe
  *   getHealthMetrics()                full health object
  *
- * Registered pool names live in `POOL_NAMES` in src/driver/registry.ts — read
- * them from there, never from a doc comment.
+ * There are no built-in pools: every name comes from a createMira() config.
  */
 
 
-import fs from "fs";
-import path from "path";
 import { EventEmitter } from "events";
 import database from "./registry";
 // Captured at load, not per call: freshOracleAdapter.js relies on it (see database.ts).
@@ -29,47 +27,6 @@ import { log } from "../shared/log";
 import { oracleMessages, miraConfigMessages } from "../shared/messages";
 import { checkDriver, MiraConfigError } from "../config/defineConfig";
 import type { DriverMode, DriverOptions } from "../config/types";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 1 — Oracle client environment  (was: oracleEnvironment.js)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function validateOracleClient() {
-    const clientPath = process.env.ORACLE_INSTANT_CLIENT;
-    if (!clientPath) {
-        log().warning(oracleMessages.ORACLE_INSTANT_CLIENT_NOT_SET);
-        return false;
-    }
-    if (!fs.existsSync(clientPath)) {
-        log().warning(oracleMessages.ORACLE_CLIENT_PATH_NOT_FOUND(clientPath));
-        return false;
-    }
-
-    // Oracle Instant Client ships the core internationalisation DLL under
-    // different names across releases:
-    //   • v23.x early builds: oraociei.dll   (no version suffix)
-    //   • v23.x later builds: oraociei23.dll (versioned suffix)
-    // Accept either variant so the validation passes on all 23.x installs.
-    const hasCoreDll =
-        fs.existsSync(path.join(clientPath, "oraociei23.dll")) ||
-        fs.existsSync(path.join(clientPath, "oraociei.dll"));
-
-    const required = ["oci.dll"];
-    const missing = required.filter(
-        (f) => !fs.existsSync(path.join(clientPath, f)),
-    );
-    if (!hasCoreDll) missing.push("oraociei23.dll or oraociei.dll");
-
-    if (missing.length) {
-        log().warning(
-            oracleMessages.ORACLE_FILES_MISSING(missing, clientPath),
-        );
-        return false;
-    }
-
-    log().notice(oracleMessages.ORACLE_CLIENT_VALIDATED(clientPath));
-    return true;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECTION 2 — Driver loader  (was: oracleLoader.js)
@@ -88,24 +45,23 @@ function _ensureSessionTimeZone() {
     if (process.env.ORA_SDTZ === undefined || process.env.ORA_SDTZ.trim() === "") process.env.ORA_SDTZ = "+00:00";
 }
 
+/** "auto": try Thick mode from libDir or the system library path; a failure leaves Thin mode. */
 function _initOracleClient(db: OracleDb, libDir?: string) {
     if (db.oracleClientVersion) return;
-    const clientPath = libDir ?? process.env.ORACLE_INSTANT_CLIENT;
-    // An explicit libDir is passed as is: validateOracleClient checks the Windows DLL names only.
-    const isValid = libDir ? true : validateOracleClient();
     try {
-        if (isValid && clientPath) {
-            db.initOracleClient({ libDir: clientPath, ..._binaryOpts() });
-            log().notice(
-                libDir ? `Oracle client initialised from ${libDir}.` : "Oracle client initialised from ORACLE_INSTANT_CLIENT.",
-            );
+        if (libDir) {
+            db.initOracleClient({ libDir, ..._binaryOpts() });
+            log().notice(`Oracle client initialised from ${libDir}.`);
         } else {
             db.initOracleClient(_binaryOpts());
             log().notice("Oracle client initialised from system PATH.");
         }
     } catch (err) {
-        if (!err.message.includes("NJS-077"))
-            log().warning(`Oracle client init: ${err.message}`);
+        if (err.message.includes("NJS-077")) return;
+        // No client on the library path is the ordinary Thin-mode case: a notice, first line only.
+        // A libDir the app named that fails to load is worth a warning.
+        if (libDir) log().warning(`Oracle client init from ${libDir} failed; using Thin mode: ${err.message}`);
+        else log().notice(`No Oracle Client on the library path; using Thin mode (${String(err.message).split("\n")[0].slice(0, 120)}).`);
     }
 }
 
@@ -181,9 +137,8 @@ function initDriver(): Readonly<{ mode: "thin" | "thick"; clientVersion?: number
             // Thin rejects some, e.g. 0x939), else Thin.
             _initOracleClient(oracledb, libDir);
         } else if (mode === "thick" && !oracledb.oracleClientVersion) {
-            const clientPath = libDir ?? process.env.ORACLE_INSTANT_CLIENT;
             try {
-                oracledb.initOracleClient({ ...(clientPath && { libDir: clientPath }), ..._binaryOpts() });
+                oracledb.initOracleClient({ ...(libDir && { libDir }), ..._binaryOpts() });
             } catch (err) {
                 if (!err.message.includes("NJS-077")) throw err;
             }
@@ -597,14 +552,6 @@ function _validateConfig(config: import("oracledb").PoolAttributes, name: unknow
         (k) => !config[k],
     );
     if (!missing.length) return;
-    const isPlaceholder =
-        config.user && String(config.user).includes("placeholder");
-    if (process.env.NODE_ENV === "development" && isPlaceholder) {
-        log().warning(
-            `Dev mode: placeholder config for "${name}". Missing: ${missing.join(", ")}`,
-        );
-        return;
-    }
     throw new Error(
         `Missing config fields for "${name}": ${missing.join(", ")}`,
     );
@@ -776,7 +723,7 @@ async function initializePools() {
             const isNJS116 = err.message.includes("NJS-116");
             const isNJS046 = err.message.includes("NJS-046");
             const hint = isNJS116
-                ? "The DB password verifier is not supported in Thin mode. Set ORACLE_INSTANT_CLIENT in .env to enable Thick mode, or reset the DB user password with a compatible verifier."
+                ? "The DB password verifier is not supported in Thin mode. Use Thick mode (configureDriver({ mode: \"thick\", libDir })), or reset the DB user password with a compatible verifier."
                 : isNJS046
                   ? "Pool alias collision during retry. The previous pool was not fully cleaned up."
                   : "Check DB credentials, network connectivity, and Oracle client installation.";
@@ -787,7 +734,6 @@ async function initializePools() {
                 stack: err.stack,
                 hint,
                 pool: name,
-                environment: process.env.NODE_ENV || "development",
             });
             results.push({ name, success: false, error: err.message });
         }
@@ -1261,4 +1207,4 @@ const __export_onPoolHealthCheck = (fn: (check: { name: string; ok: boolean }) =
         return () => healthMonitor.off("check", fn);
     };
 const __export_setPoolHealthWatched = (watched: boolean) => healthMonitor.setWatched(watched);
-export { configureDriver, initDriver, toDriverConnectTimeoutSec, POOL_DEFAULTS, withConnection, withTransaction, withBatchConnection, initializePools, closeAll, closePool, isPoolOpen, getPoolStats, __export_isPoolHealthy as isPoolHealthy, __export_getHealthMetrics as getHealthMetrics, __export___setPoolHealthForTest as __setPoolHealthForTest, __export_onPoolHealthChange as onPoolHealthChange, __export_allPoolsHealthy as allPoolsHealthy, __export_recordProbeSuccess as recordProbeSuccess, __export_nudgePoolHealth as nudgePoolHealth, __export_onPoolHealthCheck as onPoolHealthCheck, __export_setPoolHealthWatched as setPoolHealthWatched, validateOracleClient, oracledb, OUT_FORMAT_OBJECT, SYSDBA_PRIVILEGE, EXECUTE_OPTIONS, moneySafeFetchTypeHandler };
+export { configureDriver, initDriver, toDriverConnectTimeoutSec, POOL_DEFAULTS, withConnection, withTransaction, withBatchConnection, initializePools, closeAll, closePool, isPoolOpen, getPoolStats, __export_isPoolHealthy as isPoolHealthy, __export_getHealthMetrics as getHealthMetrics, __export___setPoolHealthForTest as __setPoolHealthForTest, __export_onPoolHealthChange as onPoolHealthChange, __export_allPoolsHealthy as allPoolsHealthy, __export_recordProbeSuccess as recordProbeSuccess, __export_nudgePoolHealth as nudgePoolHealth, __export_onPoolHealthCheck as onPoolHealthCheck, __export_setPoolHealthWatched as setPoolHealthWatched, oracledb, OUT_FORMAT_OBJECT, SYSDBA_PRIVILEGE, EXECUTE_OPTIONS, moneySafeFetchTypeHandler };

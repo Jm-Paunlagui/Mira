@@ -1,7 +1,8 @@
 /**
  * TYPE TESTS for JSON columns (Mira 2.1). Checked by `bun run typecheck`, never run.
  */
-import { defineTable, t, createDb } from "../../src";
+import { defineTable, t } from "../../src";
+import { db } from "./_db";
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 const assert = <T extends true>(_ok?: T) => {};
@@ -18,7 +19,7 @@ const Members = defineTable("MEMBERS", {
 assert<Equal<typeof Members.$row, { ID: number; NAME: string; PREFS: Prefs; TAGS: string[] | null; RAW: unknown; NATIVE: { n: number } | null }>>();
 assert<Equal<typeof Members.$insert, { NAME: string; PREFS: Prefs; RAW: unknown; TAGS?: string[] | null; NATIVE?: { n: number } | null }>>();
 
-const members = Members.on(createDb("appDb"));
+const members = Members.on(db);
 
 async function usage() {
   await members.insertOne({ NAME: "Ana", PREFS: { lounge: true, drinks: ["coffee"] }, RAW: 1 });
