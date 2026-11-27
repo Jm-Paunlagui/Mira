@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased] — 2.2.0
+
+Theme: config passed in, not read from Mira's own env names. Step 1 of the 3.0 restructure; everything adds to 2.1, nothing breaks.
+
+### Added
+
+- **`createMira(config)`**: pools passed in as a config object, any number of them, any names. Returns `db(pool?)`, `collection(table, pool?)`, `schema()`, `dcl()`, `transaction()` and `close()`, which closes that instance's pools only. Pool names are type-checked from the config's keys.
+- **`defineConfig(config)`**: validates a config and returns it frozen with `defaultPool` filled in. Every problem is reported in one `MiraConfigError` (`err.issues`); unknown pool keys are refused.
+- **`fromEnv(options?)`**: opt-in reader for `MIRA_DB_*` (or per-pool prefixes) into a config. A number that does not parse throws instead of falling back.
+- `buildSimpleConnectString` / `buildTNSConnectString` are exported from the package.
+- Adapter: `closePool(name)` closes one pool and stops monitoring it; `isPoolOpen(name)`. Registry: `registerConnection` / `unregisterConnection` (used by `createMira`).
+- Types: `Mira`, `MiraConfig`, `PoolConfig`, `ResolvedMiraConfig`, `FromEnvOptions`.
+
+### Fixed
+
+- `getConnectionConfig` looks up own keys only: `"constructor"` or `"toString"` no longer resolve to `Object`'s members.
+
+### Tests
+
+- New `test/unit/miraConfig.test.ts` and `test/integration/createMira.test.ts`; `test/node/smoke.cjs` also runs `createMira()` from the built package under Node.
+
 ## [2.1.0] — 2026-11-26
 
 Theme: Oracle-first, MongoDB-shaped, typed. Everything adds to 2.0; nothing breaks. Built step by step on `feature/2.1.0` (see `docs/ROADMAP-2.1.md`).

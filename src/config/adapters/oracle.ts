@@ -524,6 +524,14 @@ class PoolHealthMonitor extends EventEmitter {
         this._nudges.set(name, t);
     }
 
+    /** Drops `name`'s health record and pending nudge (its pool was closed on purpose). */
+    forget(name: string): void {
+        this._metrics.delete(name);
+        const t = this._nudges.get(name);
+        if (t) clearTimeout(t);
+        this._nudges.delete(name);
+    }
+
     stop() {
         this._stopped = true;
         if (this._timer) {
@@ -1114,6 +1122,33 @@ async function closeAll() {
     logger.notice(oracleMessages.ALL_POOLS_CLOSED);
 }
 
+/**
+ * Closes ONE pool and stops monitoring it; the other pools keep running. The
+ * next request for `name` creates the pool again (unlike closeAll, this is not
+ * a shutdown). A pool whose creation failed is dropped without a close.
+ * @param {string} name
+ * @returns {Promise<void>}
+ */
+async function closePool(name: string): Promise<void> {
+    const poolPromise = poolRegistry.get(name);
+    poolRegistry.delete(name);
+    _monitoredNames.delete(name);
+    healthMonitor.forget(name);
+    if (!poolPromise) return;
+    try {
+        const pool: import("oracledb").Pool = await poolPromise;
+        await pool.close(10);
+        logger.notice(oracleMessages.POOL_CLOSED(name));
+    } catch (e) {
+        logger.warning(oracleMessages.POOL_CLOSE_ERROR(name, e.message));
+    }
+}
+
+/** True while `name` has a pool created or being created. */
+function isPoolOpen(name: string): boolean {
+    return poolRegistry.has(name);
+}
+
 // Signal / exception handlers are in server.ts — not duplicated here.
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1226,4 +1261,4 @@ const __export_onPoolHealthCheck = (fn: (check: { name: string; ok: boolean }) =
         return () => healthMonitor.off("check", fn);
     };
 const __export_setPoolHealthWatched = (watched: boolean) => healthMonitor.setWatched(watched);
-export { toDriverConnectTimeoutSec, POOL_DEFAULTS, withConnection, withTransaction, withBatchConnection, initializePools, closeAll, getPoolStats, __export_isPoolHealthy as isPoolHealthy, __export_getHealthMetrics as getHealthMetrics, __export___setPoolHealthForTest as __setPoolHealthForTest, __export_onPoolHealthChange as onPoolHealthChange, __export_allPoolsHealthy as allPoolsHealthy, __export_recordProbeSuccess as recordProbeSuccess, __export_nudgePoolHealth as nudgePoolHealth, __export_onPoolHealthCheck as onPoolHealthCheck, __export_setPoolHealthWatched as setPoolHealthWatched, validateOracleClient, setupOracleEnvironment, oracledb, OUT_FORMAT_OBJECT, SYSDBA_PRIVILEGE, EXECUTE_OPTIONS, moneySafeFetchTypeHandler };
+export { toDriverConnectTimeoutSec, POOL_DEFAULTS, withConnection, withTransaction, withBatchConnection, initializePools, closeAll, closePool, isPoolOpen, getPoolStats, __export_isPoolHealthy as isPoolHealthy, __export_getHealthMetrics as getHealthMetrics, __export___setPoolHealthForTest as __setPoolHealthForTest, __export_onPoolHealthChange as onPoolHealthChange, __export_allPoolsHealthy as allPoolsHealthy, __export_recordProbeSuccess as recordProbeSuccess, __export_nudgePoolHealth as nudgePoolHealth, __export_onPoolHealthCheck as onPoolHealthCheck, __export_setPoolHealthWatched as setPoolHealthWatched, validateOracleClient, setupOracleEnvironment, oracledb, OUT_FORMAT_OBJECT, SYSDBA_PRIVILEGE, EXECUTE_OPTIONS, moneySafeFetchTypeHandler };

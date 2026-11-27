@@ -63,6 +63,44 @@ The package ships compiled JavaScript with `.d.ts` types, so editors and `tsc` t
 
 Working from a clone of this repository instead, `bun run build` writes the same package to `dist/`.
 
+### Config object: `createMira()` (new in 2.2, the 3.0 entry point)
+
+Pass your pools in as values. Mira reads no environment variable for them, so credentials can come from anywhere: `.env`, a secrets manager, or a config file. Name as many pools as you need.
+
+```ts
+import { createMira } from "@jm-paunlagui/mira";
+
+const mira = createMira({
+  pools: {
+    appDb:     { user: "APP", password: secret, connectString: "db-host:1521/APP", poolMax: 20, queueMax: 40 },
+    reporting: { user: "RPT", password: rptSecret, connectString: "rpt-host:1521/RPT", poolMax: 10 },
+  },
+  defaultPool: "appDb", // required with more than one pool
+});
+
+const users = mira.collection("USERS");                // appDb
+const sales = mira.collection("SALES", "reporting");   // pool names are type-checked
+const schema = mira.schema();                          // also: mira.dcl(), mira.transaction(), mira.db()
+
+await mira.close(); // closes this instance's pools only
+```
+
+- Pool options: `user`, `password`, `connectString` (required), and `poolMin`, `poolMax`, `poolIncrement`, `queueMax`, `queueTimeout` (ms), `poolTimeout` (s), `connectTimeout` (ms), `poolPingInterval` (s), `stmtCacheSize`. Left-out options use Mira's pool defaults.
+- A bad config throws one `MiraConfigError` listing every problem (`err.issues`). Unknown keys are refused, so a typo such as `poolmax` is not silently ignored. Messages name keys, never values.
+- `mira.db()` returns the same handle `createDb()` does, so it works with everything that takes one (`new OracleCollection(name, db)`, `defineTable(...).on(db)` and so on).
+- Pools open on first use. A name already open in the process (for example `appDb` after `createDb("appDb")` was used) is refused.
+
+**From environment variables, if you want them.** `fromEnv()` reads `MIRA_DB_USER`, `MIRA_DB_PASSWORD` and `MIRA_DB_CONNECT_STRING` (or `MIRA_DB_HOST` + `MIRA_DB_SERVICE` + `MIRA_DB_PORT`) plus optional `MIRA_DB_POOL_MAX`, `MIRA_DB_QUEUE_MAX`, … into one pool, `appDb`. Give more pools their own prefixes:
+
+```ts
+import { createMira, fromEnv } from "@jm-paunlagui/mira";
+
+const mira = createMira(fromEnv());                                   // MIRA_DB_* → appDb
+const both = createMira(fromEnv({ pools: { appDb: "MIRA_DB", reporting: "MIRA_RPT" }, defaultPool: "appDb" }));
+```
+
+A missing variable or a number that does not parse throws, naming the variable. `createDb()` and the 2.x variables below still work unchanged.
+
 ### Prerequisites — Database Configuration
 
 Before using `oracle-mongo-wrapper`, you need 3 config files and a `.env` file. These handle connection pooling, credentials, and adapter selection so the wrapper can talk to Oracle.

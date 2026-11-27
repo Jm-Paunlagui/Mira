@@ -10,7 +10,7 @@
  */
 "use strict";
 const assert = require("node:assert/strict");
-const { createDb, OracleCollection, OracleSchema } = require("@jm-paunlagui/mira");
+const { createDb, createMira, buildTNSConnectString, OracleCollection, OracleSchema } = require("@jm-paunlagui/mira");
 
 const T = "MIRA_NODE_SMOKE";
 
@@ -36,6 +36,16 @@ async function main() {
     const [g] = await t.aggregate([{ $group: { _id: null, total: { $sum: "$AMT" }, n: { $count: "*" } } }]);
     assert.equal(Number(g.N), 3);
     assert.equal(Number(g.TOTAL), 60.75);
+
+    // createMira(): a pool passed in as a config object, closed on its own.
+    const env = process.env;
+    const mira = createMira({
+      pools: { nodeSmoke: { user: env.APP_DB_USERNAME, password: env.APP_DB_PASSWORD, connectString: buildTNSConnectString(env.DB_HOST, env.DB_PORT, env.DB_APP_SERVICE_NAME), poolMin: 0, poolMax: 1 } },
+    });
+    assert.equal(await mira.collection(T).countDocuments(), 3);
+    await mira.close();
+    assert.equal(mira.closed, true);
+
     const mode = db.oracledb.oracleClientVersion ? "Thick" : "Thin";
     console.log(`node smoke OK (${process.version}, ${mode} mode)`);
   } finally {
