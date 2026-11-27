@@ -55,7 +55,7 @@ The package ships compiled JavaScript with `.d.ts` types, so editors and `tsc` t
 
 **Loading `.env`.** Bun reads `.env` by itself. Node does not: start it with `node --env-file=.env app.js` (Node 20.6+), or call `require("dotenv").config()` before you first use Mira. Mira reads `DB_*` / `APP_DB_*` from `process.env` when a pool is first created.
 
-**Thin or Thick mode.** Mira tries node-oracledb Thick mode first, from `ORACLE_INSTANT_CLIENT` or any Oracle Client on the system library path, and falls back to Thin mode. The startup log says which loaded. Both modes are tested in CI.
+**Thin or Thick mode.** By default (`"auto"`) Mira tries node-oracledb Thick mode first, from `ORACLE_INSTANT_CLIENT` or any Oracle Client on the system library path, and falls back to Thin mode. Choose it yourself with `configureDriver({ mode: "thin" | "thick" | "auto", libDir })` or the `driver` option of `createMira()`, before the first pool opens. `"thick"` fails instead of falling back. Importing Mira initialises nothing; the driver is set up when the first pool opens, or when you call `initDriver()` (it returns `{ mode, clientVersion }`, so call it at startup to fail fast). The log says which mode loaded. Both modes are tested in CI.
 
 > ⚠️ **Thick mode needs enough worker threads.** In Thick mode every database call runs on a native worker thread from a small pool (`UV_THREADPOOL_SIZE`; Node's default is 4, and Bun's depends on the machine: a 4-core GitHub runner hung where a 12-core PC did not). A call waiting on a row lock keeps its thread. If more calls wait at once than there are threads, the transaction holding the lock never gets a thread to commit, and the process hangs with no error. Set `UV_THREADPOOL_SIZE` to at least your largest `poolMax` (Mira's default `APP_POOL_MAX` is 20) **in the environment before the process starts**, e.g. `UV_THREADPOOL_SIZE=24 node app.js`. Setting it in code after startup has no effect. Thin mode does not use these threads. When Thick mode creates a pool whose `poolMax` is above the thread count, Mira logs a warning naming both numbers.
 
@@ -89,6 +89,8 @@ await mira.close(); // closes this instance's pools only
 - A bad config throws one `MiraConfigError` listing every problem (`err.issues`). Unknown keys are refused, so a typo such as `poolmax` is not silently ignored. Messages name keys, never values.
 - `mira.db()` returns the same handle `createDb()` does, so it works with everything that takes one (`new OracleCollection(name, db)`, `defineTable(...).on(db)` and so on).
 - Pools open on first use. A name already open in the process (for example `appDb` after `createDb("appDb")` was used) is refused.
+- `driver: { mode, libDir }` picks Thin or Thick mode (see below). It is process-wide: once the first pool has opened, only a setting compatible with the running driver is accepted.
+- `logger` sends Mira's log lines to your logger: any object with `info`, `warn` and `error` (and optionally `debug`), such as `console` or pino. `false` silences Mira. Without it, Mira uses its own logger, which writes files under `./logs`. The logger is process-wide too, and `close()` puts the default back. `setLogger(logger)` does the same for apps on `createDb()`.
 
 **From environment variables, if you want them.** `fromEnv()` reads `MIRA_DB_USER`, `MIRA_DB_PASSWORD` and `MIRA_DB_CONNECT_STRING` (or `MIRA_DB_HOST` + `MIRA_DB_SERVICE` + `MIRA_DB_PORT`) plus optional `MIRA_DB_POOL_MAX`, `MIRA_DB_QUEUE_MAX`, … into one pool, `appDb`. Give more pools their own prefixes:
 
@@ -99,7 +101,7 @@ const mira = createMira(fromEnv());                                   // MIRA_DB
 const both = createMira(fromEnv({ pools: { appDb: "MIRA_DB", reporting: "MIRA_RPT" }, defaultPool: "appDb" }));
 ```
 
-A missing variable or a number that does not parse throws, naming the variable. `createDb()` and the 2.x variables below still work unchanged.
+`MIRA_DRIVER_MODE` and `MIRA_DRIVER_LIB_DIR` set the driver option when present. A missing variable or a number that does not parse throws, naming the variable. `createDb()` and the 2.x variables below still work unchanged.
 
 ### Prerequisites — Database Configuration
 

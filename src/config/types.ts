@@ -37,12 +37,43 @@ interface PoolConfig {
   stmtCacheSize?: number;
 }
 
+/**
+ * How node-oracledb runs. Process-wide: the first pool fixes it.
+ * - `"auto"` (default, the 2.x behaviour): try Thick mode from `libDir`,
+ *   ORACLE_INSTANT_CLIENT or the system library path; fall back to Thin.
+ * - `"thin"`: never load an Oracle Client.
+ * - `"thick"`: load the Oracle Client or fail.
+ */
+type DriverMode = "auto" | "thin" | "thick";
+
+interface DriverOptions {
+  mode?: DriverMode;
+  /** Oracle Instant Client directory for Thick mode. Default: ORACLE_INSTANT_CLIENT, then the system library path. */
+  libDir?: string;
+}
+
+/**
+ * Where Mira's log lines go. Any object with these methods works (console,
+ * pino, winston). Mira's pool-lifecycle "info" lines go to `debug`, which
+ * may be left out.
+ */
+interface MiraLogger {
+  debug?(message: string, ...meta: unknown[]): void;
+  info(message: string, ...meta: unknown[]): void;
+  warn(message: string, ...meta: unknown[]): void;
+  error(message: string, ...meta: unknown[]): void;
+}
+
 /** What `createMira()` / `defineConfig()` accept. `P` is the union of pool names. */
 interface MiraConfig<P extends string = string> {
   /** Pools by name. A name is a letter followed by up to 63 letters, digits or `_`. */
   pools: Record<P, PoolConfig>;
   /** Pool used when a call names none. Required when there is more than one pool. */
   defaultPool?: NoInfer<P>;
+  /** Thin / Thick mode. Left out: whatever configureDriver() set, else "auto". */
+  driver?: DriverOptions;
+  /** Log sink; `false` silences Mira. Left out: Mira's own logger (files under ./logs). */
+  logger?: MiraLogger | false;
 }
 
 /** A validated config: frozen, with `defaultPool` filled in. */
@@ -50,6 +81,8 @@ interface ResolvedMiraConfig<P extends string = string> {
   readonly pools: Readonly<Record<P, Readonly<PoolConfig>>>;
   readonly defaultPool: P;
   readonly poolNames: readonly P[];
+  readonly driver?: Readonly<DriverOptions>;
+  readonly logger?: MiraLogger | false;
 }
 
-export type { PoolConfig, MiraConfig, ResolvedMiraConfig };
+export type { PoolConfig, MiraConfig, ResolvedMiraConfig, DriverMode, DriverOptions, MiraLogger };

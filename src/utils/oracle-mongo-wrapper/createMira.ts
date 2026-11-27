@@ -16,6 +16,11 @@
  *   const sales = mira.collection("SALES", "reporting"); // pool name type-checked
  *   await mira.close();                                  // closes these two pools only
  *
+ * `driver` (Thin / Thick) and `logger` are process-wide: the Oracle Client
+ * loads once per process, and the adapter has one log sink. A driver setting
+ * that differs from one already in force, or a second, different logger while
+ * another instance's is set, is refused rather than silently overridden.
+ *
  * Each pool is added to the same registry createDb() uses, so everything that
  * takes a db handle (OracleCollection, OracleSchema, Transaction, models)
  * works with mira.db(). A name that is a 2.x built-in (appDb, appDbBulk)
@@ -27,6 +32,7 @@
 import config from "../../config";
 import database from "../../config/database";
 import { defineConfig } from "../../config/defineConfig";
+import { getLogger, setLogger } from "../../config/log";
 import type { MiraConfig, ResolvedMiraConfig } from "../../config/types";
 import { miraConfigMessages as MSG } from "../../constants/messages/miraConfig.messages";
 import { createDb, type WrapperDb } from "./db";
@@ -69,16 +75,23 @@ function createMira<P extends string>(input: MiraConfig<P> | ResolvedMiraConfig<
   for (const name of names) {
     if (config.isPoolOpen(name)) throw new Error(MSG.MIRA_POOL_ALREADY_OPEN(name));
   }
+  const { logger } = resolved;
+  const priorLogger = getLogger();
+  if (logger !== undefined && priorLogger !== null && priorLogger !== logger) throw new Error(MSG.LOGGER_CONFLICT);
   const done: string[] = [];
   try {
     for (const name of names) {
       database.registerConnection(name, resolved.pools[name]);
       done.push(name);
     }
+    if (resolved.driver) config.configureDriver(resolved.driver);
   } catch (err) {
     for (const name of done) database.unregisterConnection(name);
     throw err;
   }
+  // Set after the pools register, so a refused config leaves the logger as it was.
+  const ownsLogger = logger !== undefined && priorLogger === null;
+  if (ownsLogger) setLogger(logger);
 
   let closed = false;
   const handles = new Map<string, WrapperDb>();
@@ -91,6 +104,7 @@ function createMira<P extends string>(input: MiraConfig<P> | ResolvedMiraConfig<
       database.unregisterConnection(name);
     }
     handles.clear();
+    if (ownsLogger && getLogger() === logger) setLogger(null);
   };
 
   const db = (pool: P = resolved.defaultPool): WrapperDb => {

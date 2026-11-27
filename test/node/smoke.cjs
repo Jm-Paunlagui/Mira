@@ -10,7 +10,10 @@
  */
 "use strict";
 const assert = require("node:assert/strict");
-const { createDb, createMira, buildTNSConnectString, OracleCollection, OracleSchema } = require("@jm-paunlagui/mira");
+const sdtzBefore = process.env.ORA_SDTZ;
+const { createDb, createMira, initDriver, buildTNSConnectString, OracleCollection, OracleSchema } = require("@jm-paunlagui/mira");
+// Importing the package initialises nothing: no session time zone, no Oracle Client.
+assert.equal(process.env.ORA_SDTZ, sdtzBefore, "import must not touch ORA_SDTZ");
 
 const T = "MIRA_NODE_SMOKE";
 
@@ -18,6 +21,8 @@ async function main() {
   assert.equal(typeof globalThis.Bun, "undefined", "run this with node, not bun");
   assert.match(require.resolve("@jm-paunlagui/mira"), /[\\/]dist[\\/]/, "the package must resolve to dist/");
 
+  const driver = initDriver();
+  assert.ok(driver.mode === "thin" || driver.mode === "thick");
   const db = createDb("appDb");
   const schema = new OracleSchema(db);
   const t = new OracleCollection(T, db);
@@ -41,6 +46,8 @@ async function main() {
     const env = process.env;
     const mira = createMira({
       pools: { nodeSmoke: { user: env.APP_DB_USERNAME, password: env.APP_DB_PASSWORD, connectString: buildTNSConnectString(env.DB_HOST, env.DB_PORT, env.DB_APP_SERVICE_NAME), poolMin: 0, poolMax: 1 } },
+      driver: { mode: driver.mode },
+      logger: false,
     });
     assert.equal(await mira.collection(T).countDocuments(), 3);
     await mira.close();

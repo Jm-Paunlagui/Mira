@@ -10,6 +10,7 @@ import { describe, it, expect, afterAll } from "bun:test";
 import { createMira, MiraConfigError, OracleCollection, OracleSchema, OracleDCL, Transaction } from "../../src/utils/oracle-mongo-wrapper";
 import database from "../../src/config/database";
 import config from "../../src/config";
+import { getLogger, setLogger } from "../../src/config/log";
 import { rawExec, dropIfExists } from "../helpers/db";
 
 const T = "MIRA_V3_ITEMS";
@@ -79,6 +80,45 @@ describe("integration: createMira", () => {
   it("invalid config throws MiraConfigError before anything is registered", () => {
     expect(() => createMira({ pools: { miraBadCfg: { ...creds, poolMax: 0 } } })).toThrow(MiraConfigError);
     expect(() => database.getConnectionConfig("miraBadCfg")).toThrow(/Unknown connection/);
+  });
+
+  it("logger option: Mira's lines go to the app logger until close(); conflicts are refused", async () => {
+    const lines: string[] = [];
+    const appLog = { info: (m: string) => void lines.push(`info ${m}`), warn: (m: string) => void lines.push(`warn ${m}`), error: (m: string) => void lines.push(`error ${m}`) };
+    const mira = createMira({ pools: { miraLog: { ...creds, poolMin: 0, poolMax: 1 } }, logger: appLog });
+    expect(getLogger()).toBe(appLog);
+    await mira.db().withConnection(async (c) => c.execute("SELECT 1 FROM DUAL"));
+    expect(lines.some((l) => l.startsWith("info ") && l.includes('"miraLog"'))).toBe(true);
+
+    // Another instance with a different logger is refused and registers nothing; the same logger is fine.
+    expect(() => createMira({ pools: { miraLog2: creds }, logger: console })).toThrow("[mira] Another logger is already set");
+    expect(() => database.getConnectionConfig("miraLog2")).toThrow(/Unknown connection/);
+    const same = createMira({ pools: { miraLog3: creds }, logger: appLog });
+    await same.close();
+    expect(getLogger()).toBe(appLog); // not its to reset
+
+    await mira.close();
+    expect(getLogger()).toBeNull();
+    expect(lines.some((l) => l.includes('Pool "miraLog" closed'))).toBe(true);
+
+    // A logger set by the app itself is left alone by close().
+    setLogger(false);
+    try {
+      const quiet = createMira({ pools: { miraLog4: creds }, logger: false });
+      await quiet.close();
+      expect(getLogger()).toBe(false);
+    } finally {
+      setLogger(null);
+    }
+  });
+
+  it("driver option: compatible with the running driver is accepted; a conflict rolls back the registration", async () => {
+    const running = config.initDriver();
+    const ok = createMira({ pools: { miraDrv: creds }, driver: { mode: running.mode } });
+    await ok.close();
+    const other = running.mode === "thin" ? "thick" : "thin";
+    expect(() => createMira({ pools: { miraDrv2: creds }, driver: { mode: other } })).toThrow(`already initialised as ${running.mode}`);
+    expect(() => database.getConnectionConfig("miraDrv2")).toThrow(/Unknown connection/);
   });
 
   it("close() after a pool that never came up logs and still unregisters", async () => {

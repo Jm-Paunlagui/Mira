@@ -11,6 +11,9 @@
  *   <P>_QUEUE_TIMEOUT (ms), <P>_POOL_TIMEOUT (s), <P>_CONNECT_TIMEOUT (ms),
  *   <P>_POOL_PING_INTERVAL (s), <P>_STMT_CACHE_SIZE  optional whole numbers
  *
+ * Process-wide, read when set: MIRA_DRIVER_MODE (auto | thin | thick) and
+ * MIRA_DRIVER_LIB_DIR (Instant Client directory).
+ *
  * A blank variable counts as unset. A number that does not parse is an error,
  * not a silent default. The 2.x variables (APP_DB_USERNAME, DB_HOST …) are not
  * read here; they still drive createDb("appDb").
@@ -18,7 +21,7 @@
 
 import { miraConfigMessages as MSG } from "../constants/messages/miraConfig.messages";
 import { defineConfig, MiraConfigError } from "./defineConfig";
-import type { PoolConfig, ResolvedMiraConfig } from "./types";
+import type { DriverMode, PoolConfig, ResolvedMiraConfig } from "./types";
 
 interface FromEnvOptions<P extends string> {
   /** Pool name → variable prefix. Default `{ appDb: "MIRA_DB" }`. */
@@ -92,7 +95,10 @@ function fromEnv<P extends string = "appDb">(options: FromEnvOptions<P> = {}): R
     else pools[name] = readPool(prefix, env, issues);
   }
   if (issues.length) throw new MiraConfigError(issues);
-  return defineConfig({ pools, defaultPool: options.defaultPool });
+  const mode = env.MIRA_DRIVER_MODE?.trim();
+  const libDir = env.MIRA_DRIVER_LIB_DIR?.trim();
+  const driver = mode || libDir ? { ...(mode && { mode: mode as DriverMode }), ...(libDir && { libDir }) } : undefined;
+  return defineConfig({ pools, defaultPool: options.defaultPool, ...(driver && { driver }) });
 }
 
 export { fromEnv };
