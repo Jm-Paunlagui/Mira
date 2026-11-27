@@ -131,6 +131,60 @@ describe("integration: createMira", () => {
     expect(() => database.getConnectionConfig("miraDrv2")).toThrow(/Unknown connection/);
   });
 
+  it("open(), stats() and health are scoped to the instance's own pools", async () => {
+    const mira = createMira({ pools: { miraH: { ...creds, poolMin: 0, poolMax: 1 }, miraH2: { ...creds, poolMin: 0, poolMax: 1 } }, defaultPool: "miraH" });
+    expect(await mira.open()).toEqual([{ name: "miraH", success: true }, { name: "miraH2", success: true }]);
+    await rawExec("SELECT 1 FROM DUAL"); // appDb is open too, but is not this instance's
+    expect(Object.keys((await mira.stats()).pools).sort()).toEqual(["miraH", "miraH2"]);
+    expect(mira.health.isHealthy()).toBe(true);
+    expect(mira.health.isHealthy("miraH2")).toBe(true);
+    expect(mira.health.allHealthy()).toBe(true);
+    expect(() => mira.health.isHealthy("appDb" as "miraH")).toThrow('[mira] Unknown pool "appDb"');
+
+    mira.health.recordProbeSuccess();
+    mira.health.recordProbeSuccess("miraH2");
+    config.recordProbeSuccess("appDb");
+    expect(Object.keys(mira.health.metrics()).sort()).toEqual(["miraH", "miraH2"]);
+    expect(Object.keys((await mira.stats()).healthMetrics).sort()).toEqual(["miraH", "miraH2"]);
+
+    // onCheck: only this instance's pools reach the listener.
+    const checks: Array<{ name: string; ok: boolean }> = [];
+    const offCheck = mira.health.onCheck((c) => void checks.push(c));
+    mira.health.nudge();
+    config.nudgePoolHealth("appDb");
+    for (let i = 0; i < 100 && !checks.some((c) => c.name === "miraH"); i++) await new Promise((r) => setTimeout(r, 50));
+    expect(checks.some((c) => c.name === "miraH" && c.ok)).toBe(true);
+    expect(checks.every((c) => c.name === "miraH" || c.name === "miraH2")).toBe(true);
+    offCheck();
+
+    // onChange: a breaker flip on this instance's pool is reported; another pool's is not.
+    const changes: Array<{ name: string; healthy: boolean }> = [];
+    const offChange = mira.health.onChange((c) => void changes.push(c));
+    config.__setPoolHealthForTest("miraNotMine", false);
+    config.__setPoolHealthForTest("miraH2", false);
+    expect(mira.health.isHealthy("miraH2")).toBe(false);
+    expect(mira.health.allHealthy()).toBe(false);
+    config.__setPoolHealthForTest("miraH2", true);
+    config.__setPoolHealthForTest("miraNotMine", true);
+    expect(changes).toEqual([{ name: "miraH2", healthy: false }, { name: "miraH2", healthy: true }]);
+    offChange();
+    config.__setPoolHealthForTest("miraH2", false);
+    config.__setPoolHealthForTest("miraH2", true);
+    expect(changes).toHaveLength(2); // unsubscribed
+
+    // close() removes listeners still subscribed and turns a watch it started off.
+    const late: unknown[] = [];
+    mira.health.onChange((c) => void late.push(c));
+    mira.health.watch(true);
+    await mira.close();
+    config.__setPoolHealthForTest("miraH2", false);
+    config.__setPoolHealthForTest("miraH2", true);
+    expect(late).toEqual([]);
+    expect(mira.health.isHealthy()).toBe(false);
+    expect(mira.health.allHealthy()).toBe(false);
+    await expect(mira.open()).rejects.toThrow("[mira] This Mira instance is closed");
+  });
+
   it("close() after a pool that never came up logs and still unregisters", async () => {
     const mira = createMira({ pools: { miraDown: { user: "nobody", password: "x", connectString: "127.0.0.1:1/NOPE", connectTimeout: 1000 } } });
     const failed = mira.db().withConnection(async () => 1).catch((e: Error) => e);

@@ -76,7 +76,7 @@ export type { IncludeOptions } from "./typed/include";
 export type { Column, ColumnMeta } from "./typed/columns";
 export type { GenerateOptions } from "./typed/generate";
 export type { Migration, MigrationContext, MigratorOptions, MigrationStatus, MigrationState, MigrationRun, Migrator } from "./migrate/migrator";
-export type { Mira } from "./driver/createMira";
+export type { Mira, MiraHealth } from "./driver/createMira";
 export type { MiraDb, DbConnection } from "./driver/db";
 export type { MiraConfig, PoolConfig, ResolvedMiraConfig, DriverMode, DriverOptions, MiraLogger } from "./config/types";
 export type { FromEnvOptions } from "./config/fromEnv";

@@ -53,10 +53,41 @@ interface Mira<P extends string = string> {
   dcl(pool?: P): OracleDCL;
   /** Transaction manager on a pool. */
   transaction(pool?: P): Transaction;
+  /** Opens this instance's pools now (they open lazily otherwise). A pool that fails is reported (success: false, error), not thrown. */
+  open(): Promise<Array<{ name: P; success: boolean; error?: string }>>;
+  /** Usage of this instance's pools (open / in use / queued …) and their health records. */
+  stats(): Promise<{ timestamp: string; pools: Record<string, unknown>; healthMetrics: Record<string, unknown> }>;
+  /** The circuit breaker and health monitor, for this instance's pools. */
+  readonly health: MiraHealth<P>;
   /** Closes this instance's pools and removes them from the registry. Idempotent. */
   close(): Promise<void>;
   /** True after close(). */
   readonly closed: boolean;
+}
+
+/**
+ * Health of a Mira instance's pools. The monitor pings each open pool (every 30 s,
+ * every 5 s while one is failing or while watched); three failed checks open a
+ * pool's circuit breaker, so withConnection fails fast with NJS-503 until a check
+ * or a probe succeeds.
+ */
+interface MiraHealth<P extends string = string> {
+  /** This pool's breaker is closed (default: config.defaultPool). False after close(). */
+  isHealthy(pool?: P): boolean;
+  /** Every pool of this instance is healthy. */
+  allHealthy(): boolean;
+  /** Health records ({ healthy, lastCheck, consecutiveFailures }) of this instance's checked pools. */
+  metrics(): Record<string, unknown>;
+  /** Called when one of this instance's pools turns healthy or unhealthy. Returns an unsubscribe function. */
+  onChange(listener: (change: { name: P; healthy: boolean }) => void): () => void;
+  /** Called after every check of one of this instance's pools. Returns an unsubscribe function. */
+  onCheck(listener: (check: { name: P; ok: boolean }) => void): () => void;
+  /** Process-wide: check every 5 s instead of 30 s (e.g. while a readiness stream has listeners). */
+  watch(on: boolean): void;
+  /** Your own probe reached the pool: close its breaker now instead of at the next check. */
+  recordProbeSuccess(pool?: P): void;
+  /** Check this pool soon, outside the regular cadence (debounced). */
+  nudge(pool?: P): void;
 }
 
 /**
@@ -93,10 +124,44 @@ function createMira<P extends string>(input: MiraConfig<P> | ResolvedMiraConfig<
 
   let closed = false;
   const handles = new Map<string, MiraDb>();
+  const unsubscribes = new Set<() => void>();
+  let watching = false;
+  const pick = (pool: P | undefined): P => {
+    const name = pool ?? resolved.defaultPool;
+    if (!names.includes(name)) throw new Error(MSG.MIRA_UNKNOWN_POOL(name, names));
+    return name;
+  };
+  const only = (record: Record<string, unknown>) => Object.fromEntries(Object.entries(record).filter(([k]) => names.includes(k as P)));
+  const subscribe = <E extends { name: string }>(on: (fn: (e: E) => void) => () => void, listener: (e: E & { name: P }) => void) => {
+    const off = on((e) => {
+      if (names.includes(e.name as P)) listener(e as E & { name: P });
+    });
+    const unsubscribe = () => {
+      off();
+      unsubscribes.delete(unsubscribe);
+    };
+    unsubscribes.add(unsubscribe);
+    return unsubscribe;
+  };
+  const health: MiraHealth<P> = {
+    isHealthy: (pool) => !closed && config.isPoolHealthy(pick(pool)),
+    allHealthy: () => names.every((n) => !closed && config.isPoolHealthy(n)),
+    metrics: () => only(config.getHealthMetrics()),
+    onChange: (listener) => subscribe(config.onPoolHealthChange, listener),
+    onCheck: (listener) => subscribe(config.onPoolHealthCheck, listener),
+    watch: (on) => {
+      watching = Boolean(on);
+      config.setPoolHealthWatched(watching);
+    },
+    recordProbeSuccess: (pool) => config.recordProbeSuccess(pick(pool)),
+    nudge: (pool) => config.nudgePoolHealth(pick(pool)),
+  };
 
   const close = async () => {
     if (closed) return;
     closed = true;
+    for (const off of [...unsubscribes]) off();
+    if (watching) health.watch(false);
     for (const name of names) {
       await config.closePool(name);
       database.unregisterConnection(name);
@@ -135,6 +200,15 @@ function createMira<P extends string>(input: MiraConfig<P> | ResolvedMiraConfig<
     schema: (pool) => new OracleSchema(db(pool)),
     dcl: (pool) => new OracleDCL(db(pool)),
     transaction: (pool) => new Transaction(db(pool)),
+    open: async () => {
+      if (closed) throw new Error(MSG.MIRA_CLOSED);
+      return (await config.initializePools([...names])) as Array<{ name: P; success: boolean; error?: string }>;
+    },
+    stats: async () => {
+      const all = await config.getPoolStats();
+      return { timestamp: all.timestamp, pools: only(all.pools), healthMetrics: only(all.healthMetrics) };
+    },
+    health,
     close,
     get closed() {
       return closed;
@@ -143,4 +217,4 @@ function createMira<P extends string>(input: MiraConfig<P> | ResolvedMiraConfig<
 }
 
 export { createMira };
-export type { Mira };
+export type { Mira, MiraHealth };

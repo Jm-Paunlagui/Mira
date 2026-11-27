@@ -1,5 +1,45 @@
 # Changelog
 
+## [3.0.0] — Unreleased
+
+Theme: Mira is a standalone library. The app passes its config in; Mira reads no environment variable, writes no log file and initialises no driver unless asked. Built on top of 2.2 (`createMira`, `configureDriver`, `setLogger`), which stays the entry point. Upgrade guide: [docs/MIGRATION-3.0.md](docs/MIGRATION-3.0.md). Plan and progress: [docs/ROADMAP-3.0.md](docs/ROADMAP-3.0.md).
+
+### Removed (breaking)
+
+- **`createDb()`** from the public API. Use `createMira(config).db(pool)`.
+- **The built-in `appDb` / `appDbBulk` pools** and every variable that drove them: `DB_HOST`, `DB_PORT`, `DB_APP_SERVICE_NAME`, `APP_DB_USERNAME`, `APP_DB_PASSWORD`, `APP_POOL_*`, `APP_BULK_*`, and the `NODE_ENV=development` + `APP_TEST_DB_*` test-schema switch. Pass pools to `createMira()`, or read `MIRA_DB_*` with `fromEnv()`.
+- **`DB_TYPE` / `createAdapter()`** (Mira is Oracle only), **`POOL_NAMES`** (use `mira.config.poolNames`) and **`READINESS_GATING_POOLS`** (a readiness rule belongs to the app).
+- **`ORACLE_INSTANT_CLIENT`** and its Windows-only DLL check. Thick mode loads from `driver.libDir`, or the system library path. `fromEnv()` reads `MIRA_DRIVER_LIB_DIR`.
+- **Mira's file logger** (`src/utils/logger.ts`, log redaction, request context) and its variables: `LOG_*`, `ENABLE_CONSOLE_LOGS`, `DOCKER_CONTAINER`, `DATA_SIGNING_SECRET`. Mira writes no file.
+- **Compiled-executable detection** (`runtimePaths`, `IS_COMPILED`): the `.env` loader, the `PATH` set-up and the connect-string whitespace tweak. Pass `driver.binaryDir`.
+- The dev-mode "placeholder credentials" pass: missing `user` / `password` / `connectString` always throws.
+- Dependencies: `dotenv` (never imported) and `@types/express`.
+
+### Changed
+
+- **Default log sink:** warnings go to `console.warn` and failures to `console.error`, prefixed `[mira]`; notices are dropped. `logger: console` shows everything, `logger: false` nothing.
+- In `"auto"` driver mode, no Oracle Client on the library path is an ordinary Thin start: a one-line notice instead of a multi-line DPI-1047 warning. A `libDir` you named that fails to load is still a warning.
+- **A handle kept after `mira.close()`** reports `isHealthy() === false` and rejects `withConnection` / `withTransaction` / `withBatchConnection` with "This Mira instance is closed". It used to stay "healthy" and fail with "Unknown connection".
+- The bare handle's `closePool()` (close every pool in the process) is gone; `mira.db().closePool()` closes that instance, as in 2.2.
+- **Layout:** `src/` is `index.ts`, `config/`, `driver/`, `core/`, `parsers/`, `pipeline/`, `joins/`, `schema/`, `typed/`, `migrate/`, `advanced/`, `shared/`, `cli/` (was `src/utils/oracle-mongo-wrapper/…`). The package entry is `dist/index.js`; only the package root is public.
+- **Package:** publishes `dist/` without `src/`, and without source or declaration maps.
+- The `mira` CLI connects with `MIRA_DB_*` through `fromEnv()`; `--verbose` sends every log line to stderr.
+
+### Added
+
+- **Lifecycle and health on the instance**, scoped to its own pools (what 2.x apps reached through the adapter): `mira.open()` opens every pool now and reports each result; `mira.stats()`; `mira.health.isHealthy(pool?)`, `allHealthy()`, `metrics()`, `onChange(fn)`, `onCheck(fn)` (each returns an unsubscribe function), `watch(on)`, `recordProbeSuccess(pool?)`, `nudge(pool?)`. `close()` removes the listeners an instance added and ends a watch it started. Type `MiraHealth`.
+- Types `MiraDb` (what `mira.db()` returns) and `DbConnection`.
+- `driver.binaryDir` for a Thick binary staged outside the package (compiled executables).
+- `buildSimpleConnectString` / `buildTNSConnectString` now live in `config/connectString.ts` (same exports).
+
+### Tests and simulation
+
+- Tests build their pool with `createMira(fromEnv())` (`test/helpers/db.ts`); CI sets `MIRA_DB_*` and connects by service name, so the listener's SID-as-service tweak is gone.
+- The simulation runs on its own `createMira` pool and also counts `mira.*` and `mira.health.*` methods; stage 17 exercises the config, lifecycle and health API. 177 of 177 public functions, 366 checks.
+- Fixed races: the chaos leak check now waits for the health monitor's ping to return its connection; the flashback test waits until its timestamp maps behind the current SCN and restores its fixture on failure.
+- 559 tests at 100% line and function coverage.
+
+
 ## [Unreleased] — 2.2.0
 
 Theme: config passed in, not read from Mira's own env names. Step 1 of the 3.0 restructure; everything adds to 2.1, nothing breaks.

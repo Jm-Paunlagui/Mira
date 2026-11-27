@@ -6,7 +6,6 @@
       "name": "mira",
       "dependencies": {
         "@types/oracledb": "^26.0.1",
-        "dotenv": "^17.4.2",
         "oracledb": "^7.0.0",
       },
       "devDependencies": {
@@ -24,8 +23,6 @@
     "@types/oracledb": ["@types/oracledb@26.0.1", "", { "dependencies": { "@types/node": "*" } }, "sha512-+PN2zINSM1vNtRiIz5D2WDboSuMv1YIe66XI3y+X1m4VGz9Ley4yyP65EwnANsBeF1qH/EpKjr5oj6sVIlq8ag=="],
 
     "bun-types": ["bun-types@1.4.5", "", { "dependencies": { "@types/node": "*", "undici-types": "*" } }, "sha512-ECHn+9dhL3wv0G6u0+7dQvrnaimXiRDxxerYBmhTaLyJEEuvTPWk2Fye3XIf5Y++JIIiHKfQw4Z7V5D8KuiXbg=="],
-
-    "dotenv": ["dotenv@17.4.2", "", {}, "sha512-nI4U3TottKAcAD9LLud4Cb7b2QztQMUEfHbvhTH09bqXTxnSie8WnjPALV/WMCrJZ6UV/qHJ6L03OqO3LcdYZw=="],
 
     "oracledb": ["oracledb@7.0.1", "", { "hasInstallScript": true }, "sha512-xlM0Ceh6A5stQLAdEfKf3pgCSkbOjQLo2ZPEi3+kXklz+KbZD3fLi/nsTSbQeZZNFBSFDNxdn1Ek3+bxG40M8w=="],
 

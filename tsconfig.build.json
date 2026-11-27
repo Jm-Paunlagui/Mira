@@ -10,8 +10,9 @@
         "outDir": "dist",
         "rootDir": "src",
         "declaration": true,
-        "declarationMap": true,
-        "sourceMap": true,
+        // dist/ is published without src/, so no source or declaration maps pointing at it.
+        "declarationMap": false,
+        "sourceMap": false,
         "types": ["node", "bun"]
     },
     "include": ["src/**/*.ts"]

@@ -61,13 +61,15 @@ export function trackObject<T extends object>(label: string, obj: T): T {
 }
 
 /**
- * Wrap a Mira instance: its methods count as "mira.*", db() also hands back a
- * tracked handle ("db.*"), and `closed` stays live (a spread would freeze it).
+ * Wrap a Mira instance: its methods count as "mira.*", its health methods as
+ * "mira.health.*", db() also hands back a tracked handle ("db.*"), and `closed`
+ * stays live (a spread would freeze it).
  */
 export function trackMira<T extends object>(mira: T): T {
   const out = trackObject("mira", mira) as Record<string, unknown>;
   const db = out.db as Fn;
   out.db = (...a: unknown[]) => trackObject("db", db(...a) as object);
+  out.health = trackObject("mira.health", (mira as { health: object }).health);
   Object.defineProperty(out, "closed", { get: () => (mira as { closed: boolean }).closed, enumerable: true });
   return out as unknown as T;
 }

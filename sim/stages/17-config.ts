@@ -7,6 +7,8 @@
  *   - the job asks for the driver mode already running (initDriver / configureDriver),
  *     and a different one is refused, since the Oracle Client is process-wide,
  *   - its log lines go to the job's own logger (setLogger) while it runs,
+ *   - it opens its pool up front and watches only its own pool's health, as a
+ *     readiness probe would (open, stats, health.*),
  *   - it counts the day's sales on its own pool, which match the trading model, once
  *     through a collection and once inside a read-only transaction,
  *   - closing it leaves appDb, which every other stage uses, serving.
@@ -53,6 +55,22 @@ export async function configStage(sim: Sim, ctx: Ctx, state: State) {
   api.setLogger({ info: (m) => void lines.push(m), warn: (m) => void lines.push(m), error: (m) => void lines.push(m) });
   const mira = api.createMira(config);
   try {
+    sim.eq("open(): the reporting pool opens up front", await mira.open(), [{ name: "reporting", success: true }]);
+    sim.eq("stats(): only the reporting pool", Object.keys((await mira.stats()).pools), ["reporting"]);
+    const checks: Array<{ name: string; ok: boolean }> = [];
+    const offCheck = mira.health.onCheck((c) => void checks.push(c));
+    const offChange = mira.health.onChange(() => {});
+    mira.health.watch(true);
+    mira.health.recordProbeSuccess();
+    mira.health.nudge();
+    for (let i = 0; i < 100 && checks.length === 0; i++) await new Promise((r) => setTimeout(r, 50));
+    sim.eq("health.onCheck(): a nudged check of the reporting pool passes", checks[0], { name: "reporting", ok: true });
+    sim.ok("health: the reporting pool and the instance are healthy", mira.health.isHealthy() && mira.health.allHealthy());
+    sim.eq("health.metrics(): only the reporting pool", Object.keys(mira.health.metrics()), ["reporting"]);
+    offCheck();
+    offChange();
+    mira.health.watch(false);
+
     const sales = await sim.mira(() => mira.collection(T.ORDERS).countDocuments());
     sim.eq("createMira: the reporting pool sees every sale", sales, state.model.orders.length);
     const inTx = await sim.mira(() => mira.transaction().withReadOnlyTransaction((s) => s.collection(T.ORDERS).countDocuments()));

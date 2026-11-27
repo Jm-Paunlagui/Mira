@@ -1,6 +1,6 @@
 # Mira 3.0 Roadmap
 
-**Status:** step 3 in progress (3a–3c done) · **Base:** v2.1.0 · **Branches (stacked):** `feature/v3-config` (#34) → `feature/v3-driver` (#35) → `feature/v3-restructure`
+**Status:** step 3 in progress (3a–3d done) · **Base:** v2.1.0 · **Branches (stacked):** `feature/v3-config` (#34) → `feature/v3-driver` (#35) → `feature/v3-restructure`
 
 Mira grew inside an app template (CATHERINE / eMeal), so `config/`, `constants/` and `utils/logger` were app code that ended up in the library. An app that installed `@jm-paunlagui/mira` from npm could use only the two built-in pools (`appDb`, `appDbBulk`), through Mira's own env names, and adding a pool meant editing `node_modules`. 3.0 makes Mira a standalone library: the app passes its config in, and Mira reads no env variable, writes no log file and initialises no driver unless asked.
 
@@ -31,7 +31,11 @@ Update this file as each item lands: tick the box and add the PR number.
   - Fixed a flashback test race (AS OF TIMESTAMP granularity); it now restores its fixture on failure.
   - 558 tests at 100%; sim 167/167 functions, 361 checks.
   - **Local `.env` still needs `MIRA_DB_USER`, `MIRA_DB_PASSWORD`, `MIRA_DB_CONNECT_STRING`** (see `.env.example`).
-- [ ] **3d. Package.** Version 3.0.0; `main` / `types` / `exports` → `dist/index.js`; drop `dotenv` and `@types/express`; publish `dist` only. Rewrite the README setup section; CHANGELOG 3.0.0; `docs/MIGRATION-3.0.md`.
+- [x] **3d. Package and docs.** Done:
+  - Version 3.0.0; entry `dist/index.js`; `dotenv` dropped (never imported); the package publishes `dist/` (no `src/`, so no source or declaration maps), README, CHANGELOG, LICENSE, `.env.example` and `docs/MIGRATION-3.0.md`.
+  - README: new Setup (install, connect, pool options, several pools, health and readiness, `fromEnv`, Thin/Thick, logging); later sections and Testing / Simulation updated. The old wrapper guide (`docs/QUERY-GUIDE.md`, a stale copy) is deleted after folding in its one unique section (`$lookup` `select`).
+  - CHANGELOG 3.0.0; `docs/MIGRATION-3.0.md` (CATHERINE-oriented).
+  - **Gap found and closed:** CATHERINE's readiness, alerting and shutdown code calls the adapter's lifecycle and health functions (`initializePools`, `closeAll`, `onPoolHealthChange`, `setPoolHealthWatched`, `recordProbeSuccess` …), none public in 3.0. Added `mira.open()`, `mira.stats()` and `mira.health.*`, scoped to the instance's pools (§3). Sim: 177/177 functions, 366 checks.
 - [ ] **3e. Verify as a user would.** `npm pack`, install the tarball into an empty temp project with no `.env`, define its own pool, run a query under Node and Bun.
 - [ ] **3f. Merge order:** #34 → #35 → step 3 PR → tag `v3.0.0` → publish.
 
@@ -97,6 +101,8 @@ The query layer's folders sit at the top level, so the old `oracle-mongo-wrapper
 **Kept / added** (exported from `src/index.ts`):
 
 - Entry: `createMira`, `defineConfig`, `fromEnv`, `MiraConfigError`, `configureDriver`, `initDriver`, `setLogger`, `buildSimpleConnectString`, `buildTNSConnectString`.
+- On an instance: `db()`, `collection()`, `schema()`, `dcl()`, `transaction()`, `open()`, `stats()`, `health.{isHealthy, allHealthy, metrics, onChange, onCheck, watch, recordProbeSuccess, nudge}`, `close()`, `config`, `closed`.
+- Types: `Mira`, `MiraHealth`, `MiraDb`, `DbConnection`, `MiraConfig`, `PoolConfig`, `ResolvedMiraConfig`, `DriverMode`, `DriverOptions`, `MiraLogger`, `FromEnvOptions`, plus the 2.1 types.
 - Query layer, unchanged: `OracleCollection`, `QueryBuilder`, `OracleSchema`, `OracleDCL`, `Transaction`, `defineTable`, `t`, `relations`, `createMigrator`, `sql`, `onQuery`, the builders and parsers, and all 2.1 types.
 
 **Removed:**
@@ -122,18 +128,21 @@ Each can be changed before 3d; say so in the PR.
 - **D2. `createDb` is removed, not deprecated.** The only app on Mira (CATHERINE) has its own copy of the adapter and does not install the package yet, so a shim has no one to protect. Internally `driver/db.ts` keeps building the handle.
 - **D3. One driver per process.** Pools, the health monitor and the Oracle Client stay process-wide (node-oracledb's Thick mode is process-wide anyway). Several `createMira()` instances share them, separated by pool name.
 - **D4. Compiled executables:** `driver.binaryDir` replaces Mira's own `IS_COMPILED` detection. The app knows where it staged the Thick binary; Mira no longer guesses from `Bun.main`.
-- **D5. Package exports only `.`** (plus `./package.json`). Deep imports such as `@jm-paunlagui/mira/dist/...` are not supported; everything public is on the root.
+- **D5. Package exports only `.`** (plus `./package.json`). Deep imports such as `@jm-paunlagui/mira/dist/...` are not supported; everything public is on the root. `src/` is not published, so the build emits no source or declaration maps.
+- **D7. Lifecycle and health live on the instance**, filtered to its pools, rather than as process-wide exports; the monitor itself stays process-wide (D3).
 - **D6. Messages stay templates in `shared/messages/`.** The "kept in sync with CATHERINE" note goes; CATHERINE keeps its own copy until step 4.
 
 ---
 
 ## 5. CATHERINE migration (step 4, outline)
 
+Step by step in [MIGRATION-3.0.md](MIGRATION-3.0.md). In short:
+
 1. `bun add @jm-paunlagui/mira@3`.
-2. One `src/config/mira.ts` in CATHERINE: `createMira({ pools: { appDb, appDbBulk }, defaultPool: "appDb", driver: { binaryDir }, logger })`, with credentials from its existing env names and its own logger passed in.
+2. One `src/config/mira.ts` in CATHERINE: `createMira({ pools: { appDb, appDbBulk }, defaultPool: "appDb", driver: { libDir, binaryDir }, logger })`, with credentials from its existing env names, the 2.x TNS connect string (`buildTNSConnectString`) and its logger behind a small adapter (notice/warning/critical → info/warn/error).
 3. Replace `createDb("appDb")` with `mira.db()` / `mira.db("appDbBulk")`; imports from `@jm-paunlagui/mira`.
-4. Delete CATHERINE's copies of the adapter and wrapper; keep its logger, `runtimePaths`, `requestContext` and readiness rules (`READINESS_GATING_POOLS`).
-5. Shutdown hook: `await mira.close()`.
+4. Boot `initializePools()` → `mira.open()`; `ReadinessService` / `HealthStreamHub` / `AlertNotifierService` → `mira.health.*`; `TeardownSequence`'s `db.closeAll()` → `mira.close()`.
+5. Delete CATHERINE's copies of the adapter and wrapper; keep its logger, `runtimePaths`, `requestContext` and readiness rules (`READINESS_GATING_POOLS`).
 
 ---
 

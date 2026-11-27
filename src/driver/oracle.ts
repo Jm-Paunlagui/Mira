@@ -689,12 +689,12 @@ function _getOrCreatePool(name: string) {
 // ── Eager pool initialization ──────────────────────────────────────────────────
 
 /**
- * Pre-create all registered pools at startup.
- * Logs each pool's config (sans credentials) and result.
+ * Pre-create registered pools at startup (default: every one; createMira().open()
+ * passes its own). Logs each pool's config (sans credentials) and result.
  * Non-fatal — a pool that fails will retry lazily on first use.
+ * @param {string[]} [names]
  */
-async function initializePools() {
-    const names = getConnectionNames();
+async function initializePools(names: string[] = getConnectionNames()) {
     log().notice(
         `Initializing ${names.length} database pool(s): ${names.join(", ")}`,
     );
