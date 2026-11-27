@@ -37,6 +37,58 @@ jobs:
       # What npm would publish (prepack rebuilds dist/).
       - run: npm pack --dry-run
 
+  windows:
+    # CATHERINE runs on Windows under Bun, in Thick mode, as a compiled executable.
+    # GitHub's Windows runners cannot run the Oracle service container, so this job
+    # covers what needs no database: type-check, unit tests (and the test runner's
+    # Windows paths), loading Thick mode, and a compiled executable loading it from
+    # binaryDir. The database suites on Windows are run by hand (docs/HANDOVER-WINDOWS.md).
+    name: Windows (Bun, Thick load, compiled executable)
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The unit tests open no connection; fromEnv() still wants the variables.
+      MIRA_DB_USER: ci
+      MIRA_DB_PASSWORD: ci
+      MIRA_DB_CONNECT_STRING: 127.0.0.1:1/NONE
+      MIRA_SKIP_PERSIST: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.5
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+
+      - name: Unit tests (and the scorecard's categories)
+        run: |
+          bun run test:unit | tee unit.log
+          # test/run.ts once split the file path on "/" only, so on Windows every test was "unknown".
+          grep -q "│ unit " unit.log || { echo "scorecard has no 'unit' category"; exit 1; }
+
+      - name: Install Oracle Instant Client (Windows)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://download.oracle.com/otn_software/nt/instantclient/instantclient-basiclite-windows.zip -OutFile "$env:RUNNER_TEMP\ic.zip"
+          Expand-Archive "$env:RUNNER_TEMP\ic.zip" -DestinationPath C:\oracle
+          $ic = (Get-ChildItem C:\oracle -Directory -Filter "instantclient_*" | Select-Object -First 1).FullName
+          "IC_DIR=$ic" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Thick mode loads (libDir)
+        run: |
+          bun -e 'const m = require("./src"); m.configureDriver({ mode: "thick", libDir: process.env.IC_DIR }); const i = m.initDriver(); console.log(i); if (i.mode !== "thick") process.exit(1); process.exit(0);'
+
+      - name: Compiled executable loads Thick mode (binaryDir)
+        run: |
+          bun build .github/windows/exe-smoke.ts --compile --outfile dist-exe/exe-smoke.exe
+          mkdir -p dist-exe/node_modules/oracledb/build/Release
+          cp node_modules/oracledb/build/Release/*win32-x64.node dist-exe/node_modules/oracledb/build/Release/
+          # Run from elsewhere so nothing resolves against the repo; it must exit by itself.
+          cd "$RUNNER_TEMP" && timeout 60 "$GITHUB_WORKSPACE/dist-exe/exe-smoke.exe"
+
   test:
     name: Oracle 23ai (${{ matrix.driver }} mode, ${{ matrix.connect }})
     runs-on: ubuntu-24.04

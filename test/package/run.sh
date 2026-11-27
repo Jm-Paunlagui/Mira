@@ -35,7 +35,9 @@ mkdir "$APP"
 cp "$ROOT"/test/package/{app.ts,app.cjs,app.mjs,tsconfig.json} "$APP"
 cd "$APP"
 npm init -y >/dev/null
-TYPES_NODE=$(node -p "require('$ROOT/package.json').devDependencies['@types/node']")
+# The path goes in as an argument, not inside the script text: Git Bash converts
+# /d/... to D:/... for arguments only, and Node on Windows cannot resolve /d/....
+TYPES_NODE=$(node -p "require(process.argv[1]).devDependencies['@types/node']" "$ROOT/package.json")
 npm install --silent --no-audit --no-fund "$TGZ" "@types/node@$TYPES_NODE" >/dev/null
 echo "package check: installed $(basename "$TGZ") into an empty project"
 

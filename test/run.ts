@@ -47,7 +47,8 @@ for (const mt of xml.matchAll(re)) {
   const failure = /<failure[^>]*message="([^"]*)"/.exec(body) ?? (/<failure/.test(body) ? ["", "failed"] : null);
   const skipped = /<skipped/.test(body);
   rows.push({
-    category: file.split("/")[1] ?? "unknown",
+    // bun writes the path with the OS separator: test/unit/… on Linux, test\unit\… on Windows.
+    category: file.split(/[\\/]/)[1] ?? "unknown",
     suite: unescape(classname),
     title,
     state: failure ? "failed" : skipped ? "skipped" : "passed",

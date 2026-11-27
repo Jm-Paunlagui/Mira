@@ -113,6 +113,8 @@ const exeDir = path.dirname(process.execPath);
 createMira({ pools, driver: { binaryDir: path.join(exeDir, "node_modules", "oracledb", "build", "Release") } });
 ```
 
+If you parse `.env` yourself, strip surrounding quotes from each value, as Bun's own loader does. A quoted `MIRA_DRIVER_LIB_DIR="C:\oracle\instantclient_19_6"` otherwise reaches `libDir` with its quotes, and Thick mode fails with `DPI-1047: Cannot locate a 64-bit Oracle Client library`.
+
 The 2.x whitespace collapse of a multi-line connect string is gone too: pass the connect string on one line.
 
 ## 8. Variables

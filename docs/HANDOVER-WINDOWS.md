@@ -115,9 +115,11 @@ import { createMira } from "@jm-paunlagui/mira";
 
 const exeDir = path.dirname(process.execPath);
 // Load .env from beside the exe yourself; Mira no longer does it.
+// Strip surrounding quotes as Bun's own loader does: a quoted MIRA_DRIVER_LIB_DIR
+// ("C:\oracle\...") otherwise reaches libDir with its quotes and fails with DPI-1047.
 for (const line of fs.readFileSync(path.join(exeDir, ".env"), "utf8").split(/\r?\n/)) {
     const m = /^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/.exec(line);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim().replace(/^(["'])(.*)\1$/, "$2");
 }
 const env = process.env;
 const mira = createMira({
