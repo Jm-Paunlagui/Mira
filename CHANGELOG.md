@@ -1,6 +1,6 @@
 # Changelog
 
-## [3.0.0] — Unreleased
+## [3.0.0] — 2026-11-28
 
 Theme: Mira is a standalone library. The app passes its config in; Mira reads no environment variable, writes no log file and initialises no driver unless asked. Built on top of 2.2 (`createMira`, `configureDriver`, `setLogger`), which stays the entry point. Upgrade guide: [docs/MIGRATION-3.0.md](docs/MIGRATION-3.0.md). Plan and progress: [docs/ROADMAP-3.0.md](docs/ROADMAP-3.0.md).
 
@@ -46,7 +46,7 @@ Theme: Mira is a standalone library. The app passes its config in; Mira reads no
 - 565 tests at 100% line and function coverage.
 
 
-## [Unreleased] — 2.2.0
+## [2.2.0] — not released separately (shipped in 3.0.0)
 
 Theme: config passed in, not read from Mira's own env names. Step 1 of the 3.0 restructure; everything adds to 2.1, nothing breaks.
 
