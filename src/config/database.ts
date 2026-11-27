@@ -5,6 +5,8 @@
 // on every require re-injects values the caller deliberately unset (e.g. a test
 // that deletes an env var to assert a default).
 
+import { POOL_NAME_RE } from "./defineConfig";
+
 const isDevelopment = process.env.NODE_ENV === "development";
 
 /**
@@ -83,7 +85,23 @@ const appDbCredentials = usingTestDb
           ),
       };
 
-const connections = {
+/** One registry entry, as the Oracle adapter reads it. */
+type ConnectionEntry = {
+    user?: string;
+    password?: string;
+    connectString?: string;
+    poolMin?: number;
+    poolMax?: number;
+    poolIncrement?: number;
+    queueMax?: number;
+    queueTimeout?: number;
+    poolTimeout?: number;
+    connectTimeout?: number;
+    poolPingInterval?: number;
+    stmtCacheSize?: number;
+};
+
+const builtinConnections = {
     // ── appDb — interactive work. The only connection a fresh project needs.
     appDb: {
         ...appDbCredentials,
@@ -118,8 +136,56 @@ const connections = {
     // },
 };
 
-function getConnectionConfig(name: string) {
-    const config = connections[name as keyof typeof connections];
+/**
+ * The live registry: the built-in pools above plus any registered at runtime
+ * by createMira() (registerConnection). Same object as builtinConnections, so
+ * `connections.appDb` keeps its 2.x type.
+ */
+const connections: typeof builtinConnections & Record<string, ConnectionEntry> = builtinConnections;
+
+/** Built-in entries a runtime registration replaced, restored on unregister. */
+const _shadowed = new Map<string, ConnectionEntry>();
+/** Names added by registerConnection and not yet unregistered. */
+const _registered = new Set<string>();
+
+/**
+ * Adds (or, for a built-in name, temporarily replaces) a registry entry.
+ * Used by createMira(); app code should not need it.
+ *
+ * @throws when the name is not a valid pool name, or another live
+ *   registration already holds it.
+ */
+function registerConnection(name: string, entry: ConnectionEntry): void {
+    if (typeof name !== "string" || !POOL_NAME_RE.test(name)) {
+        throw new Error(`Invalid connection name "${String(name).slice(0, 80)}". Use a letter followed by up to 63 letters, digits or _.`);
+    }
+    if (_registered.has(name)) {
+        throw new Error(`Connection "${name}" is already registered by a live createMira() instance. Close that instance first.`);
+    }
+    if (Object.hasOwn(connections, name)) _shadowed.set(name, connections[name]);
+    connections[name] = { ...entry };
+    _registered.add(name);
+}
+
+/**
+ * Removes a runtime registration, restoring the built-in entry it replaced.
+ * @returns false when `name` was not registered at runtime (built-ins stay).
+ */
+function unregisterConnection(name: string): boolean {
+    if (!_registered.delete(name)) return false;
+    const original = _shadowed.get(name);
+    if (original) {
+        connections[name] = original;
+        _shadowed.delete(name);
+    } else {
+        delete connections[name];
+    }
+    return true;
+}
+
+function getConnectionConfig(name: string): ConnectionEntry {
+    // Own keys only: "constructor" or "toString" must not resolve to Object's members.
+    const config = Object.hasOwn(connections, name) ? connections[name] : undefined;
     if (!config) {
         const available = Object.keys(connections).join(", ");
         throw new Error(
@@ -133,8 +199,8 @@ function getConnectionNames() {
     return Object.keys(connections);
 }
 
-/** Named pool keys — single source of truth for pool name strings. */
-const POOL_NAMES = Object.freeze(Object.keys(connections));
+/** Built-in pool keys (runtime registrations are not included; see getConnectionNames). */
+const POOL_NAMES = Object.freeze(Object.keys(builtinConnections));
 
 /**
  * Pools whose saturation (NJS-076) an app's readiness check should treat as
@@ -157,5 +223,6 @@ for (const p of READINESS_GATING_POOLS) {
 // getConnectionConfig from it at load, so a test can swap the function on this
 // plain object for a fresh adapter copy. A named-export binding cannot be
 // reassigned from outside the module.
-export default { connections, getConnectionConfig, getConnectionNames, isDevelopment, usingTestDb, POOL_NAMES, READINESS_GATING_POOLS, buildSimpleConnectString, buildTNSConnectString };
-export { connections, getConnectionConfig, getConnectionNames, isDevelopment, usingTestDb, POOL_NAMES, READINESS_GATING_POOLS, buildSimpleConnectString, buildTNSConnectString };
+export default { connections, registerConnection, unregisterConnection, getConnectionConfig, getConnectionNames, isDevelopment, usingTestDb, POOL_NAMES, READINESS_GATING_POOLS, buildSimpleConnectString, buildTNSConnectString };
+export { connections, registerConnection, unregisterConnection, getConnectionConfig, getConnectionNames, isDevelopment, usingTestDb, POOL_NAMES, READINESS_GATING_POOLS, buildSimpleConnectString, buildTNSConnectString };
+export type { ConnectionEntry };

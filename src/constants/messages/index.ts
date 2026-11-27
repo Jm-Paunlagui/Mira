@@ -10,3 +10,4 @@
 
 export * from "./oracle.messages";
 export * from "./oracleWrapper.messages";
+export * from "./miraConfig.messages";
