@@ -1,6 +1,6 @@
 # Mira 3.0 Roadmap
 
-**Status:** step 3 in progress (3a–3e done; 3f is the merge and release) · **Base:** v2.1.0 · **Branches (stacked):** `feature/v3-config` (#34) → `feature/v3-driver` (#35) → `feature/v3-restructure`
+**Status:** #34 and #35 merged; step 3 (#36) green, held open before merge · **Base:** v2.1.0 · **Branch:** `feature/v3-restructure` (#36)
 
 Mira grew inside an app template (CATHERINE / eMeal), so `config/`, `constants/` and `utils/logger` were app code that ended up in the library. An app that installed `@jm-paunlagui/mira` from npm could use only the two built-in pools (`appDb`, `appDbBulk`), through Mira's own env names, and adding a pool meant editing `node_modules`. 3.0 makes Mira a standalone library: the app passes its config in, and Mira reads no env variable, writes no log file and initialises no driver unless asked.
 
@@ -12,9 +12,9 @@ Update this file as each item lands: tick the box and add the PR number.
 
 | Step | What | Branch | PR | Status |
 |---|---|---|---|---|
-| 1 | `createMira()`, `defineConfig()`, `fromEnv()`, runtime pool registry, `closePool()` | `feature/v3-config` | #34 | ✅ open, ships as 2.2 |
-| 2 | Lazy driver init, `configureDriver()` / `initDriver()`, injectable logger | `feature/v3-driver` | #35 | ✅ open, ships as 2.2 |
-| 3 | Restructure + remove the 2.x API → **3.0.0** | `feature/v3-restructure` | — | 🚧 in progress |
+| 1 | `createMira()`, `defineConfig()`, `fromEnv()`, runtime pool registry, `closePool()` | `feature/v3-config` | #34 | ✅ merged |
+| 2 | Lazy driver init, `configureDriver()` / `initDriver()`, injectable logger | `feature/v3-driver` | #35 | ✅ merged |
+| 3 | Restructure + remove the 2.x API → **3.0.0** | `feature/v3-restructure` | #36 | ✅ green, held open |
 | 4 | CATHERINE switches from its own adapter copy to the npm package | CATHERINE repo | — | ⏳ after 3.0.0 |
 
 ### Step 3 checklist
@@ -39,7 +39,7 @@ Update this file as each item lands: tick the box and add the PR number.
 - [x] **3e. Verify as a user would.** `test/package/run.sh` (`bun run test:package`, also a CI step in both driver modes): packs the tarball, installs it with `@types/node` into an empty temp project with no `.env`, unsets every `MIRA_*` and 2.x variable, and gives the app its own pool name (`shop`) and variables (`PKG_DB_*`). Then: strict `tsc` (`skipLibCheck: false`) over a TypeScript app and the published `.d.ts`, the app under Bun (typed table create / insert / find, exact money, `MiraConfigError`, `open`, health, stats, close, no `logs/`), a CommonJS app and an ES-module app (named imports from the CommonJS build, `fromEnv` with a custom prefix) under Node, and the `mira` CLI binary. Checked that a wrong password fails it.
   - Found on the way: `mira.close()` waited out every retry of a pool that could not come up (4 attempts plus backoff; up to a minute with long connect timeouts). `closePool()` now stops a creation in progress at the current attempt or backoff. The test that exposed it took 5 s and only passed under the runner's 180 s timeout; it now takes ~0.1 s. 561 tests at 100%.
 - [ ] **Open: Thick mode without failover.** On #36, CI's switch to plain Easy Connect made both Thick jobs fail in the chaos suite: the per-call timeout test got `DPI-1010: not connected`, and the session it left counted as in use for four later tests ("1 in use, expected 0"). `:dedicated` did not help. Working theory: in Thick mode a timed-out call can leave the connection dead; the test's `finally { c.callTimeout = 0 }` then throws DPI-1010 over the real error, and the adapter's release of a dead connection fails and is only logged, so the pool slot is never returned. 2.x's descriptor carried `FAILOVER_MODE=(TYPE=SELECT …)`, whose transparent reconnect hid this; CI went back to that descriptor. To do: reproduce on a machine with Instant Client; if confirmed, release a connection whose close fails with `close({ drop: true })`, and make the test's reset not mask the error. Matters for any 3.0 app on Thick mode with an Easy Connect string.
-- [ ] **3f. Merge order:** #34 → #35 → step 3 PR → tag `v3.0.0` → publish.
+- [ ] **3f. Merge and release.** #34 merged (`4f3a93f`) and #35 merged (`4ed51a5`) into `main` on 2026-11-27. #36 (step 3) is green and mergeable, and is held open by decision. After it merges: Claude creates the `v3.0.0` tag and the GitHub release from the CHANGELOG; the maintainer runs `npm publish` (irreversible, so kept with the maintainer).
 
 ---
 
