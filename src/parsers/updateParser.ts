@@ -44,7 +44,7 @@
  * ============================================================================
  */
 
-import { quoteIdentifier, bindSafe } from "../shared/utils";
+import { quoteIdentifier, bindSafe, assertMaxDepth } from "../shared/utils";
 import { oracleMongoWrapperMessages as MSG } from "../shared/messages";
 import { JsonUpdates } from "./jsonPath";
 
@@ -108,6 +108,7 @@ function resetUpdateCounter() {}
  *   // → { setClause: 'SET "updatedAt" = SYSDATE', binds: {} }
  */
 function parseUpdate(update: Record<string, any>): { setClause: string; binds: Record<string, unknown>; } {
+  assertMaxDepth(update, "updateParser");
   if (
     !update ||
     typeof update !== "object" ||

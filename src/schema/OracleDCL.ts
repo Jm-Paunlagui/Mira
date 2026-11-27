@@ -27,6 +27,20 @@ import type { DbConnection } from "../driver/db";
 import { quoteIdentifier } from "../shared/utils";
 import { oracleMongoWrapperMessages as MSG } from "../shared/messages";
 const PRIVILEGE_ERROR_CODES = [1031, 942, 1917, 1919];
+/** Oracle object privileges: the only words grant() / revoke() write into the statement. */
+const OBJECT_PRIVILEGES = new Set([
+    "SELECT", "INSERT", "UPDATE", "DELETE", "ALTER", "INDEX", "REFERENCES", "EXECUTE", "READ", "WRITE",
+    "DEBUG", "FLASHBACK", "UNDER", "ON COMMIT REFRESH", "QUERY REWRITE", "ALL", "ALL PRIVILEGES",
+]);
+function privilegeList(where: string, privileges: unknown): string {
+    const list = Array.isArray(privileges) ? privileges : [privileges];
+    if (list.length === 0) throw new Error(MSG.DCL_PRIVILEGE_INVALID(where, "(none)"));
+    return list.map((p) => {
+        const word = typeof p === "string" ? p.trim().toUpperCase().replace(/\s+/g, " ") : "";
+        if (!OBJECT_PRIVILEGES.has(word)) throw new Error(MSG.DCL_PRIVILEGE_INVALID(where, p));
+        return word;
+    }).join(", ");
+}
 
 /**
  * Oracle DCL (Data Control Language) manager.
@@ -54,7 +68,7 @@ class OracleDCL {
      */
     async grant(privileges: string[], on: string, to: string): Promise<{ acknowledged: boolean; }> {
         return this.db.withConnection(async (conn: DbConnection) => {
-            const privList = privileges.join(", ");
+            const privList = privilegeList("grant", privileges);
             const sql = `GRANT ${privList} ON ${quoteIdentifier(on)} TO ${quoteIdentifier(to)}`;
 
             try {
@@ -83,7 +97,7 @@ class OracleDCL {
      */
     async revoke(privileges: string[], on: string, from: string): Promise<{ acknowledged: boolean; }> {
         return this.db.withConnection(async (conn: DbConnection) => {
-            const privList = privileges.join(", ");
+            const privList = privilegeList("revoke", privileges);
             const sql = `REVOKE ${privList} ON ${quoteIdentifier(on)} FROM ${quoteIdentifier(from)}`;
 
             try {

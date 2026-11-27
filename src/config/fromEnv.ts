@@ -20,6 +20,7 @@
 
 import { miraConfigMessages as MSG } from "../shared/messages/miraConfig.messages";
 import { defineConfig, MiraConfigError } from "./defineConfig";
+import { buildSimpleConnectString } from "./connectString";
 import type { DriverMode, PoolConfig, ResolvedMiraConfig } from "./types";
 
 interface FromEnvOptions<P extends string> {
@@ -59,7 +60,13 @@ function readPool(prefix: string, env: Record<string, string | undefined>, issue
   if (!connectString) {
     const host = get("HOST");
     const service = get("SERVICE");
-    if (host && service) connectString = `${host}:${get("PORT") ?? "1521"}/${service}`;
+    if (host && service) {
+      try {
+        connectString = buildSimpleConnectString(host, get("PORT") ?? "1521", service);
+      } catch {
+        issues.push(MSG.ENV_CONNECT_PARTS_INVALID(prefix));
+      }
+    }
     else issues.push(MSG.ENV_CONNECT_REQUIRED(prefix));
   }
 

@@ -287,7 +287,7 @@ describe("unit/errors: remaining edges", () => {
   it("aggregate expressions that are scalars or empty objects pass through", async () => {
     const { buildAggregateSQL } = await import("../../src");
     expect(buildAggregateSQL("T", [{ $group: { _id: "$R", n: 5 } }], {}).sql).toBe('SELECT "R", 5 AS "N" FROM "T" GROUP BY "R"');
-    expect(buildAggregateSQL("T", [{ $project: { e: {} } }], {}).sql).toBe('SELECT [object Object] AS "E" FROM "T"');
+    expect(() => buildAggregateSQL("T", [{ $project: { e: {} } }], {})).toThrow(/Unsupported operand/);
   });
 
   it("db handle exposes pool health and stats", async () => {

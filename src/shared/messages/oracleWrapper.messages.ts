@@ -170,6 +170,20 @@ const oracleMongoWrapperMessages = {
     `[aggregatePipeline] $matchRecognize: ${String(why)}.`,
   PIPELINE_EXPRESSION_ARGS: (op: unknown, expected: unknown) =>
     `[aggregatePipeline] ${String(op)} expects ${String(expected)}.`,
+  IN_SELECT_INVALID: (got: string) =>
+    `[filterParser] $inSelect takes a query (collection.find(…).project(…)), a sql\`…\` statement or an array of values, not a ${got}. A plain SQL string is no longer run: write it as sql\`SELECT … WHERE X = \${value}\`.`,
+  UNTRUSTED_FILTER: (path: string, why: string) =>
+    `[sanitizeFilter] ${path}: ${why}. Untrusted input may only give plain values (string, number, boolean, null, Date); build operators in code.`,
+  QUERY_TOO_DEEP: (where: string, max: number) =>
+    `[${where}] The input is nested more than ${max} levels deep (or refers to itself). Flatten it, e.g. combine conditions in one $and / $or list.`,
+  PIPELINE_OPERAND_INVALID: (val: unknown) =>
+    `[aggregatePipeline] Unsupported operand of type ${val === null ? "null" : Array.isArray(val) ? "array" : typeof val === "object" ? (val as object).constructor?.name ?? "object" : typeof val}: give a "$COLUMN", an expression, or a string, number, boolean, bigint, Date or Buffer value.`,
+  SCHEMA_SQL_TYPE_INVALID: (where: string, col: unknown, type: unknown) =>
+    `[OracleSchema.${where}] Column ${JSON.stringify(String(col))}: ${JSON.stringify(typeof type === "string" ? type : typeof type)} is not a column type. A type is words, numbers, parentheses and commas only (e.g. "VARCHAR2(100 CHAR)", "NUMBER(19,4)", "TIMESTAMP(6) WITH TIME ZONE").`,
+  SCHEMA_SQL_FRAGMENT_INVALID: (where: string, what: string, reason: string) =>
+    `[OracleSchema.${where}] ${what}: ${reason}. It is written into the DDL as SQL, so it must be one balanced expression with no ";" or comments.`,
+  DCL_PRIVILEGE_INVALID: (where: string, priv: unknown) =>
+    `[OracleDCL.${where}] ${JSON.stringify(typeof priv === "string" ? priv : typeof priv)} is not an object privilege. Use SELECT, INSERT, UPDATE, DELETE, ALTER, INDEX, REFERENCES, EXECUTE, READ, WRITE, DEBUG, FLASHBACK, UNDER, ON COMMIT REFRESH, QUERY REWRITE, ALL or ALL PRIVILEGES.`,
   PIPELINE_UNKNOWN_EXPRESSION: (op: unknown) =>
     `[aggregatePipeline] Unsupported expression operator "${String(op)}".`,
   INLINE_BIND_UNSUPPORTED: (where: unknown, key: unknown, type: unknown) =>

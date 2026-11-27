@@ -6,7 +6,7 @@
  * "SECURITY:" tests assert the safe behaviour and fail while the hole is open.
  */
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
-import { OracleCollection, parseFilter } from "../../src";
+import { OracleCollection, parseFilter, sanitizeFilter, sql } from "../../src";
 import * as config from "../../src/driver/oracle";
 import registry from "../../src/driver/registry";
 import { mira, db, coll, createUsers, dropIfExists, rawExec, recordMetric, USERS } from "../helpers/db";
@@ -167,9 +167,21 @@ describe("security: raw-SQL splice points (live exploit attempts)", () => {
     expect(await OracleCollection.union(users.find({ NAME: "Juan" }), users.find({ NAME: "Ana" })).limit(1).toArray()).toHaveLength(1);
   });
 
-  it("documented escape hatch: raw $inSelect strings execute verbatim (never pass user input)", async () => {
-    const r = await users.find({ ID: { $inSelect: `SELECT "ID" FROM "${U}" WHERE "NAME" = 'Juan'` } }).toArray();
+  it("SECURITY: $inSelect never runs a plain string (operator injection from request input)", async () => {
+    // Express parses ?id[$inSelect]=… into exactly this object.
+    const fromRequest = { ID: { $inSelect: `SELECT "ID" FROM "${U}" UNION SELECT 1 FROM "${S}"` } };
+    await expect(users.find(fromRequest).toArray()).rejects.toThrow(/\$inSelect takes a query/);
+    const r = await users.find({ ID: { $inSelect: sql`SELECT "ID" FROM ${sql.ident(U)} WHERE "NAME" = ${"Juan"}` } }).toArray();
     expect(r).toHaveLength(1);
+    await intact();
+  });
+
+  it("SECURITY: sanitizeFilter keeps request input to equality (no $ne / $gtAny / $or)", async () => {
+    for (const attack of [{ NAME: { $ne: "x" } }, { $or: [{ NAME: "Juan" }, { NAME: { $ne: "" } }] }, { NAME: { $gtAny: { collection: S, field: "SECRET" } } }, { NAME: ["Juan", "Ana"] }]) {
+      expect(() => sanitizeFilter(JSON.parse(JSON.stringify(attack)))).toThrow(/sanitizeFilter/);
+    }
+    expect(await users.find(sanitizeFilter(JSON.parse('{"NAME":"Juan"}'))).toArray()).toHaveLength(1);
+    expect(await users.find(sanitizeFilter(JSON.parse(`{"NAME":"${PAYLOADS[1].replace(/"/g, "")}"}`))).toArray()).toHaveLength(0);
   });
 });
 

@@ -643,6 +643,19 @@ await users.drop(); // ⚠️ Permanent! Deletes the table and all its data
 
 > Comparison operators, chaining find queries, pagination, projections, and advanced update operators.
 
+### Filters from request input
+
+A filter is a small query language, so a request body or query string must never become one as is. `?name[$ne]=x` arrives as `{ name: { $ne: "x" } }`. `sanitizeFilter()` keeps plain values (string, number, boolean, null, Date) as equality and refuses every operator, nested object and list:
+
+```js
+import { sanitizeFilter } from "@jm-paunlagui/mira";
+
+// GET /users?city=Cebu&status=active
+await users.find({ ...sanitizeFilter(req.query), tenantId: user.tenantId }).toArray();
+```
+
+Add operators in code, from values you took out of the input. See [SECURITY.md](SECURITY.md) for what Mira binds and which inputs are SQL by design.
+
 ### Filter Operators
 
 Instead of just `{ field: value }`, you can use `$operators` for comparisons:
@@ -1552,6 +1565,11 @@ await users
     .find({
         id: { $inSelect: orders.find({}).project({ userId: 1 }) },
     })
+    .toArray();
+
+// …or a hand-written subquery: sql`…` binds every value. A plain string is refused.
+await users
+    .find({ id: { $inSelect: sql`SELECT USER_ID FROM ORDERS WHERE TOTAL > ${minTotal}` } })
     .toArray();
 
 // Scalar subquery — add a computed column

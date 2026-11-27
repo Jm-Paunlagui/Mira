@@ -211,7 +211,7 @@ describe("unit: parseFilter", () => {
     expect(() => parseFilter({ T: { $lt: { $now: { minus: { days: Infinity } } } } })).toThrow(/non-negative/);
   });
 
-  it("$inSelect: array, empty array, QueryBuilder, object without _getBinds, raw SQL", () => {
+  it("$inSelect: array, empty array, QueryBuilder, object without _getBinds, no raw SQL", () => {
     expect(parseFilter({ ID: { $inSelect: [1, 2] } }).whereClause).toBe('WHERE "ID" IN (:where_ID_0, :where_ID_1)');
     expect(parseFilter({ ID: { $inSelect: [] } }).whereClause).toBe("WHERE 1=0");
     expect(parseFilter({ ID: { $inSelect: Array.from({ length: 1500 }, (_, i) => i) } }).whereClause).toBe('WHERE "ID" IN (SELECT COLUMN_VALUE FROM TABLE(:where_ID_0))');
@@ -221,7 +221,8 @@ describe("unit: parseFilter", () => {
     expect(viaQb.whereClause).toBe('WHERE "ID" IN (SELECT "ID" FROM "T_U" t0 WHERE "S" = :sq_0_where_S_0)');
     expect(viaQb.binds).toEqual({ sq_0_where_S_0: "a" });
     expect(parseFilter({ ID: { $inSelect: { _buildSQL: () => "SELECT 1 FROM DUAL" } } }).whereClause).toBe('WHERE "ID" IN (SELECT 1 FROM DUAL)');
-    expect(parseFilter({ ID: { $inSelect: "SELECT 1 FROM DUAL" } }).whereClause).toBe('WHERE "ID" IN (SELECT 1 FROM DUAL)');
+    // 3.0.1: a plain string is refused (it was run as raw SQL); a sql`` statement takes its place.
+    expect(() => parseFilter({ ID: { $inSelect: "SELECT 1 FROM DUAL" } })).toThrow(/not a string/);
   });
 
   it("$gtAny..$lteAll compile to ANY/ALL subqueries", () => {
@@ -340,6 +341,18 @@ describe("unit: aggregate pipeline", () => {
     expect(() => agg([{ $having: { X: { $gt: 1 } } }])).toThrow(/\$having must directly follow a \$group/);
   });
 
+  it("SECURITY: an operand that is not a value or an expression is refused, never spliced", () => {
+    const evil = { toString: () => "1) UNION SELECT PASSWORD FROM DBA_USERS --" };
+    expect(() => agg([{ $project: { X: { $cond: { if: { A: 1 }, then: 1, else: evil } } } }])).toThrow(/Unsupported operand of type Object/);
+    expect(() => agg([{ $project: { X: { $add: ["$A", evil] } } }])).toThrow(/Unsupported operand/);
+    expect(() => agg([{ $project: { X: { $add: ["$A", Symbol("s")] } } }])).toThrow(/Unsupported operand of type symbol/);
+    expect(() => agg([{ $project: { X: { $mod: [evil, 2] } } }])).toThrow(/Unsupported operand/);
+    expect(() => agg([{ $project: { X: { $year: evil } } }])).toThrow(/Unsupported operand/);
+    expect(() => agg([{ $project: { X: { $year: Infinity } } }])).toThrow(/Unsupported operand of type number/);
+    expect(() => agg([{ $project: { X: {} } }])).toThrow(/Unsupported operand/);
+    expect(() => agg([{ $project: { X: { $add: ["$A", null, Buffer.from("x")] } } }])).not.toThrow();
+  });
+
   it("aggregate expressions: arithmetic, string, date, conditional, window, fallbacks", () => {
     const { sql, binds } = agg([
       {
@@ -355,7 +368,7 @@ describe("unit: aggregate pipeline", () => {
           d: { $dateToString: { format: "YYYY'Q", date: "$D" } }, d2: { $dateToString: { date: "$D" } },
           cnd: { $cond: { if: { A: { $gte: 10 } }, then: "VIP", else: "$B" } },
           cnd2: { $cond: { if: { $A: 5 }, then: 1, else: 0 } },
-          cnd3: { $cond: { if: "nope", then: 1, else: { x: 1 } } },
+          cnd3: { $cond: { if: "nope", then: 1, else: 0 } },
           cnd4: { $cond: { if: { A: { $weird: 1 } }, then: 1, else: 0 } },
           inl: { $ifNull: ["$N", "anon"] }, inl1: { $ifNull: "$N" },
           sz: { $size: "$ARR" },
@@ -369,7 +382,7 @@ describe("unit: aggregate pipeline", () => {
       '"F" || "L"', 'UPPER("F")', 'LOWER("F")', 'SUBSTR("F", 1, 3)', "TO_CHAR(\"D\", 'YYYY''Q')", "TO_CHAR(\"D\", 'YYYY-MM-DD')",
       'CASE WHEN "A" >= :cond_5 THEN :agg_6 ELSE "B" END', 'CASE WHEN "A" = :cond_7', "CASE WHEN 1=1 THEN :agg_",
       'COALESCE("N", :agg_', "JSON_VALUE(\"ARR\", '$.size()' RETURNING NUMBER)", "ROW_NUMBER() OVER ()", '"keep"', '"A" AS "ALIAS"',
-      'COUNT(*) AS "STAR"', 'SUM(5) AS "NUM"', '"A" AS "MUL1"', '"F" AS "SS1"', '"N" AS "INL1"', "[object Object]",
+      'COUNT(*) AS "STAR"', 'SUM(5) AS "NUM"', '"A" AS "MUL1"', '"F" AS "SS1"', '"N" AS "INL1"',
     ])
       expect(sql).toContain(frag);
     expect(binds.agg_0).toBe(2);

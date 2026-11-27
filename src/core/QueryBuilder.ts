@@ -535,7 +535,11 @@ class QueryBuilder {
         const resolve = async (obj: unknown): Promise<unknown> => {
             if (obj && typeof obj === "object" && "then" in obj && typeof obj.then === "function") return await obj;
             if (Array.isArray(obj)) return Promise.all(obj.map(resolve));
-            if (obj && typeof obj === "object" && !(obj instanceof Date)) {
+            // Only plain objects are filter structure. A Date, Buffer or sql`…` statement is a
+            // value: copying it field by field lost its class (a sql`` subquery became a plain
+            // object, a Buffer an object of byte fields).
+            const proto = obj && typeof obj === "object" ? Object.getPrototypeOf(obj) : undefined;
+            if (obj && typeof obj === "object" && (proto === Object.prototype || proto === null)) {
                 const result: Record<string, unknown> = {};
                 for (const [k, v] of Object.entries(obj)) {
                     result[k] = await resolve(v);

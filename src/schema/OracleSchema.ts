@@ -42,7 +42,7 @@
 
 import type { DbConnection } from "../driver/db";
 import type { QueryBuilder } from "../core/QueryBuilder";
-import { quoteIdentifier, inlineBinds } from "../shared/utils";
+import { quoteIdentifier, inlineBinds, sqlFragmentProblem } from "../shared/utils";
 import { oracleMongoWrapperMessages as MSG } from "../shared/messages";
 
 /**
@@ -69,6 +69,24 @@ type AlterOperation = {
   addConstraint?: { type: string; columns: string[]; name?: string };
   dropConstraint?: string;
 };
+
+/** A column type written into DDL: one balanced SQL fragment (see sqlFragmentProblem). */
+function _sqlType(where: string, col: string, type: unknown): string {
+  if (sqlFragmentProblem(type) !== null) throw new Error(MSG.SCHEMA_SQL_TYPE_INVALID(where, col, type));
+  return type as string;
+}
+/** A DEFAULT or CHECK expression written into DDL: a finite number, or one balanced SQL fragment. */
+function _sqlExpr(where: string, what: string, value: unknown): string {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error(MSG.SCHEMA_SQL_FRAGMENT_INVALID(where, what, "a number must be finite"));
+    return String(value);
+  }
+  if (typeof value === "bigint") return String(value);
+  const problem = sqlFragmentProblem(value);
+  if (problem !== null) throw new Error(MSG.SCHEMA_SQL_FRAGMENT_INVALID(where, what, problem));
+  return value as string;
+}
+const CONSTRAINT_TYPES = new Set(["UNIQUE", "PRIMARY KEY"]);
 
 class OracleSchema {
   declare db: import("../driver/db").WrapperDb;
@@ -116,7 +134,7 @@ class OracleSchema {
       }
 
       for (const [colName, spec] of Object.entries(columns)) {
-        const parts = [quoteIdentifier(colName), spec.type];
+        const parts = [quoteIdentifier(colName), _sqlType("createTable", colName, spec.type)];
 
         if (spec.autoIncrement) {
           parts.push("GENERATED ALWAYS AS IDENTITY");
@@ -124,7 +142,7 @@ class OracleSchema {
         // Oracle's column grammar puts DEFAULT before every inline constraint:
         // "NOT NULL DEFAULT 0" or "PRIMARY KEY DEFAULT 1" is ORA-00907.
         if (spec.default != null) {
-          parts.push(`DEFAULT ${spec.default}`);
+          parts.push(`DEFAULT ${_sqlExpr("createTable", `${colName} default`, spec.default)}`);
         }
         if (spec.primaryKey) {
           parts.push("PRIMARY KEY");
@@ -133,7 +151,7 @@ class OracleSchema {
           parts.push("NOT NULL");
         }
         if (spec.check) {
-          parts.push(`CHECK (${spec.check})`);
+          parts.push(`CHECK (${_sqlExpr("createTable", `${colName} check`, spec.check)})`);
         }
         if (spec.references) {
           parts.push(
@@ -187,7 +205,7 @@ class OracleSchema {
       if (operation.addColumn) {
         const entries = Object.entries(operation.addColumn);
         const colDefs = entries
-          .map(([col, type]) => `${quoteIdentifier(col)} ${type}`)
+          .map(([col, type]) => `${quoteIdentifier(col)} ${_sqlType("alterTable", col, type)}`)
           .join(", ");
         sql = `ALTER TABLE ${quoteIdentifier(tableName)} ADD (${colDefs})`;
       } else if (operation.dropColumn) {
@@ -199,7 +217,7 @@ class OracleSchema {
       } else if (operation.modifyColumn) {
         const entries = Object.entries(operation.modifyColumn);
         const colDefs = entries
-          .map(([col, type]) => `${quoteIdentifier(col)} ${type}`)
+          .map(([col, type]) => `${quoteIdentifier(col)} ${_sqlType("alterTable", col, type)}`)
           .join(", ");
         sql = `ALTER TABLE ${quoteIdentifier(tableName)} MODIFY (${colDefs})`;
       } else if (operation.renameColumn) {
@@ -207,10 +225,12 @@ class OracleSchema {
         sql = `ALTER TABLE ${quoteIdentifier(tableName)} RENAME COLUMN ${quoteIdentifier(from)} TO ${quoteIdentifier(to)}`;
       } else if (operation.addConstraint) {
         const { type, columns, name } = operation.addConstraint;
+        const kind = typeof type === "string" ? type.trim().toUpperCase().replace(/\s+/g, " ") : "";
+        if (!CONSTRAINT_TYPES.has(kind)) throw new Error(MSG.SCHEMA_SQL_FRAGMENT_INVALID("alterTable", "addConstraint.type", 'use "UNIQUE" or "PRIMARY KEY"'));
         const constraintName =
           name || `${type}_${tableName}_${columns.join("_")}`;
         const colList = columns.map(quoteIdentifier).join(", ");
-        sql = `ALTER TABLE ${quoteIdentifier(tableName)} ADD CONSTRAINT ${quoteIdentifier(constraintName)} ${type} (${colList})`;
+        sql = `ALTER TABLE ${quoteIdentifier(tableName)} ADD CONSTRAINT ${quoteIdentifier(constraintName)} ${kind} (${colList})`;
       } else if (operation.dropConstraint) {
         sql = `ALTER TABLE ${quoteIdentifier(tableName)} DROP CONSTRAINT ${quoteIdentifier(operation.dropConstraint)}`;
       } else {

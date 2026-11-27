@@ -1,5 +1,34 @@
 # Changelog
 
+## [3.1.0] — Unreleased
+
+Theme: security hardening. A red-team pass (a new SQL-text fuzzer, plus hand-written attacks) found five ways for a caller's text to reach SQL unescaped. Each is fixed and has a regression test. **Upgrade if your app passes request input into filters, or builds views from filters.**
+
+### Security
+
+- **`createView()` / `createMaterializedView()` value injection.** Filter values are written into the view's SQL as literals, one bind at a time. A value containing another bind's name (for example `":where_CITY_1"`) pulled the next value into its own quotes, and a value such as `' || (SELECT PASSWORD FROM …) || '` then ran as SQL in the view. Binds are now inlined in one pass that never re-reads a literal. `renameBinds` (subqueries, `$lookup`) gets the same one-pass fix: it could rename a placeholder twice and bind the wrong value.
+- **`$inSelect` operator injection.** A plain string given to `$inSelect` was run as raw SQL. A filter built from request input (`users.find({ ID: req.query.id })` with `?id[$inSelect]=SELECT…`) reached it. **Breaking:** a string is now refused. Pass a query (`orders.find(…).project(…)`), an array of values, or a ``sql`…` `` statement, whose values are binds.
+- **New `sanitizeFilter(input)`.** It turns untrusted input into an equality-only filter and refuses `$` operators, nested objects, lists and `__proto__`/`constructor` keys. Mongo-style APIs let a request send `{ "NAME": { "$ne": "" } }`; use `users.find(sanitizeFilter(req.query))` and add your operators in code.
+- **`grant()` / `revoke()` privilege injection.** Privilege names were joined into the statement as written. Only Oracle object privileges are accepted now (SELECT, INSERT, UPDATE, DELETE, ALTER, INDEX, REFERENCES, EXECUTE, READ, WRITE, DEBUG, FLASHBACK, UNDER, ON COMMIT REFRESH, QUERY REWRITE, ALL [PRIVILEGES]).
+- **DDL fragments.** A column type (`createTable`, `alterTable` add/modify), `DEFAULT` and `CHECK` are still developer-written SQL, but each must now be one balanced fragment: quotes closed, parentheses balanced, no top-level `,`, no `;`, no comments. A value can no longer close the column definition and add its own. `addConstraint.type` takes only `UNIQUE` or `PRIMARY KEY`.
+- **Aggregate operands.** A value that is neither a column, an expression nor a plain value (for example an object with its own `toString()`) was spliced into the SQL as `String(value)`. It is refused with a `TypeError`; non-finite numbers are refused too.
+- **Connect-string injection.** `buildSimpleConnectString`, `buildTNSConnectString` and `fromEnv`'s `HOST`/`PORT`/`SERVICE` wrote their parts into the descriptor unchecked. A host such as `db)(ADDRESS=(HOST=evil)…` added an address and sent the credentials to another server. Host, port (1–65535) and service/SID are now validated; errors name the part, never the value.
+- **Stack exhaustion.** A filter, update or pipeline nested 100,000 levels deep overflowed the stack inside the recursive parsers. Input deeper than 100 levels, or input that refers to itself, is refused up front with a `RangeError`.
+
+### Fixed
+
+- A `Buffer` or a ``sql`…` `` statement inside a filter kept its type: the filter-resolution step copied every object field by field.
+
+### Supply chain
+
+- Every GitHub Action is pinned to a commit SHA (Dependabot keeps the pins current), and `actions/checkout` no longer leaves the token in `.git/config`.
+- `SECURITY.md`: how to report a vulnerability.
+
+### Tests
+
+- `test/security/fuzz.test.ts` takes about 60 call shapes covering every public builder and sends each through every mutation: each string, key and number replaced by 19 hostile payloads, in both string and `toString()` object form. A SQL lexer, which also reads inside `EXECUTE IMMEDIATE` strings, checks that no payload ever appears as bare SQL.
+- `test/security/hardening.test.ts`: a regression test for each fix above.
+
 ## [3.0.0] — 2026-11-28
 
 Theme: Mira is a standalone library. The app passes its config in; Mira reads no environment variable, writes no log file and initialises no driver unless asked. Built on top of 2.2 (`createMira`, `configureDriver`, `setLogger`), which stays the entry point. Upgrade guide: [docs/MIGRATION-3.0.md](docs/MIGRATION-3.0.md). Plan and progress: [docs/ROADMAP-3.0.md](docs/ROADMAP-3.0.md).

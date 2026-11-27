@@ -72,7 +72,7 @@
  * ============================================================================
  */
 
-import { quoteIdentifier, renameBinds, sortTerm } from "../shared/utils";
+import { quoteIdentifier, renameBinds, sortTerm, assertMaxDepth } from "../shared/utils";
 import { parseFilter } from "../parsers/filterParser";
 import { splitPath, pathText } from "../parsers/jsonPath";
 import { oracleMongoWrapperMessages as MSG } from "../shared/messages";
@@ -122,6 +122,7 @@ function _createCounter(): Counter {
  *   ], db);
  */
 function buildAggregateSQL(tableName: string, pipeline: Array<any>, db: Record<string, unknown>, aliasPrefix = "", hoist?: Array<{ alias: string; sql: string }>, base?: Array<{ alias: string; sql: string; cols?: string[]; suffix?: string }>): { sql: string; binds: Record<string, unknown>; arrays?: Record<string, "array" | "set"> } {
+  if (!aliasPrefix && !hoist) assertMaxDepth(pipeline, "aggregatePipeline");
   const counter = _createCounter();
   const ctes: Array<{ alias: string; sql: string }> = [];
   const allBinds: Record<string, unknown> = {};
@@ -855,7 +856,9 @@ function _buildAggExpr(expr: Record<string, DslSpec>, binds: Record<string, unkn
       }
     }
   }
-  return String(expr);
+  // A bare number ({ $group: { N: 5 } }) is a constant; anything else is not an expression.
+  if (typeof expr === "number" && Number.isFinite(expr)) return String(expr);
+  throw new TypeError(MSG.PIPELINE_OPERAND_INVALID(expr));
 }
 
 /**
@@ -942,7 +945,11 @@ function _fieldRef(val: DslSpec) {
     return _refResolver ? _refResolver(val.substring(1)) : quoteIdentifier(val.substring(1));
   }
   if (val === "*") return "*";
-  if (typeof val === "number") return String(val);
+  if (typeof val === "number") {
+    if (!Number.isFinite(val)) throw new TypeError(MSG.PIPELINE_OPERAND_INVALID(val));
+    return String(val);
+  }
+  if (typeof val !== "string") throw new TypeError(MSG.PIPELINE_OPERAND_INVALID(val));
   return quoteIdentifier(val);
 }
 
@@ -957,10 +964,12 @@ function _fieldRefOrBind(val: unknown, binds: Record<string, unknown>, counter: 
   }
   if (_isExpr(val)) return `(${_buildAggExpr(val as Record<string, DslSpec>, binds, counter)})`;
   if (val === null) return "NULL";
-  if (typeof val === "number" || typeof val === "boolean" || typeof val === "string" || typeof val === "bigint" || val instanceof Date) {
+  if (typeof val === "number" || typeof val === "boolean" || typeof val === "string" || typeof val === "bigint" || val instanceof Date || val instanceof Uint8Array) {
     return _bindValue(val, binds, counter);
   }
-  return String(val);
+  // Anything else (an object with its own toString, a class instance, a symbol) used
+  // to be spliced into the SQL as String(val): an injection point. Refuse it.
+  throw new TypeError(MSG.PIPELINE_OPERAND_INVALID(val));
 }
 
 /**

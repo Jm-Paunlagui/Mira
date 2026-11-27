@@ -175,11 +175,12 @@ function mergeBinds(a: Record<string, unknown>, b: Record<string, unknown>): Rec
  */
 function renameBinds(sql: string, binds: Record<string, unknown>, prefix: string): { sql: string; binds: Record<string, unknown> } {
   const out: Record<string, unknown> = {};
-  let renamed = sql;
-  for (const [k, v] of Object.entries(binds)) {
-    renamed = renamed.replace(new RegExp(`:${k.replace(/[^A-Za-z0-9_$#]/g, "\\$&")}\\b`, "g"), `:${prefix}${k}`);
-    out[`${prefix}${k}`] = v;
-  }
+  for (const [k, v] of Object.entries(binds)) out[`${prefix}${k}`] = v;
+  // One pass, skipping quoted text, so a renamed placeholder is never renamed again
+  // (binds "A" and "p_A" with prefix "p_") and a quoted name or literal is left alone.
+  const renamed = sql.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"|:([A-Za-z_][A-Za-z0-9_$#]*)/g, (m, name?: string) =>
+    name !== undefined && Object.prototype.hasOwnProperty.call(binds, name) ? `:${prefix}${name}` : m,
+  );
   return { sql: renamed, binds: out };
 }
 
@@ -195,7 +196,7 @@ function renameBinds(sql: string, binds: Record<string, unknown>, prefix: string
  * TypeError instead of guessing a format; pass the view as SQL text for those.
  */
 function inlineBinds(sql: string, binds: Record<string, unknown>, where: string): string {
-  let out = sql;
+  const literals = new Map<string, string>();
   for (const [k, v] of Object.entries(binds)) {
     let literal: string;
     if (v === null || v === undefined) literal = "NULL";
@@ -203,9 +204,14 @@ function inlineBinds(sql: string, binds: Record<string, unknown>, where: string)
     else if (typeof v === "bigint") literal = v.toString();
     else if (typeof v === "string") literal = `'${v.replace(/'/g, "''")}'`;
     else throw new TypeError(MSG.INLINE_BIND_UNSUPPORTED(where, k, v instanceof Date ? "Date" : typeof v));
-    out = out.replace(new RegExp(`:${k.replace(/[^A-Za-z0-9_$#]/g, "\\$&")}\\b`, "g"), () => literal);
+    literals.set(k, literal);
   }
-  return out;
+  // One pass over the SQL, skipping 'literals' and "identifiers". Replacing bind by
+  // bind (2.x–3.0.0) re-scanned literals already inlined: a value containing the text
+  // ":where_B_1" pulled the next value into it and broke out of the quotes.
+  return sql.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"|:([A-Za-z_][A-Za-z0-9_$#]*)/g, (m, name?: string) =>
+    name !== undefined && literals.has(name) ? literals.get(name)! : m,
+  );
 }
 
 // ─── buildOrderBy ───────────────────────────────────────────────
@@ -323,4 +329,57 @@ function buildProjection(projection: Record<string, unknown> | null | undefined)
   };
 }
 
+// ─── sqlFragmentProblem ─────────────────────────────────────────
+/**
+ * Checks a piece of developer-written SQL that Mira writes into a statement as
+ * is (a column type, a DEFAULT, a CHECK condition). It must stay one expression:
+ * quotes closed, parentheses balanced and never closed below the start, no ","
+ * at the top level (which would start another column), no ";" and no comments.
+ * Returns why it is refused, or null when it is acceptable.
+ */
+function sqlFragmentProblem(text: unknown): string | null {
+  if (typeof text !== "string") return `expected a string, got ${text === null ? "null" : typeof text}`;
+  if (text.trim() === "") return "it is empty";
+  if (text.includes("\u0000")) return "it contains a NUL character";
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "'" || c === '"') {
+      const end = text.indexOf(c, i + 1);
+      if (end < 0) return `a ${c === "'" ? "string" : "quoted name"} is not closed`;
+      i = end;
+      while (text[i + 1] === c) { const next = text.indexOf(c, i + 2); if (next < 0) return "a quote is not closed"; i = next; }
+    } else if (c === "(") depth++;
+    else if (c === ")") { if (--depth < 0) return 'it closes a ")" it did not open'; }
+    else if (c === ";") return 'it contains ";"';
+    else if (c === "," && depth === 0) return 'it contains "," outside parentheses';
+    else if ((c === "-" && text[i + 1] === "-") || (c === "/" && text[i + 1] === "*")) return "it contains a comment";
+    else if ((c === "q" || c === "Q") && text[i + 1] === "'" && !/[A-Za-z0-9_$#]/.test(text[i - 1] ?? "")) return "q-quoted strings are not accepted";
+  }
+  return depth === 0 ? null : 'a "(" is not closed';
+}
+
+// ─── assertMaxDepth ─────────────────────────────────────────────
+/** Deepest nesting a filter, update or pipeline may have. Real queries stay far below it. */
+const MAX_QUERY_DEPTH = 100;
+/**
+ * Refuses a value nested deeper than `max` objects/arrays (or one that refers to
+ * itself). Iterative, so a hostile 100 000-level filter is refused with a clear
+ * error instead of overflowing the stack inside the recursive parsers.
+ */
+function assertMaxDepth(value: unknown, where: string, max = MAX_QUERY_DEPTH): void {
+  if (!value || typeof value !== "object") return;
+  const stack: Array<[unknown, number]> = [[value, 1]];
+  while (stack.length > 0) {
+    const [v, d] = stack.pop()!;
+    if (d > max) throw new RangeError(MSG.QUERY_TOO_DEEP(where, max));
+    // Only plain objects and arrays are query structure; a QueryBuilder, Date or Buffer is a leaf.
+    const proto = Object.getPrototypeOf(v);
+    if (!Array.isArray(v) && proto !== Object.prototype && proto !== null) continue;
+    const children = Array.isArray(v) ? v : Object.values(v as object);
+    for (const c of children) if (c && typeof c === "object") stack.push([c, d + 1]);
+  }
+}
+
+export { sqlFragmentProblem, assertMaxDepth, MAX_QUERY_DEPTH };
 export { quoteIdentifier, bindSafe, convertTypes, rowToDoc, mergeBinds, renameBinds, inlineBinds, buildOrderBy, buildProjection, sortTerm };

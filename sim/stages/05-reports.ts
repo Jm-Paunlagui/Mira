@@ -100,6 +100,12 @@ export async function reportsStage(sim: Sim, ctx: Ctx, state: State) {
     await count({ $notExists: { collection: T.ORDERS, match: { CUSTOMER_ID: "$ID" } } }),
   ], [buyers.size, custs.length - buyers.size]);
   sim.eq("$inSelect: customers whose id appears in the orders", await count({ ID: { $inSelect: orders.find({}).project({ CUSTOMER_ID: 1 }) } }), buyers.size);
+  sim.eq("$inSelect with a sql`` subquery: the same customers", await count({ ID: { $inSelect: api.sql`SELECT CUSTOMER_ID FROM ${api.sql.ident(T.ORDERS)} WHERE ID > ${0}` } }), buyers.size);
+  await sim.rejects("$inSelect: a plain SQL string is refused (operator injection)", () => count({ ID: { $inSelect: `SELECT ID FROM "${T.CUSTOMERS}"` } }), /\$inSelect takes a query/);
+  // A customer search straight from a query string: equality only, operators refused.
+  const search = api.sanitizeFilter(JSON.parse(JSON.stringify({ TIER: "vip" })));
+  sim.eq("sanitizeFilter: a request's plain fields filter as equality", await count(search), custs.filter((c) => c.TIER === "vip").length);
+  await sim.rejects("sanitizeFilter: ?TIER[$ne]=x from a request is refused", () => api.sanitizeFilter({ TIER: { $ne: "x" } }), /operators|not a plain value/);
   const staff = (await raw<{ ID: number; MANAGER_ID: number | null; NAME: string; DEPT: string; SALARY: number }>(`SELECT ID, MANAGER_ID, NAME, DEPT, SALARY FROM "${T.EMPLOYEES}"`)).map((e) => ({
     ...e,
     ID: Number(e.ID),

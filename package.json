@@ -1,6 +1,6 @@
 {
   "name": "@jm-paunlagui/mira",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "MongoDB-style queries on Oracle: pass your pools to createMira(), get typed collections, pipelines and Oracle SQL with bind variables.",
   "keywords": [
     "oracle",
