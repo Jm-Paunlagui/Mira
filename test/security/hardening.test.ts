@@ -155,8 +155,8 @@ describe("security: untrusted filters", () => {
     expect(sanitizeFilter(null)).toEqual({});
     expect(sanitizeFilter(Object.assign(Object.create(null), { A: 1 }))).toEqual({ A: 1 });
     const bad: Array<[unknown, RegExp]> = [
-      [{ $or: [] }, /"\$or": operators/], [{ A: { $ne: 1 } }, /"A": a object/], [{ A: [1, 2] }, /a list/], [{ A: undefined }, /missing value/],
-      [{ A: NaN }, /non-finite number/], [{ A: new Date("x") }, /a object/], [{ A: () => 1 }, /a function/], [JSON.parse('{"__proto__":{"x":1}}'), /"__proto__": this key/],
+      [{ $or: [] }, /"\$or": operators/], [{ A: { $ne: 1 } }, /"A": an object/], [{ A: [1, 2] }, /a list/], [{ A: undefined }, /missing value/],
+      [{ A: NaN }, /non-finite number/], [{ A: new Date("x") }, /an invalid Date/], [{ A: () => 1 }, /a function/], [JSON.parse('{"__proto__":{"x":1}}'), /"__proto__": this key/],
       [{ constructor: 1 }, /this key/], [{ "": 1 }, /1 to 128/], [{ ["A".repeat(129)]: 1 }, /1 to 128/], ["NAME=x", /plain object/], [[{ A: 1 }], /plain object/], [new Map(), /plain object/],
     ];
     for (const [v, re] of bad) expect(() => sanitizeFilter(v)).toThrow(re);
@@ -165,7 +165,7 @@ describe("security: untrusted filters", () => {
   it("$inSelect takes a query, a sql`` statement or values, never a string", async () => {
     const { parseFilter, sql } = await import("../../src");
     expect(() => parseFilter({ ID: { $inSelect: "SELECT 1 FROM DUAL" } })).toThrow(/not a string/);
-    expect(() => parseFilter({ ID: { $inSelect: { sql: "SELECT 1 FROM DUAL", binds: {} } } })).toThrow(/not a object/);
+    expect(() => parseFilter({ ID: { $inSelect: { sql: "SELECT 1 FROM DUAL", binds: {} } } })).toThrow(/not an object/);
     expect(() => parseFilter({ ID: { $inSelect: null } })).toThrow(/not a null/);
     const r = parseFilter({ ID: { $inSelect: sql`SELECT ID FROM T WHERE A = ${"x"} AND B = ${2}` }, NAME: "n" });
     expect(r.whereClause).toMatch(/^WHERE "ID" IN \(SELECT ID FROM T WHERE A = :sq_\d+_p0 AND B = :sq_\d+_p1\) AND "NAME" = :where_NAME_\d+$/);

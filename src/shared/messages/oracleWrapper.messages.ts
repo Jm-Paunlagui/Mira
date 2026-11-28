@@ -171,7 +171,7 @@ const oracleMongoWrapperMessages = {
   PIPELINE_EXPRESSION_ARGS: (op: unknown, expected: unknown) =>
     `[aggregatePipeline] ${String(op)} expects ${String(expected)}.`,
   IN_SELECT_INVALID: (got: string) =>
-    `[filterParser] $inSelect takes a query (collection.find(…).project(…)), a sql\`…\` statement or an array of values, not a ${got}. A plain SQL string is no longer run: write it as sql\`SELECT … WHERE X = \${value}\`.`,
+    `[filterParser] $inSelect takes a query (collection.find(…).project(…)), a sql\`…\` statement or an array of values, not ${/^[aeiou]/.test(got) ? "an" : "a"} ${got}. A plain SQL string is no longer run: write it as sql\`SELECT … WHERE X = \${value}\`.`,
   UNTRUSTED_FILTER: (path: string, why: string) =>
     `[sanitizeFilter] ${path}: ${why}. Untrusted input may only give plain values (string, number, boolean, null, Date); build operators in code.`,
   QUERY_TOO_DEEP: (where: string, max: number) =>

@@ -585,6 +585,8 @@ await users.insertMany([
 ]);
 ```
 
+`insertMany` returns `insertedIds`. By default it reads each new `ID` back with `RETURNING`, which costs out-binds on every row. When every document already carries its own integer `ID`, the table is your schema's own, its `ID` is a `NUMBER` with no scale, and no trigger fires on insert, Mira reports the IDs you supplied and skips `RETURNING` (about 2.4× faster for 1,000 rows). It checks the dictionary once per table per minute. Pass `returning: ["ID"]` to always read the stored values back, or `returning: []` when you need no IDs.
+
 ### Find Data
 
 ```js

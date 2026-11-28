@@ -147,12 +147,116 @@ describe("unit/errors: OracleCollection wraps every driver failure", () => {
     expect((await c.deleteOne({ A: 1 }, { returning: ["NAME"] })).returning).toEqual({ NAME: "x" });
     const many = await c.updateMany({ A: 1 }, { $set: { A: 2 } }, { returning: ["NAME", "MISSING"] });
     expect(many.returning).toEqual([{ NAME: "x", MISSING: null }]);
-    const conn2 = stubConn(() => ({ rowsAffected: 1, outBinds: [{ out_ID: 3 }, { out_ID: [null] }] }));
+    // executeMany binds by position: one entry per row, the RETURNING outs in order (scalar or array).
+    const conn2 = stubConn(() => ({ rowsAffected: 1, outBinds: [[3], [[null]]] }));
     const c2 = new OracleCollection("T_X", stubDb(conn2) as never, conn2 as never);
     expect((await c2.insertMany([{ A: 1 }, { A: 2 }])).insertedIds).toEqual([3, null]);
     const conn3 = stubConn(() => ({ rowsAffected: 1, outBinds: { out_ID: { weird: true } } }));
     const c3 = new OracleCollection("T_X", stubDb(conn3) as never, conn3 as never);
     expect((await c3.insertOne({ A: 1 }, { returning: ["ID"] })).insertedId).toBeNull();
+  });
+});
+
+describe("unit/errors: one-statement batches commit with the execute", () => {
+  // No session: insertMany (one column set) and bulkUpdateByKeys borrow a connection
+  // and pass autoCommit, so the commit rides on the execute's round trip.
+  const borrowed = (conn: ReturnType<typeof stubConn>) => {
+    const db = stubDb(conn);
+    let tx = 0;
+    const withTransaction = db.withTransaction;
+    return { db: { ...db, withTransaction: (cb: never) => (tx++, withTransaction(cb)) }, tx: () => tx };
+  };
+
+  it("insertMany (one shape) and bulkUpdateByKeys use autoCommit and no transaction", async () => {
+    const conn = stubConn(() => ({ rowsAffected: 1, outBinds: [] }));
+    const { db, tx } = borrowed(conn);
+    const c = new OracleCollection("T_X", db as never);
+    await c.insertMany([{ A: 1 }, { A: 2 }], { returning: [] });
+    await c.bulkUpdateByKeys([{ K: 1, A: 1 }], { keys: ["K"] });
+    expect(conn.calls.map((k) => (k.opts as { autoCommit?: boolean }).autoCommit)).toEqual([true, true]);
+    expect(tx()).toBe(0);
+  });
+
+  it("several column sets or batchErrors keep one transaction (no autoCommit)", async () => {
+    const conn = stubConn(() => ({ rowsAffected: 1, outBinds: [], batchErrors: [] }));
+    const { db, tx } = borrowed(conn);
+    const c = new OracleCollection("T_X", db as never);
+    await c.insertMany([{ A: 1 }, { B: 2 }], { returning: [] });
+    await c.insertMany([{ A: 1 }], { returning: [], batchErrors: true });
+    expect(conn.calls.map((k) => (k.opts as { autoCommit?: boolean }).autoCommit)).toEqual([false, false, false]);
+    expect(tx()).toBe(2);
+  });
+
+  it("a failed autoCommit statement is rolled back; a failing rollback never hides the error", async () => {
+    let rolledBack = 0;
+    const conn = Object.assign(stubConn(), { rollback: async () => { rolledBack++; } });
+    const c = new OracleCollection("T_X", stubDb(conn) as never);
+    await expect(c.insertMany([{ A: 1 }], { returning: [] })).rejects.toThrow(/insertMany[\s\S]*ORA-00942/);
+    await expect(c.bulkUpdateByKeys([{ K: 1, A: 1 }], { keys: ["K"] })).rejects.toThrow(/bulkUpdateByKeys[\s\S]*ORA-00942/);
+    expect(rolledBack).toBe(2);
+    const bad = Object.assign(stubConn(), { rollback: async () => { throw oraError(3113, "end-of-file on communication channel"); } });
+    await expect(new OracleCollection("T_X", stubDb(bad) as never).insertMany([{ A: 1 }], { returning: [] })).rejects.toThrow(/ORA-00942/);
+  });
+
+  it("a very large batch does not overflow the stack sizing its binds", async () => {
+    const conn = stubConn((_s, rows) => ({ rowsAffected: (rows as unknown[]).length, outBinds: [] }));
+    const c = new OracleCollection("T_X", stubDb(conn) as never);
+    const docs = Array.from({ length: 300_000 }, (_, i) => ({ ID: i, NAME: i % 2 ? "ñandú" : "x" }));
+    expect((await c.insertMany(docs, { returning: [] })).insertedCount).toBe(300_000);
+    expect((await c.bulkUpdateByKeys(docs, { keys: ["ID"] })).modifiedCount).toBe(300_000);
+    const defs = (conn.calls[0].opts as { bindDefs: Array<{ maxSize?: number }> }).bindDefs;
+    expect(defs[1].maxSize).toBe(100); // "ñandú" is 7 bytes; floor 100
+  });
+});
+
+describe("unit: insertMany reports supplied IDs only when the table cannot change them", () => {
+  const DICT = /USER_TRIGGERS/;
+  /** A stub whose dictionary read returns `meta` (or throws), and whose inserts echo RETURNING outs. */
+  const tableStub = (meta: unknown) => stubConn((sql, binds) => {
+    if (DICT.test(sql)) {
+      if (meta instanceof Error) throw meta;
+      return { rows: meta };
+    }
+    return { rowsAffected: (binds as unknown[]).length, outBinds: (binds as unknown[][]).map((r) => [[(r[0] as number) + 100]]) };
+  });
+  const insert = (conn: ReturnType<typeof stubConn>, table: string, docs: Array<Record<string, unknown>>, opts?: object) =>
+    new OracleCollection(table, stubDb(conn) as never).insertMany(docs, opts);
+  const sqls = (conn: ReturnType<typeof stubConn>) => conn.calls.map((c) => (DICT.test(c.sql) ? "dict" : /RETURNING/.test(c.sql) ? "insert+returning" : "insert"));
+
+  it("own table, NUMBER ID, no INSERT trigger: the supplied IDs, no RETURNING, dictionary read once", async () => {
+    const conn = tableStub([{ DATA_TYPE: "NUMBER", DATA_SCALE: 0, TRG: 0 }]);
+    expect((await insert(conn, "T_IDS_OK", [{ ID: 1, A: 1 }, { ID: 2, A: 2 }])).insertedIds).toEqual([1, 2]);
+    expect((await insert(conn, "T_IDS_OK", [{ ID: 3, A: 3 }])).returning).toEqual([{ ID: 3 }]);
+    expect(sqls(conn)).toEqual(["dict", "insert", "insert"]);
+  });
+
+  it("keeps RETURNING (the stored values) for a trigger, a scale, a missing table or a failed read", async () => {
+    const cases: Array<[string, unknown]> = [
+      ["T_IDS_TRG", [{ DATA_TYPE: "NUMBER", DATA_SCALE: null, TRG: 1 }]],
+      ["T_IDS_DEC", [{ DATA_TYPE: "NUMBER", DATA_SCALE: 2, TRG: 0 }]],
+      ["T_IDS_RAW", [{ DATA_TYPE: "VARCHAR2", DATA_SCALE: null, TRG: 0 }]],
+      ["T_IDS_VIEW", []],
+      ["T_IDS_ERR", oraError(942)],
+    ];
+    for (const [table, meta] of cases) {
+      const conn = tableStub(meta);
+      expect((await insert(conn, table, [{ ID: 1, A: 1 }])).insertedIds).toEqual([101]);
+      expect(sqls(conn)).toEqual(["dict", "insert+returning"]);
+    }
+  });
+
+  it("no dictionary read when an ID is not a safe integer, the name is not a plain table, or returning is explicit", async () => {
+    for (const [table, docs, opts] of [
+      ["T_IDS_A", [{ ID: 1 }, { ID: "2" }], undefined],
+      ["T_IDS_B", [{ ID: 1.5 }], undefined],
+      ["T_IDS_C", [{ A: 1 }], undefined],
+      ["OTHER.T_IDS_D", [{ ID: 1 }], undefined],
+      ["T_IDS_E", [{ ID: 1 }], { returning: ["ID"] }],
+    ] as Array<[string, Array<Record<string, unknown>>, object | undefined]>) {
+      const conn = tableStub([{ DATA_TYPE: "NUMBER", DATA_SCALE: 0, TRG: 0 }]);
+      await insert(conn, table, docs, opts);
+      expect(sqls(conn)).toEqual(["insert+returning"]);
+    }
   });
 });
 

@@ -768,7 +768,8 @@ function sanitizeFilter(input: unknown): Record<string, string | number | boolea
     if (typeof v === "number" ? Number.isFinite(v) : v === null || typeof v === "string" || typeof v === "boolean" || typeof v === "bigint" || (v instanceof Date && !Number.isNaN(v.getTime()))) {
       out[key] = v as string | number | boolean | bigint | Date | null;
     } else {
-      throw new TypeError(MSG.UNTRUSTED_FILTER(where, `a ${Array.isArray(v) ? "list" : v === undefined ? "missing value" : typeof v === "number" ? "non-finite number" : typeof v} is not a plain value`));
+      const kind = Array.isArray(v) ? "a list" : v === undefined ? "a missing value" : typeof v === "number" ? "a non-finite number" : v instanceof Date ? "an invalid Date" : typeof v === "object" ? "an object" : `a ${typeof v}`;
+      throw new TypeError(MSG.UNTRUSTED_FILTER(where, `${kind} is not a plain value`));
     }
   }
   return out;
