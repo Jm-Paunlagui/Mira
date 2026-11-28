@@ -54,14 +54,29 @@ const STATS_STMTS = 2;
 const openedBound = (s: Stats) => STMT_CACHE + USER_SLACK + (s.vOpen - s.vUser) + STATS_STMTS;
 
 /**
- * Hard parses allowed when the same ~177 texts (same bind types) run a second time.
- * Each is then a client statement-cache hit (no parse), a server session-cursor-cache hit,
- * or a soft parse of the shared-pool cursor; a hard parse happens only if Oracle aged a
- * cursor out of the shared pool or invalidated it between the rounds (seconds apart).
- * If Mira's SQL text were unstable per call (a literal, a counter, unpadded IN lists) the
- * second round would hard parse about once per shape — over 150.
+ * Per-statement view of the shared pool, for the repeat check: one row per child cursor of
+ * each of Mira's texts. A second round that binds the same types adds no child cursor; a
+ * bind whose type or length class changed between calls would (a new child = a hard parse
+ * that Mira caused). Reloads after Oracle aged a cursor out or invalidated it (LOADS,
+ * INVALIDATIONS) are the server's doing and are recorded, not asserted: the session-wide
+ * "parse count (hard)" counts those too, which made it flaky as a bound (12 once on CI).
+ * Matched on SQL_TEXT (the first 1,000 characters, with line breaks and tabs shown as
+ * spaces, so the keys are written the same way), read from another session so the measured
+ * one is not disturbed.
  */
-const HARD_REPEAT = 5;
+/** How V$SQL.SQL_TEXT shows a statement: its first 1,000 characters, line breaks and tabs as spaces. */
+const sqlTextKey = (text: string) => text.slice(0, 1000).replace(/[\r\n\t]/g, " ");
+type Children = Map<string, { children: number; loads: number; invalidations: number }>;
+async function sharedCursors(texts: Set<string>): Promise<Children> {
+  const keys = [...new Set([...texts].map(sqlTextKey))];
+  const binds = Object.fromEntries(keys.map((t, i) => [`t${i}`, t]));
+  const r = await rawExec<{ SQL_TEXT: string; CHILDREN: number; LOADS: number; INV: number }>(
+    `SELECT SQL_TEXT, COUNT(*) "CHILDREN", SUM(LOADS) "LOADS", SUM(INVALIDATIONS) "INV" FROM V$SQL
+      WHERE PARSING_SCHEMA_NAME = USER AND SQL_TEXT IN (${keys.map((_, i) => `:t${i}`).join(", ")}) GROUP BY SQL_TEXT`,
+    binds,
+  );
+  return new Map((r.rows ?? []).map((x) => [x.SQL_TEXT, { children: Number(x.CHILDREN), loads: Number(x.LOADS), invalidations: Number(x.INV) }]));
+}
 
 const m = (metric: string, value: number, unit: string, note?: string) => recordMetric({ category: "reliability", metric, value, unit, note });
 
@@ -246,10 +261,17 @@ describe("reliability/cursors: no server-side cursor leaks, a bounded statement 
         for (const run of shapes(c, target, 1)) await run();
       });
       const s1 = await stats(conn);
+      const v1 = await sharedCursors(texts1);
       const [, texts2] = await capture(async () => {
         for (const run of shapes(c, target, 2)) await run();
       });
       const s2 = await stats(conn);
+      const v2 = await sharedCursors(texts1);
+      const both = [...v1.keys()].filter((t) => v2.has(t));
+      const newChildren = both.filter((t) => v2.get(t)!.children > v1.get(t)!.children);
+      const reloads = both.reduce((a, t) => a + v2.get(t)!.loads - v1.get(t)!.loads, 0);
+      const keyCount = new Set([...texts1].map(sqlTextKey)).size; // a few texts differ only by a line break vs a space
+      log.push(`shapes V$SQL: ${v1.size}/${keyCount} texts found after round 1, ${v2.size} after round 2; new child cursors ${newChildren.length}; reloads ${reloads}${newChildren.length ? `\n      new children: ${newChildren.map((t) => t.slice(0, 120)).join("\n      ")}` : ""}`);
       log.push(show("shapes before ", s0), show("shapes round 1", s1), show("shapes round 2", s2), `shapes distinct SQL texts: round 1 ${texts1.size}, round 2 ${texts2.size}`);
       const calls = shapes(c, target, 0).length;
       m("cursors: call shapes per round", calls, "count");
@@ -260,6 +282,8 @@ describe("reliability/cursors: no server-side cursor leaks, a bounded statement 
       m("cursors: hard parses round 1", s1.hard - s0.hard, "count");
       m("cursors: hard parses round 2", s2.hard - s1.hard, "count");
       m("cursors: parse calls round 2", s2.total - s1.total, "count", "client statement-cache hits make none");
+      m("cursors: new child cursors for Mira's texts in round 2", newChildren.length, "count", "V$SQL");
+      m("cursors: reloads of Mira's texts in round 2", reloads, "count", "V$SQL LOADS: aged out or invalidated by the server, not asserted");
 
       // The workload really exceeds the cache several times over, or it proves nothing.
       expect(texts1.size).toBeGreaterThanOrEqual(3 * STMT_CACHE);
@@ -271,8 +295,11 @@ describe("reliability/cursors: no server-side cursor leaks, a bounded statement 
       // The same sequence again leaves the same cache contents: no growth at all.
       expect(s2.open).toBeLessThanOrEqual(s1.open);
       expect(s2.vUser).toBeLessThanOrEqual(s1.vUser);
-      // Repeats are cache hits or soft parses. See HARD_REPEAT for the bound.
-      expect(s2.hard - s1.hard).toBeLessThanOrEqual(HARD_REPEAT);
+      // Repeats compile nothing new for Mira's statements (see sharedCursors): V$SQL finds most
+      // of the texts (a few may have been aged out already under memory pressure, so not all
+      // are required), and none of them gained a child cursor in round 2.
+      expect(v1.size).toBeGreaterThan(keyCount / 2);
+      expect(newChildren).toEqual([]);
     });
   }, 30_000);
 
@@ -348,14 +375,18 @@ describe("reliability/cursors: no server-side cursor leaks, a bounded statement 
         }
         return errors;
       };
-      await phase(1);
+      const [, warmTexts] = await capture(() => phase(1));
       const s0 = await stats(conn);
+      const v0 = await sharedCursors(warmTexts);
       const [errors, texts] = await capture(() => phase(50));
       const s1 = await stats(conn);
+      const v1 = await sharedCursors(warmTexts);
+      const newChildren = [...v0.keys()].filter((t) => v1.has(t) && v1.get(t)!.children > v0.get(t)!.children);
       log.push(show("streams/errors before", s0), show("streams/errors after ", s1), `streams/errors: 50 completed + 100 aborted streams, ${errors.length} failed statements, ${texts.size} executed texts`);
       m("cursors: opened cursors current, streams+errors delta", s1.open - s0.open, "count", "150 streams + 150 failures");
       m("cursors: V$OPEN_CURSOR client cursors, streams+errors delta", s1.vUser - s0.vUser, "count");
-      m("cursors: hard parses, streams+errors", s1.hard - s0.hard, "count");
+      m("cursors: hard parses, streams+errors", s1.hard - s0.hard, "count", "session-wide, includes the server's own reloads: recorded, not asserted");
+      m("cursors: new child cursors for Mira's texts, streams+errors", newChildren.length, "count", "V$SQL");
       m("cursors: failed parses, streams+errors", s1.failed - s0.failed, "count", "ORA-00904 x 100");
 
       // Each consumer failure and each driver error really happened, 50 times each.
@@ -370,9 +401,12 @@ describe("reliability/cursors: no server-side cursor leaks, a bounded statement 
       // A statement that fails semantic checks (ORA-00904) never becomes a shared cursor, so
       // Oracle hard parses it on every submission and counts it in "parse count (failures)":
       // exactly the 100 bad-column calls. Apart from those, repeating warmed texts compiles
-      // nothing (ORA-00001 fails at execution, after a successful, cached parse).
+      // nothing (ORA-00001 fails at execution, after a successful, cached parse): the same
+      // texts ran, and none of Mira's shared cursors gained a child (see sharedCursors).
       expect(s1.failed - s0.failed).toBe(100);
-      expect(s1.hard - s0.hard - (s1.failed - s0.failed)).toBeLessThanOrEqual(HARD_REPEAT);
+      expect([...texts].sort()).toEqual([...warmTexts].sort());
+      expect(v0.size).toBeGreaterThan(0);
+      expect(newChildren).toEqual([]);
     });
   }, 30_000);
 

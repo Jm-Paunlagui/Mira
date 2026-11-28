@@ -121,7 +121,28 @@ type Sample = {
   cursors: number;
   openCursorRows: number;
   p95: number;
+  /** Diagnostics for a latency failure (recorded, not asserted): */
+  p50: number;
+  max: number;
+  /** Longest event-loop stall seen while the window ran: a JS-side pause (GC, a sync call) vs a database-side one. */
+  loopLagMax: number;
 };
+
+/**
+ * Event-loop lag: a 10 ms tick that measures how late it fires. A stall that every worker
+ * sees at once is either the JS thread being blocked (lag ≈ the stall) or the database
+ * pausing (lag ≈ 0); this tells the two apart when a latency check fails.
+ */
+let loopLagMax = 0;
+function startLagProbe(): () => void {
+  let last = performance.now();
+  const tick = setInterval(() => {
+    const now = performance.now();
+    loopLagMax = Math.max(loopLagMax, now - last - 10);
+    last = now;
+  }, 10);
+  return () => clearInterval(tick);
+}
 
 /**
  * Reads every open session of the soak pool: borrows connectionsOpen connections at
@@ -250,6 +271,7 @@ const failures = { expected: 0, misreported: 0, unexpected: 0, firstUnexpected: 
 
 /** Runs ops [from, to) with WORKERS in flight; returns the window's latencies. */
 async function runWindow(from: number, to: number) {
+  loopLagMax = 0;
   const lat: number[] = [];
   let next = from;
   await Promise.all(
@@ -281,6 +303,8 @@ async function runWindow(from: number, to: number) {
 }
 
 async function takeSample(ops: number, lat: number[]): Promise<Sample> {
+  const lagMax = loopLagMax; // the window's, before the sampler's own work
+  const sorted = [...lat].sort((a, b) => a - b);
   const stat = await poolStat();
   const { sessions, openCursorRows } = await readSessions();
   Bun.gc(true);
@@ -294,7 +318,10 @@ async function takeSample(ops: number, lat: number[]): Promise<Sample> {
     sessions,
     cursors: sessions.reduce((a, s) => a + s.cursors, 0),
     openCursorRows,
-    p95: percentile([...lat].sort((a, b) => a - b), 95),
+    p95: percentile(sorted, 95),
+    p50: percentile(sorted, 50),
+    max: sorted[sorted.length - 1] ?? 0,
+    loopLagMax: lagMax,
   };
 }
 
@@ -335,10 +362,15 @@ describe("reliability: long soak, resources stay flat", () => {
     async () => {
       const samples: Sample[] = [];
       const t0 = performance.now();
-      for (let w = 0; w < SAMPLES; w++) {
-        const from = Math.floor((w * OPS) / SAMPLES);
-        const to = Math.floor(((w + 1) * OPS) / SAMPLES);
-        samples.push(await takeSample(to, await runWindow(from, to)));
+      const stopLagProbe = startLagProbe();
+      try {
+        for (let w = 0; w < SAMPLES; w++) {
+          const from = Math.floor((w * OPS) / SAMPLES);
+          const to = Math.floor(((w + 1) * OPS) / SAMPLES);
+          samples.push(await takeSample(to, await runWindow(from, to)));
+        }
+      } finally {
+        stopLagProbe();
       }
       const wallMs = performance.now() - t0;
 
@@ -393,8 +425,17 @@ describe("reliability: long soak, resources stay flat", () => {
       expect(fits.heapUsed.growth).toBeLessThan(HEAP_GROWTH_MAX);
       expect(fits.rss.growth).toBeLessThan(RSS_GROWTH_MAX);
 
-      // Latency.
-      expect(measured[measured.length - 1].p95).toBeLessThanOrEqual(2 * measured[0].p95);
+      // Latency. On a failure, print every window so the stall can be placed: event-loop lag
+      // near the stall means the JS thread was blocked; lag near 0 means the database paused.
+      const last = measured[measured.length - 1];
+      if (last.p95 > 2 * measured[0].p95)
+        console.log(
+          `soak latency by window (ms):\n${samples
+            .map((s, w) => `  w${w}${w < WARMUP ? " (warm-up)" : ""}: ops≤${s.ops} p50=${s.p50.toFixed(2)} p95=${s.p95.toFixed(2)} max=${s.max.toFixed(1)} loopLag=${s.loopLagMax.toFixed(1)}`)
+            .join("\n")}`,
+        );
+      m(`${tag}: worst event-loop lag in a window`, Math.max(...samples.map((s) => s.loopLagMax)), "ms", "diagnostic: a JS-side pause vs a database-side one");
+      expect(last.p95).toBeLessThanOrEqual(2 * measured[0].p95);
     },
     Math.max(120_000, OPS * 20),
   );
