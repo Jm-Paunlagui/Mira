@@ -31,6 +31,8 @@ Theme: security hardening, then performance. A red-team pass (a new SQL-text fuz
 
 ### Fixed
 
+- **`forEach()` and `for await` handed their connection back before the query stream closed.** They settled on the stream's `end` (or right after `destroy()`), and node-oracledb closes the result set after that, so the connection went back to the pool while still in native use. Under Bun in Thick mode, another caller's error on that connection could then read `DPI-1039` / `NJS-003` instead of its real `ORA-` text (21–30 in 2,000 duplicate-key errors next to running streams). Both now wait for the stream's `close`.
+
 - A `Buffer` or a ``sql`…` `` statement inside a filter kept its type: the filter-resolution step copied every object field by field.
 - `insertMany()` and `bulkUpdateByKeys()` with a very large batch threw `RangeError: Maximum call stack size exceeded` while sizing the binds (`Math.max(...values)`): on Node from about 125,000 rows, on Bun at 1,000,000. Sized with a loop now.
 - Error messages say "an object", not "a object" (`sanitizeFilter`, `$inSelect`).
@@ -45,6 +47,7 @@ Theme: security hardening, then performance. A red-team pass (a new SQL-text fuz
 - `test/security/fuzz.test.ts` takes about 60 call shapes covering every public builder and sends each through every mutation: each string, key and number replaced by 19 hostile payloads, in both string and `toString()` object form. A SQL lexer, which also reads inside `EXECUTE IMMEDIATE` strings, checks that no payload ever appears as bare SQL.
 - `test/security/hardening.test.ts`: a regression test for each fix above.
 - `test/performance/budgets.test.ts`: bounds that fail on a 2× regression on any machine. SQL-building cost is measured against a fixed calibration workload in the same run; statements per call are exact counts; overhead over the raw driver is a ratio of interleaved medians.
+- Reliability: `test/reliability/soak.test.ts` (3,000 mixed operations by default, `MIRA_SOAK_OPS=30000` for a long run: heap, RSS, server-side cursors, connections and p95 must stay flat), `cursorLeak.test.ts` (Oracle's own session statistics: 177 call shapes stay within the statement cache, repeats compile nothing, `$in` lengths 1–1,000 collapse to 9 SQL texts, aborted streams and failed statements hold no cursor), `concurrency.test.ts` (typed tables, `include()`, `withCTE` and recursive CTEs give the sequential answer under 50 concurrent callers) and `timezoneSoak.test.ts` (about 1,900 instants across both daylight-saving changes, four column types, three write paths). The test schema needs `SELECT` on `V_$OPEN_CURSOR`, `V_$MYSTAT`, `V_$STATNAME`.
 - `test/chaos/network.test.ts` (with `test/helpers/chaosProxy.ts`): a stalled link, a database restart (every connection cut), a flapping link, `close()` with work and a stream in flight, and connections cut at random points in `withTransaction`, `bulkWrite` and `insertMany` (all or nothing). It needs no database privileges.
 - The simulation records each stage's time, statement count and time spent in statements (`coverage/sim-stages.json`, and the CI job summary).
 

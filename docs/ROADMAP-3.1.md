@@ -1,6 +1,6 @@
 # Mira 3.1.0: security, performance, chaos, reliability
 
-**Status:** security, performance and chaos done; reliability next · **Base:** v3.0.0 · **Branch:** `security/hardening`
+**Status:** all four areas done; open: DST repeated-hour defect (decision), Bun Thick segfault on macOS (workaround), reviews before merge · **Base:** v3.0.0 · **Branch:** `security/hardening`
 
 3.1.0 works on four areas. Each one is done when its unit and integration tests pass, its own suite under `test/<area>/` passes, the sim's real-world stages pass, and CI is green across all four live jobs (Thin/Thick × failover/Easy Connect) plus the Windows job.
 
@@ -9,7 +9,7 @@
 | Security | `test/security` | 97 | ✅ done: 9 holes closed (see CHANGELOG 3.1.0) |
 | Performance | `test/performance` | 44 (+11 unit, +3 integration) | ✅ budgets in CI; hot-path review done |
 | Chaos | `test/chaos` | 25 | ✅ network chaos suite: stall, restart, flapping, close in flight, cut mid-write |
-| Reliability | `test/reliability` | 12 | ⏳ evaluate: longer soak, leak and drift checks |
+| Reliability | `test/reliability` | 34 | ✅ soak, cursor leaks, concurrency, DST soak; one DST defect open (decision) |
 
 Rules carried over from 3.0:
 - A timing failure is fixed by finding the race and waiting for the real condition, never by loosening a bound.
@@ -81,17 +81,19 @@ All five run through a TCP proxy (`test/helpers/chaosProxy.ts`) in `test/chaos/n
 - [x] **Flapping** (three stall/recover cycles): exactly one `onChange` per transition (`false, true` × 3), 12–13 checks in all, and the breaker settles healthy.
 - [x] **Fault injection:** connections cut after the 1st, 3rd and 7th statement of a 10-insert `withTransaction` leave no rows; a cut inside `bulkWrite` leaves none; a cut during a 20,000-row `insertMany` leaves all or none (observed: all, since it committed first).
 
-## 4. Reliability ⏳
+## 4. Reliability ✅
 
 Goal: results stay correct and resources flat over long runs and under concurrency.
 
 Already covered: no lost updates, no leaks after 1,000 mixed ops, idempotent merge, balanced ledger, exact round trips, money sums, a 3k-op soak, deterministic SQL, cursor snapshot, per-connection state.
 
-- [ ] Longer soak, opt-in in CI (for example 30k ops): memory (RSS, heap), open connections, open cursors (`V$OPEN_CURSOR`) and latency all flat
-- [ ] Statement-cache and cursor leak check over many distinct call shapes
-- [ ] Concurrency of typed tables, `include()` and `withCTE` under load: same results as sequential
-- [ ] Time zones and DST over a soak in Thick mode (the 3.0 limitation stays documented)
-- [ ] **Bun segfault, Thick mode, macOS.** Workaround in place: on macOS in Thick mode, `bun run test` runs the chaos suite in a second process (unless `--coverage` or a file filter is given; `MIRA_TEST_SPLIT=1/0` forces it): 3/3 full runs clean, against 4/4 crashes in one process. An issue for Bun is drafted for the maintainer to file. Details (updated 2026-11-28, after the network chaos tests): Every full Thick run now crashes (4/4; it was about half), and not only after the chaos tests: one run crashed right after `createMira.test.ts` "close() after a pool that never came up" (test 443 of 703). The common thread at every crash site is a Thick pool whose creation failed, then later work in the same `bun test` process. Thin mode is clean (703/703). Earlier notes: The crash lands within tests 678–680 of 692: the chaos tests right after the two dead-host tests (`127.0.0.1:1`, connection refused, 4 create attempts). Skipping the dead-host tests: 4/4 full runs clean; with them: about half crash. It is not the background re-creation of the dead pool (the chaos suite now closes its injected pools, and it still crashes), and it is not the bad-credentials test (moving it to a child process did not help). Outside `bun test` it never reproduced: dead pool retrying under load for 2 × 90 s (650k queries each), bad-credential pools ×30, dead host + breaker nudges ×9. Thin mode and CI (Linux Thick) are clean. Next: report it to Bun with `bun test` full-suite repro steps; retest on the next Bun release.
+- [x] **Long soak** (`soak.test.ts`; 3,000 ops by default, `MIRA_SOAK_OPS=30000` locally): 8 workers on their own pool, mixed reads, writes, transactions, streams and deliberate failures. Over the measured window heap grows ~10 B/op at 30k (bound 1 MiB), server cursors +1.7 to +3.8 across 8 sessions (bound 16), connections flat at 8, p95 flat (1.3–1.5 ms). **Found:** `forEach` released its connection before the stream closed (50/50); Bun + Thick then misreported nearby errors as DPI-1039 / NJS-003. Fixed.
+- [x] **Cursor leak check** (`cursorLeak.test.ts`, from `V$MYSTAT` / `V$OPEN_CURSOR`): 177 distinct texts twice on one connection stay within the cache of 50, round 2 hard parses 0; `$in` lengths 1–1,000 make 9 texts, each parsed once; 150 streams (100 aborted) and 150 failed statements hold no cursor; every pooled session stays within its cache. Oracle's internal collection-bind cursors (`table_…`, from `TABLE(:b)`) are not client cursors and are excluded.
+- [x] **Concurrency** (`concurrency.test.ts`): typed-table reads and disjoint writes, aggregates, `include()` (hasMany, hasOne, belongsTo), `withCTE` and `withRecursiveCTE`, 50 concurrent callers each: identical to the sequential baseline in both modes; no connection left checked out.
+- [x] **Time zones and DST** (`timezoneSoak.test.ts`, local run under America/New_York; CI runs it under Asia/Manila): 1,942 instants × 4 column types × 3 write paths. UTC and Manila: exact in both modes. New York: as documented outside one hour — Thick moves summer instants by exactly 1 h in the two time-zone column types only.
+- [ ] **DEFECT (open, decision pending): the hour repeated when clocks go back.** In a daylight-saving zone, a Date in 01:00–02:00 local on the day clocks go back reads back an hour off: Thin in all four column types, Thick in TIMESTAMP and DATE; an equality filter there matches its twin too. node-oracledb binds a Date as a wall-clock time; binding it as `DB_TYPE_TIMESTAMP_TZ` keeps the instant in the two time-zone column types (checked with the raw driver). TIMESTAMP and DATE cannot tell the two 01:30s apart at all (document). A bind-type change on filters could stop index use on DATE/TIMESTAMP columns, so it needs a design (`senior-oracle-engineer-planner`). Processes on UTC or a zone without DST (CATHERINE: Manila) are not affected.
+- [ ] **Error metadata (backlog).** Collection methods rethrow driver errors as `new Error(text)`, without `errorNum` or `cause`, so callers can only match `ORA-00001` by text.
+- [ ] **Bun segfault, Thick mode, macOS.** Not caused by the `forEach` release bug (still 3/4 single-process crashes after that fix); the split runs were 3/3 clean afterwards, but one split run also crashed in the first process, so the workaround lowers the rate rather than removing it. Workaround in place: on macOS in Thick mode, `bun run test` runs the chaos suite in a second process (unless `--coverage` or a file filter is given; `MIRA_TEST_SPLIT=1/0` forces it): 3/3 full runs clean, against 4/4 crashes in one process. An issue for Bun is drafted for the maintainer to file. Details (updated 2026-11-28, after the network chaos tests): Every full Thick run now crashes (4/4; it was about half), and not only after the chaos tests: one run crashed right after `createMira.test.ts` "close() after a pool that never came up" (test 443 of 703). The common thread at every crash site is a Thick pool whose creation failed, then later work in the same `bun test` process. Thin mode is clean (703/703). Earlier notes: The crash lands within tests 678–680 of 692: the chaos tests right after the two dead-host tests (`127.0.0.1:1`, connection refused, 4 create attempts). Skipping the dead-host tests: 4/4 full runs clean; with them: about half crash. It is not the background re-creation of the dead pool (the chaos suite now closes its injected pools, and it still crashes), and it is not the bad-credentials test (moving it to a child process did not help). Outside `bun test` it never reproduced: dead pool retrying under load for 2 × 90 s (650k queries each), bad-credential pools ×30, dead host + breaker nudges ×9. Thin mode and CI (Linux Thick) are clean. Next: report it to Bun with `bun test` full-suite repro steps; retest on the next Bun release.
 
 ---
 
@@ -115,3 +117,5 @@ Already covered: no lost updates, no leaks after 1,000 mixed ops, idempotent mer
 | 2026-11-28 | Chaos | On a stalled link a call hung forever (no per-pool call timeout; the 60 s default was never applied) | `callTimeout` pool option + JS backstop (Thin's driver waits forever after its own timeout) |
 | 2026-11-28 | Chaos | Health checks on a stalled link never finished, so the breaker never opened | checks bounded at `connectTimeout` |
 | 2026-11-28 | Chaos | Thick mode: opening a pool over a stalled link hung (connectTimeout is Thin-only; an awaited close blocked the retry) | each open step bounded; failed attempt's close not awaited |
+| 2026-11-28 | Reliability | `forEach` / `for await` released the connection on the stream's `end`, before its `close` (Bun + Thick: wrong error text on the next caller) | wait for `close` on every path |
+| 2026-11-28 | Reliability | A Date in the repeated hour (clocks going back) reads back an hour off in a DST zone | open: design needed |
