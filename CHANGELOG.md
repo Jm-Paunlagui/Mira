@@ -1,6 +1,6 @@
 # Changelog
 
-## [3.1.0] — Unreleased
+## [3.1.0] — 2026-11-28
 
 Theme: security hardening, then performance. A red-team pass (a new SQL-text fuzzer, plus hand-written attacks) found five ways for a caller's text to reach SQL unescaped. Each is fixed and has a regression test. **Upgrade if your app passes request input into filters, or builds views from filters.**
 
