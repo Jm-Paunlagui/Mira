@@ -76,7 +76,10 @@ jobs:
       - name: Install Oracle Instant Client (Windows)
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri https://download.oracle.com/otn_software/nt/instantclient/instantclient-basiclite-windows.zip -OutFile "$env:RUNNER_TEMP\ic.zip"
+          # Pinned build + checksum (the unversioned "latest" link is rebuilt in place).
+          Invoke-WebRequest -Uri https://download.oracle.com/otn_software/nt/instantclient/2326100/instantclient-basiclite-windows.x64-23.26.1.0.0.zip -OutFile "$env:RUNNER_TEMP\ic.zip"
+          $sum = (Get-FileHash "$env:RUNNER_TEMP\ic.zip" -Algorithm SHA256).Hash.ToLower()
+          if ($sum -ne "db791e42a578337cae9293a5bde33b09933e365440f3d0b542eee422a0082ec0") { throw "Instant Client checksum mismatch: $sum" }
           Expand-Archive "$env:RUNNER_TEMP\ic.zip" -DestinationPath C:\oracle
           $ic = (Get-ChildItem C:\oracle -Directory -Filter "instantclient_*" | Select-Object -First 1).FullName
           "IC_DIR=$ic" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -107,7 +110,8 @@ jobs:
         connect: [failover, easy]
     services:
       oracle:
-        image: gvenzl/oracle-free:23-slim-faststart
+        # Pinned by digest (the tag moves); refresh with `docker buildx imagetools inspect gvenzl/oracle-free:23-slim-faststart`.
+        image: gvenzl/oracle-free:23-slim-faststart@sha256:cebd977833411a42170777d8e9ccf616a028a2bb137ae96498354ab6c7510268
         env:
           # A throwaway container reachable only from this job's runner.
           ORACLE_PASSWORD: MiraCi_sys_2026
@@ -167,7 +171,9 @@ jobs:
           sudo apt-get install -y -qq libaio1t64 unzip
           # Instant Client looks for libaio.so.1; Ubuntu 24.04 ships it as libaio.so.1t64.
           sudo ln -sf /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
-          curl -sSLo /tmp/ic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basiclite-linuxx64.zip
+          # Pinned build + checksum (the unversioned "latest" link is rebuilt in place).
+          curl -sSLo /tmp/ic.zip https://download.oracle.com/otn_software/linux/instantclient/2326200/instantclient-basiclite-linux.x64-23.26.2.0.0.zip
+          echo "c5e97765e633ad02597b8274c35efe5c10bd249a3285e34ee58fa7b318243225  /tmp/ic.zip" | sha256sum -c -
           sudo unzip -q /tmp/ic.zip -d /opt/oracle
           IC_DIR=$(ls -d /opt/oracle/instantclient_*)
           # On Linux the client is found through the library path (configureDriver's default).
