@@ -2,7 +2,7 @@
 
 ## [3.1.0] — 2026-11-28
 
-Theme: security hardening, then performance. A red-team pass (a new SQL-text fuzzer, plus hand-written attacks) found five ways for a caller's text to reach SQL unescaped. Each is fixed and has a regression test. **Upgrade if your app passes request input into filters, or builds views from filters.**
+Theme: security, performance, chaos and reliability. A red-team pass (a new SQL-text fuzzer, plus hand-written attacks) found five ways for a caller's text to reach SQL unescaped. Each is fixed and has a regression test. A TCP chaos proxy then showed a database that stops answering could hang Mira; every call, health check, pool open, release and close is now bounded, errors say whether a write may have happened (`MiraDbError.outcomeUnknown`), and two Thick-mode pool defects found on the way are fixed. **Upgrade if your app passes request input into filters, builds views from filters, or runs in Thick mode.**
 
 ### Security
 
