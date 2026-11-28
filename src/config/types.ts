@@ -35,6 +35,19 @@ interface PoolConfig {
   poolPingInterval?: number;
   /** Statements cached per connection. Default 50. */
   stmtCacheSize?: number;
+  /**
+   * Milliseconds one round trip to the database may take (an execute, a fetch, a
+   * commit) before it is cancelled with DPI-1067 / NJS-123. Bounds a call on a link
+   * that stopped answering, which otherwise waits forever. Applied to every
+   * connection borrowed from the pool. 0: no limit. Default 0.
+   */
+  callTimeout?: number;
+  /**
+   * Minutes between keepalive probes on an open connection, so one a firewall or a
+   * dead network silently dropped is noticed instead of hanging the next call.
+   * 0: no probes. Default 0.
+   */
+  expireTime?: number;
 }
 
 /**

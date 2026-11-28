@@ -34,15 +34,27 @@ export function stubConn(handler: Handler = () => { throw oraError(942, "table o
     },
     queryStream(sql: string, binds: unknown) {
       calls.push({ sql, binds, opts: {} });
-      const em = Object.assign(new EventEmitter(), { pause() {}, resume() {}, destroy() {} });
+      // Like node-oracledb's QueryStream: "close" follows "end", "error" or destroy(), once.
+      let closed = false;
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        setTimeout(() => em.emit("close"), 0);
+      };
+      const em = Object.assign(new EventEmitter(), { pause() {}, resume() {}, destroy: close });
       setTimeout(() => {
+        if (closed) return;
         try {
           const r = handler(sql, binds) as { rows?: unknown[] } | undefined;
-          for (const row of r?.rows ?? []) em.emit("data", row);
+          for (const row of r?.rows ?? []) {
+            if (closed) return;
+            em.emit("data", row);
+          }
           em.emit("end");
         } catch (e) {
           em.emit("error", e);
         }
+        close();
       }, 0);
       return em;
     },

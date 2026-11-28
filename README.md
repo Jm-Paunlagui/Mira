@@ -26,6 +26,7 @@ Oracle Database
     - [Pool options](#pool-options)
     - [Several pools](#several-pools)
     - [Health and readiness](#health-and-readiness)
+    - [Errors and retries](#errors-and-retries)
     - [Config from environment variables](#config-from-environment-variables)
     - [Thin or Thick mode](#thin-or-thick-mode)
     - [Logging](#logging)
@@ -92,11 +93,13 @@ process.on("SIGTERM", () => void mira.close());
 | `poolMax` | 50 | Most connections. Size it by concurrent operations: each `withConnection` call borrows one. |
 | `poolIncrement` | 5 | Connections opened at a time when the pool grows. |
 | `queueMax` | 40 | Most callers waiting for a connection; one more fails at once with NJS-076. `0` disables queuing. |
-| `queueTimeout` | 15000 | Milliseconds a caller waits in the queue (NJS-040). `0` waits forever. |
+| `queueTimeout` | 15000 | Milliseconds a caller waits in the queue (NJS-040). `0` waits forever. Mira also bounds the whole wait for a connection at `queueTimeout` + `connectTimeout` (30 s by default; `MIRA_ACQUIRE_TIMEOUT`), so a driver stuck on a dead link cannot hold a caller forever. |
 | `poolTimeout` | 30 | Seconds an idle connection above `poolMin` stays open. `0` keeps it. |
-| `connectTimeout` | 15000 | Milliseconds to open one connection (Thin mode). |
+| `connectTimeout` | 15000 | Milliseconds to open one connection. Thin mode applies it in the driver; Mira also bounds, in both modes, each step of opening a pool (at twice this), every health check (at this), and a caller's wait for a pool that is still opening (at this; `MIRA_POOL_OPENING`), so a database that stops answering cannot hold them forever. |
 | `poolPingInterval` | 30 | Seconds idle before a connection is pinged on checkout; negative never pings. |
 | `stmtCacheSize` | 50 | Statements cached per connection. |
+| `callTimeout` | 0 | Milliseconds one round trip may take, set on every borrowed connection: `execute`, `executeMany`, `commit`, `rollback`, each fetch of a stream (`forEach`, `for await`, `queryStream`), and releasing the connection. A call on a link that stopped answering then fails (DPI-1067, or Mira's own bound at `callTimeout` + 1 s, `MIRA_CALL_TIMEOUT`, which Thin mode needs on a dead link) and its connection is dropped; later calls on it fail at once (`MIRA_CONNECTION_DEAD`). Calls on one connection run one after another, so each timer starts when its call does: `Promise.all` of three 1 s queries on one connection under a 1.5 s limit succeeds. `0`: no limit. Set it above your slowest legitimate statement. See [Errors and retries](#errors-and-retries). |
+| `expireTime` | 0 | Minutes between keepalive probes on open connections, so one a firewall silently dropped is noticed. `0`: none. |
 
 A config that cannot work throws one `MiraConfigError` listing every problem (`err.issues`), before anything connects. Unknown keys are refused, so a typo such as `poolmax` is not silently ignored. Messages name keys, never values. `defineConfig(config)` runs the same checks and returns the config frozen, for apps that build it in one place and use it in another.
 
@@ -123,12 +126,24 @@ A separate pool for long-held work (exports, bulk loads) keeps it from starving 
 
 ### Health and readiness
 
-Each open pool is pinged by a health monitor (every 30 s; every 5 s while one is failing, or while watched). Three failed checks open that pool's circuit breaker: `withConnection` then fails fast with `NJS-503` until a check, or your own probe, succeeds. A Mira instance sees only its own pools:
+Each open pool is pinged by a health monitor (every 30 s; every 5 s while one is failing, or while watched). Three failed checks, or three failed attempts to open the pool, open that pool's circuit breaker: `withConnection` then fails fast with `NJS-503` (`MIRA_CIRCUIT_OPEN`). The breaker has three states:
+
+- **closed**: calls pass.
+- **open**: calls fail fast. The first passing check moves it to half-open.
+- **half-open**: 3 calls at a time are let through to test the pool. 3 successes, the next passing check, or your own probe close it; a connectivity failure opens it again. So after an outage, recovery takes one check more than it used to (about 5 s).
+
+A check that fails only because the pool is busy (every connection in use, calls still finishing) is not a failure: the record shows `saturated: true` and the breaker does not move. A full pool is a capacity problem, not an outage.
+
+**A pool that is still opening.** Pools open lazily. While one is still opening (a slow or unreachable database), a caller waits at most `connectTimeout` and then gets `MIRA_POOL_OPENING`; the pool keeps trying in the background, up to 4 attempts. `mira.open()` waits for the whole attempt and reports the result; `stats()` never waits and shows `{ opening: true }`, or `{ error }` once opening has failed. Retries open with `poolMin: 0` and restore your `poolMin` afterwards, and at most 2 unfinished opening steps per pool are left running (`MIRA_CREATE_DEFERRED` past that).
+
+**Pool replacement.** When a link goes silent, connections can stay stuck inside the driver (Thin mode leaves them hung; Thick mode interrupts and closes them). Once the stuck connections reach `poolMax`, or the breaker opens while any are stuck, Mira replaces the pool: the old one closes in the background (counted in `abandoned.pools`), the next call opens a new one, and `replacements` counts how often it happened. A caller still queued on the old pool gets a connectivity error (NJS-064/065).
+
+A Mira instance sees only its own pools:
 
 ```ts
 const results = await mira.open();          // open every pool now: [{ name, success, error? }]; a pool that fails is reported, not thrown
 const ready = mira.health.allHealthy();      // or mira.health.isHealthy("reporting")
-const usage = await mira.stats();            // { pools: { appDb: { connectionsOpen, connectionsInUse, queueLength, … } }, healthMetrics }
+const usage = await mira.stats();            // { pools, healthMetrics, abandoned }, see below
 
 const off = mira.health.onChange(({ name, healthy }) => notify(name, healthy));   // breaker flips
 mira.health.onCheck(({ name, ok }) => record(name, ok));                       // every check
@@ -137,7 +152,40 @@ mira.health.recordProbeSuccess("appDb");     // your own probe reached the pool:
 mira.health.nudge("appDb");                  // check soon, outside the cadence
 ```
 
-`close()` removes the listeners an instance added and turns off a watch it started.
+`stats()` returns:
+
+| Field | |
+| --- | --- |
+| `pools[name]` | the driver's usage (`connectionsOpen`, `connectionsInUse`, `queueLength`, …) plus `zombieConnections` (connections dropped while a call on them was still hung) and `replacements`; or `{ opening: true }` / `{ error }`. In Thick mode, while a pool operation is in flight, `connectionsOpen` is the last value read safely and `countsApproximate: true` is set (asking the driver then could block the whole process behind a call hung on a dead link) |
+| `healthMetrics[name]` | `healthy`, `state` (`"closed"`, `"open"`, `"half-open"`), `lastCheck`, `consecutiveFailures`, `saturated` |
+| `abandoned` | process-wide `{ calls, pools, zombies }`: native work Mira stopped waiting for that is still running. It should fall back to 0 once the database answers again. |
+
+`close()` closes this instance's pools in parallel. A pool that does not close within 10 s + 2 × `connectTimeout` (a database that stopped answering) is abandoned: `close()` returns, the pool keeps closing in the background, and `abandoned.pools` counts it. `close()` also removes the listeners an instance added and turns off a watch it started.
+
+### Errors and retries
+
+Every error that leaves `withConnection`, and so every collection method, is a `MiraDbError`:
+
+```ts
+import { MiraDbError } from "@jm-paunlagui/mira";
+
+try {
+    await Orders.insertOne(order);
+} catch (err) {
+    if (err instanceof MiraDbError && err.kind === "connectivity" && !err.outcomeUnknown) retryLater();
+    else if (err instanceof MiraDbError && err.outcomeUnknown) checkByKeyThenMaybeRetry(order);
+    else throw err;
+}
+```
+
+| Field | |
+| --- | --- |
+| `kind` | `"connectivity"` (link or database unreachable, breaker open), `"saturation"` (pool full: NJS-040 / NJS-076), `"timeout"` (a driver timeout fired), `"statement"` (the SQL itself failed: retrying will not help) |
+| `code` | Mira's own case, e.g. `MIRA_CALL_TIMEOUT`, `MIRA_ACQUIRE_TIMEOUT`, `MIRA_POOL_OPENING`, `MIRA_CIRCUIT_OPEN`; undefined for a plain driver error, whose ORA-/NJS-/DPI- code stays in `message` (match `ORA-00001` and the like there). Mira's messages end with ` [MIRA_CODE]`. |
+| `outcomeUnknown` | `true` when a call was cut while it could have committed (a commit, an auto-committed write, DDL or PL/SQL). The write may or may not have happened: check the database by a natural or idempotency key before repeating it. `false`: the failed call committed nothing, so retrying is safe. |
+| `connectionName`, `durationMs`, `originalError` | the pool, how long the call ran, the error caught |
+
+Retry with backoff on `connectivity` or `saturation` when `outcomeUnknown` is false; never retry `statement` errors blindly. Mira itself retries only a transient failure to get a connection (before your SQL runs), never a statement.
 
 ### Config from environment variables
 
@@ -176,9 +224,13 @@ const { mode, clientVersion } = initDriver();   // set the driver up now; return
 - `binaryDir`: where node-oracledb's Thick binary is, when it is not beside the installed package, e.g. staged next to a `bun build --compile` executable.
 - Once the driver is up, a setting compatible with it is accepted and a different one throws.
 
-> ⚠️ **Thick mode needs enough worker threads.** In Thick mode every database call runs on a native worker thread from a small pool (`UV_THREADPOOL_SIZE`; Node's default is 4, and Bun's depends on the machine: a 4-core GitHub runner hung where a 12-core PC did not). A call waiting on a row lock keeps its thread. If more calls wait at once than there are threads, the transaction holding the lock never gets a thread to commit, and the process hangs with no error. Set `UV_THREADPOOL_SIZE` to at least your largest `poolMax` **in the environment before the process starts**, e.g. `UV_THREADPOOL_SIZE=24 node app.js`. Setting it in code after startup has no effect. Thin mode does not use these threads. When Thick mode creates a pool whose `poolMax` is above the thread count, Mira logs a warning naming both numbers.
+> ⚠️ **Thick mode needs enough worker threads.** In Thick mode every database call runs on one of the runtime's native worker threads, shared by all pools. Node uses `UV_THREADPOOL_SIZE` (default 4). Bun honours the same variable for a value of 2 or more and, unset, uses one thread per CPU core (so a 4-core CI runner can hang where a 12-core PC does not). A call waiting on a row lock or a stalled link keeps its thread. Measured: with 4 threads and 4 stalled calls, a query on another pool waited about 2.7 s; with 5 threads it answered at once. If more calls wait at once than there are threads, the transaction holding a lock never gets a thread to commit, and the process hangs with no error.
+>
+> Set `UV_THREADPOOL_SIZE` to at least the sum of every pool's `poolMax`, plus 3 per pool, plus 2, **in the environment before the process starts**, e.g. `UV_THREADPOOL_SIZE=30 node app.js` for one pool of 24. Setting it in code after startup has no effect. Thin mode does not use these threads. In Thick mode Mira logs a warning, naming both numbers, when a pool it creates raises that need above the thread count.
 
-**Session time zone.** node-oracledb writes a JS `Date` in the process's time zone and Oracle reads it in the session's, so Mira opens every pooled session in the process's zone: its region (e.g. `Asia/Manila`) in Thin mode, its UTC offset in Thick mode. A `Date` then keeps its instant in every date column type, under Node and Bun. `CURRENT_TIMESTAMP` and `LOCALTIMESTAMP` in your own SQL are in that zone; `SYSTIMESTAMP` / `SYSDATE` (the database server's clock) are unchanged. To choose another session zone, set `ORA_SDTZ` yourself, to the same zone as the process (`TZ`), or Dates move by the difference; a value that is not an offset, a region, `LOCAL` or `DBTIMEZONE` is refused with a warning. **Thick mode in a zone with daylight saving:** the session takes the offset in force when it opens (a region would make the client fetch with its own time-zone file, which fails with `ORA-01805` when it differs from the server's), so a `Date` from the other season moves by an hour. Run such a process on UTC (`TZ=UTC`).
+**Session time zone.** node-oracledb writes a JS `Date` in the process's time zone and Oracle reads it in the session's, so Mira opens every pooled session in the process's zone: its region (e.g. `Asia/Manila`) in Thin mode, its UTC offset in Thick mode. A `Date` then keeps its instant in every date column type, under Node and Bun. `CURRENT_TIMESTAMP` and `LOCALTIMESTAMP` in your own SQL are in that zone; `SYSTIMESTAMP` / `SYSDATE` (the database server's clock) are unchanged. To choose another session zone, set `ORA_SDTZ` yourself, to the same zone as the process (`TZ`), or Dates move by the difference; a value that is not an offset, a region, `LOCAL` or `DBTIMEZONE` is refused with a warning. **Thick mode in a zone with daylight saving:** the session takes the offset in force when it opens (a region would make the client fetch with its own time-zone file, which fails with `ORA-01805` when it differs from the server's), so a `Date` from the other season moves by an hour in `TIMESTAMP WITH TIME ZONE` and `TIMESTAMP WITH LOCAL TIME ZONE` columns. Run such a process on UTC (`TZ=UTC`).
+
+**The hour repeated when clocks go back (any mode, zones with daylight saving).** On the day clocks go back, local times from 01:00 to 02:00 happen twice. node-oracledb sends a `Date` as a local wall-clock time, and Oracle reads an ambiguous one as the second (standard-time) occurrence. So a `Date` in that hour can read back one hour off: in Thin mode in all four date column types, in Thick mode in `TIMESTAMP` and `DATE`. An equality filter on such an instant also matches its twin an hour away. `TIMESTAMP` and `DATE` hold no zone, so they cannot tell the two apart at all. A process on UTC, or in a zone without daylight saving (Asia/Manila, for example), is not affected. Planned for 3.2: binding Dates as exact instants for the zone-aware column types. Until then, run processes that write such instants on UTC.
 
 ### Logging
 
@@ -585,6 +637,8 @@ await users.insertMany([
 ]);
 ```
 
+`insertMany` returns `insertedIds`. By default it reads each new `ID` back with `RETURNING`, which costs out-binds on every row. When every document already carries its own integer `ID`, the table is your schema's own, its `ID` is a `NUMBER` with no scale, and no trigger fires on insert, Mira reports the IDs you supplied and skips `RETURNING` (about 2.4× faster for 1,000 rows). It checks the dictionary once per table per minute. Pass `returning: ["ID"]` to always read the stored values back, or `returning: []` when you need no IDs.
+
 ### Find Data
 
 ```js
@@ -642,6 +696,19 @@ await users.drop(); // ⚠️ Permanent! Deletes the table and all its data
 ## Medium — Filtering, Updating & Chaining
 
 > Comparison operators, chaining find queries, pagination, projections, and advanced update operators.
+
+### Filters from request input
+
+A filter is a small query language, so a request body or query string must never become one as is. `?name[$ne]=x` arrives as `{ name: { $ne: "x" } }`. `sanitizeFilter()` keeps plain values (string, number, boolean, null, Date) as equality and refuses every operator, nested object and list:
+
+```js
+import { sanitizeFilter } from "@jm-paunlagui/mira";
+
+// GET /users?city=Cebu&status=active
+await users.find({ ...sanitizeFilter(req.query), tenantId: user.tenantId }).toArray();
+```
+
+Add operators in code, from values you took out of the input. See [SECURITY.md](SECURITY.md) for what Mira binds and which inputs are SQL by design.
 
 ### Filter Operators
 
@@ -1554,6 +1621,11 @@ await users
     })
     .toArray();
 
+// …or a hand-written subquery: sql`…` binds every value. A plain string is refused.
+await users
+    .find({ id: { $inSelect: sql`SELECT USER_ID FROM ORDERS WHERE TOTAL > ${minTotal}` } })
+    .toArray();
+
 // Scalar subquery — add a computed column
 await users
     .find({})
@@ -1809,7 +1881,7 @@ bun run test:coverage   # + coverage (threshold 100% lines and functions for eve
 bun run test:unit       # or :integration / :performance / :chaos / :security / :reliability
 ```
 
-**Database prerequisites.** The schema user needs `CREATE TABLE`, `CREATE VIEW`, `CREATE SEQUENCE`, `CREATE SYNONYM`, `CREATE MATERIALIZED VIEW` and a tablespace quota (`ALTER USER <user> QUOTA UNLIMITED ON USERS;`). Every suite creates its own `MIRA_<suite>_*` tables and drops them afterwards.
+**Database prerequisites.** The schema user needs `CREATE TABLE`, `CREATE VIEW`, `CREATE SEQUENCE`, `CREATE SYNONYM`, `CREATE MATERIALIZED VIEW`, `CREATE TRIGGER` (one integration test), `SELECT` on `V_$OPEN_CURSOR`, `V_$MYSTAT`, `V_$STATNAME` and `V_$SQL` (the reliability suite's leak and recompile checks) and a tablespace quota (`ALTER USER <user> QUOTA UNLIMITED ON USERS;`). Every suite creates its own `MIRA_<suite>_*` tables and drops them afterwards.
 
 **Results.** The runner prints a scorecard per category. Tests named `DEFECT:` / `SECURITY:` assert the *fixed* behaviour of a known open issue and are reported separately from unexpected failures. Each run is stored under one `RUN_ID` in two tables that are kept between runs: `MIRA_TEST_RESULTS` (one row per test) and `MIRA_TEST_METRICS` (latencies, throughput, counts). Set `MIRA_SKIP_PERSIST=1` to skip writing them; performance budgets can be tightened with `MIRA_PERF_*` env vars (see `test/performance/perf.test.ts`).
 

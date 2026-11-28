@@ -4,7 +4,7 @@
  * method's own return value alone.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "bun:test";
-import { OracleCollection } from "../../src";
+import { OracleCollection, onQuery } from "../../src";
 import { db, schema, coll, createUsers, createOrders, createEmployees, dropIfExists, rawExec, USERS } from "../helpers/db";
 
 const U = "MIRA_IT_USERS";
@@ -103,6 +103,54 @@ describe("integration: inserts", () => {
     const before = await emp.countDocuments();
     await expect(emp.insertMany([{ ID: 60, NAME: "A" }, { ID: 1, NAME: "dup" }], { returning: [] })).rejects.toThrow(/ORA-00001/);
     expect(await emp.countDocuments()).toBe(before);
+  });
+
+  it("insertMany with supplied IDs: RETURNING is skipped only when the table cannot change them", async () => {
+    const tables = ["MIRA_IT_IDS_PLAIN", "MIRA_IT_IDS_TRG", "MIRA_IT_IDS_DEC"];
+    await dropIfExists(...tables);
+    try {
+      await schema.createTable(tables[0], { ID: { type: "NUMBER", primaryKey: true }, N: { type: "VARCHAR2(20)" } });
+      await schema.createTable(tables[1], { ID: { type: "NUMBER", primaryKey: true }, N: { type: "VARCHAR2(20)" } });
+      await rawExec(`CREATE OR REPLACE TRIGGER "${tables[1]}_BI" BEFORE INSERT ON "${tables[1]}" FOR EACH ROW BEGIN :NEW.ID := :NEW.ID + 1000; END;`);
+      await schema.createTable(tables[2], { ID: { type: "NUMBER(10,2)", primaryKey: true }, N: { type: "VARCHAR2(20)" } });
+      const seen: string[] = [];
+      const stop = onQuery((e) => { if (/^INSERT/.test(e.sql)) seen.push(/RETURNING/.test(e.sql) ? "returning" : "plain"); });
+      try {
+        // No trigger, NUMBER key: the caller's IDs, and no out-binds.
+        expect((await coll(tables[0]).insertMany([{ ID: 7, N: "a" }, { ID: 8, N: "b" }])).insertedIds).toEqual([7, 8]);
+        // A BEFORE INSERT trigger rewrites the key: the stored IDs, read back.
+        expect((await coll(tables[1]).insertMany([{ ID: 7, N: "a" }, { ID: 8, N: "b" }])).insertedIds).toEqual([1007, 1008]);
+        expect((await rawExec<{ ID: number }>(`SELECT ID FROM "${tables[1]}" ORDER BY ID`)).rows?.map((r) => r.ID)).toEqual([1007, 1008]);
+        // A scaled key and an explicit `returning` always read back.
+        expect((await coll(tables[2]).insertMany([{ ID: 1, N: "a" }])).insertedIds).toEqual([1]);
+        expect((await coll(tables[0]).insertMany([{ ID: 9, N: "c" }], { returning: ["ID"] })).insertedIds).toEqual([9]);
+      } finally {
+        stop();
+      }
+      expect(seen).toEqual(["plain", "returning", "returning", "returning"]);
+    } finally {
+      await dropIfExists(...tables);
+    }
+  });
+
+  it("a one-statement batch (autoCommit) that fails midway leaves nothing behind on any pooled session", async () => {
+    // 1,000 rows, the 500th a duplicate key: none land.
+    const before = await emp.countDocuments();
+    const rows = Array.from({ length: 1000 }, (_, i) => ({ ID: i === 499 ? 1 : 10_000 + i, NAME: `bulk-${i}` }));
+    await expect(emp.insertMany(rows, { returning: [] })).rejects.toThrow(/ORA-00001/);
+    expect(await emp.countDocuments()).toBe(before);
+    // bulkUpdateByKeys: the 3rd row's value is too large for NAME, so rows 1–2 are undone too.
+    const names = (await emp.find({}).sort({ ID: 1 }).limit(3).toArray()).map((r) => ({ ID: r.ID, NAME: r.NAME }));
+    const upd = names.map((r, i) => ({ ID: r.ID, NAME: i === 2 ? "x".repeat(5000) : "changed" }));
+    await expect(emp.bulkUpdateByKeys(upd, { keys: ["ID"] })).rejects.toThrow(/ORA-12899|ORA-01401|too large/);
+    expect((await emp.find({}).sort({ ID: 1 }).limit(3).toArray()).map((r) => ({ ID: r.ID, NAME: r.NAME }))).toEqual(names);
+    // Hold every pooled connection at once: none carries an open transaction.
+    const open = await Promise.all(Array.from({ length: 8 }, () => db.withConnection(async (conn) => {
+      const r = await conn.execute<{ T: string | null }>("SELECT DBMS_TRANSACTION.LOCAL_TRANSACTION_ID AS T FROM DUAL", [], { outFormat: db.oracledb.OUT_FORMAT_OBJECT });
+      await new Promise((res) => setTimeout(res, 50));
+      return r.rows?.[0]?.T ?? null;
+    })));
+    expect(open.every((t) => t === null)).toBe(true);
   });
 });
 

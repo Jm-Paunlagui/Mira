@@ -9,6 +9,10 @@
 const miraConfigMessages = {
   INVALID_CONFIG: (issues: readonly string[]) =>
     `[mira] Invalid config:\n  - ${issues.join("\n  - ")}`,
+  ENV_CONNECT_PARTS_INVALID: (prefix: string) =>
+    `${prefix}_HOST, ${prefix}_PORT or ${prefix}_SERVICE is not valid (a host name or IP address, a port from 1 to 65535, a service name of letters, digits and _ . $ # -)`,
+  CONNECT_PART_INVALID: (where: string, part: string, expected: string) =>
+    `[mira] ${where}(): the ${part} must be ${expected}.`,
   CONFIG_NOT_OBJECT: "config must be an object with a `pools` object",
   POOLS_EMPTY: "pools must name at least one pool",
   POOL_NAME_INVALID: (name: string) =>

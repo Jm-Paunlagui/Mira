@@ -11,6 +11,11 @@
  *     readiness probe would (open, stats, health.*),
  *   - it counts the day's sales on its own pool, which match the trading model, once
  *     through a collection and once inside a read-only transaction,
+ *   - a failing statement reaches it as a MiraDbError that says what sort of failure it was
+ *     (a statement, not a link) and that nothing is in doubt (outcomeUnknown false),
+ *   - stats() reports no native work abandoned (a healthy run gives up on nothing), and the
+ *     pool is open (not "opening") and was never replaced,
+ *   - health.metrics() shows its breaker closed and the pool not saturated (busy, not down),
  *   - closing it leaves appDb, which every other stage uses, serving.
  */
 import type { Ctx } from "../lib/context";
@@ -57,6 +62,15 @@ export async function configStage(sim: Sim, ctx: Ctx, state: State) {
   try {
     sim.eq("open(): the reporting pool opens up front", await mira.open(), [{ name: "reporting", success: true }]);
     sim.eq("stats(): only the reporting pool", Object.keys((await mira.stats()).pools), ["reporting"]);
+    sim.eq("stats(): nothing abandoned on a healthy run", (await mira.stats()).abandoned, { calls: 0, pools: 0, zombies: 0 });
+    const poolStats = (await mira.stats()).pools.reporting as { opening?: boolean; replacements?: number; zombieConnections?: number };
+    sim.eq("stats(): the reporting pool is open, never replaced, with no stuck connection", [poolStats.opening, poolStats.replacements, poolStats.zombieConnections], [undefined, 0, 0]);
+    const missing = await mira.db().withConnection((c) => c.execute('SELECT 1 FROM "MIRA_SIM_NO_SUCH_TABLE"')).catch((e: unknown) => e);
+    sim.ok(
+      "MiraDbError: a failing statement is a statement failure with nothing in doubt",
+      missing instanceof api.MiraDbError && missing.kind === "statement" && missing.outcomeUnknown === false && missing.connectionName === "reporting" && String(missing.message).includes("ORA-00942"),
+      missing,
+    );
     const checks: Array<{ name: string; ok: boolean }> = [];
     const offCheck = mira.health.onCheck((c) => void checks.push(c));
     const offChange = mira.health.onChange(() => {});
@@ -67,6 +81,8 @@ export async function configStage(sim: Sim, ctx: Ctx, state: State) {
     sim.eq("health.onCheck(): a nudged check of the reporting pool passes", checks[0], { name: "reporting", ok: true });
     sim.ok("health: the reporting pool and the instance are healthy", mira.health.isHealthy() && mira.health.allHealthy());
     sim.eq("health.metrics(): only the reporting pool", Object.keys(mira.health.metrics()), ["reporting"]);
+    const record = mira.health.metrics().reporting as { state?: string; saturated?: boolean };
+    sim.eq("health.metrics(): the reporting breaker is closed and the pool is not saturated", [record.state, record.saturated], ["closed", false]);
     offCheck();
     offChange();
     mira.health.watch(false);

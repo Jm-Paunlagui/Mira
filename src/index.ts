@@ -17,7 +17,7 @@ import { QueryBuilder } from "./core/QueryBuilder"; // Lazy cursor from .find()
 import { Transaction } from "./core/Transaction"; // Transaction manager with savepoints
 
 // ─── Parsers: Convert MongoDB operators to SQL fragments ─────────
-import { parseFilter } from "./parsers/filterParser"; // { status: "active" } → WHERE clause
+import { parseFilter, sanitizeFilter } from "./parsers/filterParser"; // { status: "active" } → WHERE clause
 import { parseUpdate } from "./parsers/updateParser"; // { $set: { name: "X" } } → SET clause
 
 // ─── Aggregation pipeline: Complex queries via MongoDB-style stages ──
@@ -60,12 +60,13 @@ import { defineConfig, MiraConfigError } from "./config/defineConfig";
 import { fromEnv } from "./config/fromEnv";
 import { buildSimpleConnectString, buildTNSConnectString } from "./config/connectString";
 import { configureDriver, initDriver } from "./driver/oracle";
+import { MiraDbError } from "./driver/errors";
 import { setLogger } from "./shared/log";
 
 // ─── Shared utility functions ────────────────────────────────────
 import { quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection } from "./shared/utils";
 
-export { OracleCollection, OracleSchema, OracleDCL, QueryBuilder, Transaction, parseFilter, parseUpdate, buildAggregateSQL, buildWindowExpr, buildJoinSQL, SetResultBuilder, withCTE, withRecursiveCTE, series, buildScalarSubquery, buildExistsSubquery, buildNotExistsSubquery, buildCorrelatedSubquery, buildInSelectSubquery, buildAnyAllSubquery, buildConnectBy, buildPivot, buildUnpivot, createPerformance, quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection, defineTable, TypedTable, t, generateTableTypes, createMigrator, relations, hasMany, hasOne, belongsTo, MiraValidationError, ModelCollection, MiraConcurrencyError, sql, SqlStatement, onQuery, createMira, defineConfig, fromEnv, MiraConfigError, buildSimpleConnectString, buildTNSConnectString, configureDriver, initDriver, setLogger };
+export { OracleCollection, OracleSchema, OracleDCL, QueryBuilder, Transaction, parseFilter, sanitizeFilter, parseUpdate, buildAggregateSQL, buildWindowExpr, buildJoinSQL, SetResultBuilder, withCTE, withRecursiveCTE, series, buildScalarSubquery, buildExistsSubquery, buildNotExistsSubquery, buildCorrelatedSubquery, buildInSelectSubquery, buildAnyAllSubquery, buildConnectBy, buildPivot, buildUnpivot, createPerformance, quoteIdentifier, convertTypes, rowToDoc, mergeBinds, buildOrderBy, buildProjection, defineTable, TypedTable, t, generateTableTypes, createMigrator, relations, hasMany, hasOne, belongsTo, MiraValidationError, ModelCollection, MiraConcurrencyError, sql, SqlStatement, onQuery, createMira, defineConfig, fromEnv, MiraConfigError, buildSimpleConnectString, buildTNSConnectString, configureDriver, initDriver, setLogger, MiraDbError };
 export type { RowOf, InsertOf, Filter, Update, Sort, Projection, Projected, TypedCollection, TypedQuery, TableTarget, IncludeOptionsOf, TableOptions, TableHooks, SoftDeleteMethods, CollectionOf } from "./typed/table";
 export type { HookContext } from "./typed/model";
 export type { SqlTarget } from "./core/sql";
@@ -76,7 +77,8 @@ export type { IncludeOptions } from "./typed/include";
 export type { Column, ColumnMeta } from "./typed/columns";
 export type { GenerateOptions } from "./typed/generate";
 export type { Migration, MigrationContext, MigratorOptions, MigrationStatus, MigrationState, MigrationRun, Migrator } from "./migrate/migrator";
-export type { Mira, MiraHealth } from "./driver/createMira";
+export type { Mira, MiraHealth, MiraAbandoned } from "./driver/createMira";
+export type { MiraErrorKind, MiraErrorCode } from "./driver/errors";
 export type { MiraDb, DbConnection } from "./driver/db";
 export type { MiraConfig, PoolConfig, ResolvedMiraConfig, DriverMode, DriverOptions, MiraLogger } from "./config/types";
 export type { FromEnvOptions } from "./config/fromEnv";

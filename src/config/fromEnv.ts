@@ -9,7 +9,8 @@
  *   <P>_CONNECT_STRING                        or <P>_HOST + <P>_SERVICE (+ <P>_PORT, default 1521)
  *   <P>_POOL_MIN, <P>_POOL_MAX, <P>_POOL_INCREMENT, <P>_QUEUE_MAX,
  *   <P>_QUEUE_TIMEOUT (ms), <P>_POOL_TIMEOUT (s), <P>_CONNECT_TIMEOUT (ms),
- *   <P>_POOL_PING_INTERVAL (s), <P>_STMT_CACHE_SIZE  optional whole numbers
+ *   <P>_POOL_PING_INTERVAL (s), <P>_STMT_CACHE_SIZE,
+ *   <P>_CALL_TIMEOUT (ms), <P>_EXPIRE_TIME (min)       optional whole numbers
  *
  * Process-wide, read when set: MIRA_DRIVER_MODE (auto | thin | thick) and
  * MIRA_DRIVER_LIB_DIR (Instant Client directory).
@@ -20,6 +21,7 @@
 
 import { miraConfigMessages as MSG } from "../shared/messages/miraConfig.messages";
 import { defineConfig, MiraConfigError } from "./defineConfig";
+import { buildSimpleConnectString } from "./connectString";
 import type { DriverMode, PoolConfig, ResolvedMiraConfig } from "./types";
 
 interface FromEnvOptions<P extends string> {
@@ -43,6 +45,8 @@ const INT_VARS = Object.freeze({
   CONNECT_TIMEOUT: "connectTimeout",
   POOL_PING_INTERVAL: "poolPingInterval",
   STMT_CACHE_SIZE: "stmtCacheSize",
+  CALL_TIMEOUT: "callTimeout",
+  EXPIRE_TIME: "expireTime",
 } satisfies Record<string, keyof PoolConfig>);
 
 function readPool(prefix: string, env: Record<string, string | undefined>, issues: string[]): PoolConfig {
@@ -59,7 +63,13 @@ function readPool(prefix: string, env: Record<string, string | undefined>, issue
   if (!connectString) {
     const host = get("HOST");
     const service = get("SERVICE");
-    if (host && service) connectString = `${host}:${get("PORT") ?? "1521"}/${service}`;
+    if (host && service) {
+      try {
+        connectString = buildSimpleConnectString(host, get("PORT") ?? "1521", service);
+      } catch {
+        issues.push(MSG.ENV_CONNECT_PARTS_INVALID(prefix));
+      }
+    }
     else issues.push(MSG.ENV_CONNECT_REQUIRED(prefix));
   }
 

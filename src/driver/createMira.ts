@@ -34,7 +34,7 @@ import { getLogger, setLogger } from "../shared/log";
 import type { MiraConfig, ResolvedMiraConfig } from "../config/types";
 import { miraConfigMessages as MSG } from "../shared/messages/miraConfig.messages";
 import { createDb, type DbConnection, type MiraDb } from "./db";
-import { OracleCollection } from "../core/OracleCollection";
+import { OracleCollection, forgetSuppliedIds } from "../core/OracleCollection";
 import { OracleSchema } from "../schema/OracleSchema";
 import { OracleDCL } from "../schema/OracleDCL";
 import { Transaction } from "../core/Transaction";
@@ -55,33 +55,57 @@ interface Mira<P extends string = string> {
   transaction(pool?: P): Transaction;
   /** Opens this instance's pools now (they open lazily otherwise). A pool that fails is reported (success: false, error), not thrown. */
   open(): Promise<Array<{ name: P; success: boolean; error?: string }>>;
-  /** Usage of this instance's pools (open / in use / queued …) and their health records. */
-  stats(): Promise<{ timestamp: string; pools: Record<string, unknown>; healthMetrics: Record<string, unknown> }>;
+  /**
+   * Usage of this instance's pools (open / in use / queued …, plus `abandonedCalls`,
+   * `abandonedPools` and `zombieConnections`: native work Mira gave up waiting for and
+   * that is still running; `replacements`: how often the pool was replaced because its
+   * connections were stuck on a link that stopped answering)
+   * and their health records. A pool that is still opening is `{ opening: true }` (stats()
+   * never waits for it); one whose opening failed is `{ error }`. In Thick mode, while a pool
+   * operation is in flight, `connectionsOpen` is the last value read safely and `countsApproximate` is true. `abandoned` is process-wide:
+   * the same counters summed over every pool name, closed pools included.
+   */
+  stats(): Promise<{ timestamp: string; pools: Record<string, unknown>; healthMetrics: Record<string, unknown>; abandoned: MiraAbandoned }>;
   /** The circuit breaker and health monitor, for this instance's pools. */
   readonly health: MiraHealth<P>;
-  /** Closes this instance's pools and removes them from the registry. Idempotent. */
+  /**
+   * Closes this instance's pools (in parallel) and removes them from the registry. Idempotent.
+   * A pool that does not close within 10 s + 2 x connectTimeout (a database that stopped
+   * answering) is abandoned: close() returns, the pool keeps closing in the background, and
+   * `stats().abandoned.pools` counts it until it ends.
+   */
   close(): Promise<void>;
   /** True after close(). */
   readonly closed: boolean;
 }
 
+/** Native work Mira stopped waiting for and that is still running (see Mira.stats). `zombies`: connections dropped or released while a call on them was still hung. */
+type MiraAbandoned = { calls: number; pools: number; zombies: number };
+
 /**
  * Health of a Mira instance's pools. The monitor pings each open pool (every 30 s,
  * every 5 s while one is failing or while watched); three failed checks open a
- * pool's circuit breaker, so withConnection fails fast with NJS-503 until a check
- * or a probe succeeds.
+ * pool's circuit breaker, so withConnection fails fast with NJS-503. After an outage the
+ * first passing check half-opens it: 3 calls at a time are let through, and 3 successes
+ * (or the next passing check, or a probe) close it; a connectivity failure opens it again.
+ * A check that fails only because the pool is busy (every connection in use, calls still
+ * finishing) is not a failure: it is reported as `saturated`.
  */
 interface MiraHealth<P extends string = string> {
   /** This pool's breaker is closed (default: config.defaultPool). False after close(). */
   isHealthy(pool?: P): boolean;
   /** Every pool of this instance is healthy. */
   allHealthy(): boolean;
-  /** Health records ({ healthy, lastCheck, consecutiveFailures }) of this instance's checked pools. */
+  /**
+   * Health records of this instance's checked pools: `healthy` (breaker closed), `state`
+   * ("closed" | "open" | "half-open"), `lastCheck`, `consecutiveFailures`, and `saturated`
+   * (the last check found the pool busy, not down).
+   */
   metrics(): Record<string, unknown>;
   /** Called when one of this instance's pools turns healthy or unhealthy. Returns an unsubscribe function. */
   onChange(listener: (change: { name: P; healthy: boolean }) => void): () => void;
   /** Called after every check of one of this instance's pools. Returns an unsubscribe function. */
-  onCheck(listener: (check: { name: P; ok: boolean }) => void): () => void;
+  onCheck(listener: (check: { name: P; ok: boolean; saturated?: boolean }) => void): () => void;
   /** Process-wide: check every 5 s instead of 30 s (e.g. while a readiness stream has listeners). */
   watch(on: boolean): void;
   /** Your own probe reached the pool: close its breaker now instead of at the next check. */
@@ -157,15 +181,19 @@ function createMira<P extends string>(input: MiraConfig<P> | ResolvedMiraConfig<
     nudge: (pool) => config.nudgePoolHealth(pick(pool)),
   };
 
+  const closeAndUnregister = async (name: P) => {
+    await config.closePool(name);
+    database.unregisterConnection(name);
+    forgetSuppliedIds(name); // a later pool of this name may reach another database or user
+  };
+
   const close = async () => {
     if (closed) return;
     closed = true;
     for (const off of [...unsubscribes]) off();
     if (watching) health.watch(false);
-    for (const name of names) {
-      await config.closePool(name);
-      database.unregisterConnection(name);
-    }
+    // In parallel: each pool is bounded on its own, so one that will not close does not hold the others up.
+    await Promise.allSettled(names.map(closeAndUnregister));
     handles.clear();
     if (ownsLogger && getLogger() === logger) setLogger(null);
   };
@@ -206,7 +234,7 @@ function createMira<P extends string>(input: MiraConfig<P> | ResolvedMiraConfig<
     },
     stats: async () => {
       const all = await config.getPoolStats();
-      return { timestamp: all.timestamp, pools: only(all.pools), healthMetrics: only(all.healthMetrics) };
+      return { timestamp: all.timestamp, pools: only(all.pools), healthMetrics: only(all.healthMetrics), abandoned: all.abandoned };
     },
     health,
     close,
@@ -217,4 +245,4 @@ function createMira<P extends string>(input: MiraConfig<P> | ResolvedMiraConfig<
 }
 
 export { createMira };
-export type { Mira, MiraHealth };
+export type { Mira, MiraHealth, MiraAbandoned };

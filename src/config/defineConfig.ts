@@ -27,6 +27,8 @@ const INT_FIELDS = Object.freeze({
   connectTimeout: 1,
   poolPingInterval: -Infinity,
   stmtCacheSize: 0,
+  callTimeout: 0,
+  expireTime: 0,
 } satisfies Record<Exclude<keyof PoolConfig, (typeof STRING_FIELDS)[number]>, number>);
 
 const KNOWN_KEYS = new Set<string>([...STRING_FIELDS, ...Object.keys(INT_FIELDS)]);

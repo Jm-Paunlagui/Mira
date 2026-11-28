@@ -58,7 +58,7 @@ describe("unit: defineConfig", () => {
           "9bad": pool,
           notObj: "x" as never,
           typo: { ...pool, poolmax: 5 } as never,
-          nums: { ...pool, poolMin: 5, poolMax: 2, queueMax: -1, connectTimeout: 0, poolTimeout: 1.5, poolPingInterval: 0.5, stmtCacheSize: Number.NaN },
+          nums: { ...pool, poolMin: 5, poolMax: 2, queueMax: -1, connectTimeout: 0, poolTimeout: 1.5, poolPingInterval: 0.5, stmtCacheSize: Number.NaN, callTimeout: -1, expireTime: 1.5 },
           blank: { user: " ", password: "", connectString: "db" },
         },
         defaultPool: "empty",
@@ -76,6 +76,8 @@ describe("unit: defineConfig", () => {
       "pools.nums.connectTimeout must be an integer >= 1",
       "pools.nums.poolPingInterval must be an integer",
       "pools.nums.stmtCacheSize must be an integer >= 0",
+      "pools.nums.callTimeout must be an integer >= 0",
+      "pools.nums.expireTime must be an integer >= 0",
       "pools.nums.poolMin must not exceed poolMax",
       "pools.blank.user must be a non-empty string",
       "pools.blank.password must be a non-empty string",
@@ -136,9 +138,9 @@ describe("unit: fromEnv", () => {
   const base = { MIRA_DB_USER: "APP", MIRA_DB_PASSWORD: "pw", MIRA_DB_CONNECT_STRING: "db:1521/APP" };
 
   it("defaults to one appDb pool under MIRA_DB; numbers parse, blanks are unset", () => {
-    const c = fromEnv({ env: { ...base, MIRA_DB_POOL_MAX: " 20 ", MIRA_DB_POOL_MIN: "", MIRA_DB_POOL_PING_INTERVAL: "-1", MIRA_DB_QUEUE_TIMEOUT: "0" } });
+    const c = fromEnv({ env: { ...base, MIRA_DB_POOL_MAX: " 20 ", MIRA_DB_POOL_MIN: "", MIRA_DB_POOL_PING_INTERVAL: "-1", MIRA_DB_QUEUE_TIMEOUT: "0", MIRA_DB_CALL_TIMEOUT: "30000", MIRA_DB_EXPIRE_TIME: "2" } });
     expect(c.defaultPool).toBe("appDb");
-    expect(c.pools.appDb).toEqual({ user: "APP", password: "pw", connectString: "db:1521/APP", poolMax: 20, poolPingInterval: -1, queueTimeout: 0 });
+    expect(c.pools.appDb).toEqual({ user: "APP", password: "pw", connectString: "db:1521/APP", poolMax: 20, poolPingInterval: -1, queueTimeout: 0, callTimeout: 30000, expireTime: 2 });
   });
 
   it("reads process.env when no env is given", () => {

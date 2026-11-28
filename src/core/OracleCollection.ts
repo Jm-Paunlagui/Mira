@@ -131,11 +131,103 @@ function _deepClone(value: unknown): unknown {
     return out;
 }
 
+/** Per pool and table: can a supplied ID be reported as stored? Cached briefly (see suppliedIdsAreFinal). */
+const _idsFinalCache = new Map<string, { at: number; ok: Promise<boolean> }>();
+/** How long a table's answer is reused. A trigger added by raw DDL is seen within this window. */
+const IDS_FINAL_TTL_MS = 60_000;
+
+/** Forgets the cached answers for one pool (its Mira instance closed; a new pool of that name may point elsewhere). */
+function forgetSuppliedIds(pool: string): void {
+    for (const key of _idsFinalCache.keys()) if (key.startsWith(`${pool}\u0000`)) _idsFinalCache.delete(key);
+}
+
 /**
- * WHERE clause that picks ONE matching row for updateOne / replaceOne /
- * deleteOne. An empty filter yields no WHERE from parseFilter, so appending
- * "AND ROWNUM = 1" would produce invalid SQL ("… t0  AND ROWNUM = 1").
+ * insertMany's default RETURNING "ID" can be skipped only when the database is
+ * certain to store exactly the ID each document supplied:
+ *   - every document has an ID that is a safe integer (a string "5" would come
+ *     back as the number 5; a fraction could be rounded by the column's scale);
+ *   - the session writes to its own schema (CURRENT_SCHEMA = SESSION_USER, so an
+ *     unqualified name is the login user's table) and the table is in USER_TABLES:
+ *     a view, synonym or another schema's table falls back to RETURNING;
+ *   - its ID column is NUMBER with no fractional scale;
+ *   - no enabled trigger on the table fires on INSERT, whoever owns the trigger
+ *     (ALL_TRIGGERS: a DBA or audit schema can own a trigger on our table, and a
+ *     BEFORE INSERT trigger may rewrite :NEW.ID).
+ * Any doubt, including a failed dictionary read, keeps RETURNING. One dictionary
+ * query per pool and table per minute; concurrent calls share it.
  */
+async function suppliedIdsAreFinal(conn: DbConnection, pool: string, table: string, docs: Array<Record<string, unknown>>, outFormat: number): Promise<boolean> {
+    for (const d of docs) if (!Number.isSafeInteger(d.ID)) return false;
+    if (!/^[A-Za-z][A-Za-z0-9_$#]{0,127}$/.test(table)) return false;
+    const key = `${pool}\u0000${table}`;
+    const hit = _idsFinalCache.get(key);
+    if (hit && Date.now() - hit.at < IDS_FINAL_TTL_MS) return hit.ok;
+    const ok = conn
+        .execute<{ DATA_TYPE: string; DATA_SCALE: number | null; TRG: number; SAME: number }>(
+            `SELECT c.DATA_TYPE, c.DATA_SCALE,
+                    (SELECT COUNT(*) FROM ALL_TRIGGERS g WHERE g.TABLE_OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND g.TABLE_NAME = :t
+                        AND g.BASE_OBJECT_TYPE = 'TABLE' AND g.STATUS = 'ENABLED' AND g.TRIGGERING_EVENT LIKE '%INSERT%') AS TRG,
+                    CASE WHEN SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') = SYS_CONTEXT('USERENV', 'SESSION_USER') THEN 1 ELSE 0 END AS SAME
+               FROM USER_TAB_COLUMNS c JOIN USER_TABLES u ON u.TABLE_NAME = c.TABLE_NAME
+              WHERE c.TABLE_NAME = :t AND c.COLUMN_NAME = 'ID'`,
+            { t: table },
+            { outFormat },
+        )
+        .then((r) => {
+            const row = r.rows?.[0];
+            return !!row && Number(row.SAME) === 1 && row.DATA_TYPE === "NUMBER" && !row.DATA_SCALE && Number(row.TRG) === 0;
+        }, () => false);
+    _idsFinalCache.set(key, { at: Date.now(), ok });
+    return ok;
+}
+
+/**
+ * One column of an executeMany batch, scanned once: the first non-null value
+ * (picks the bind type), whether numbers and strings are mixed, and the largest
+ * value in UTF-8 bytes (at least 1). A Date binds as DATE, so its text length is
+ * never a bind size and is not measured. A loop rather than Math.max(...values):
+ * spreading a very large batch overflows the call stack.
+ */
+function scanBindColumn(rows: Array<Record<string, unknown>>, col: string): { sample: unknown; mixed: boolean; maxBytes: number } {
+    let sample: unknown = null;
+    let num = false;
+    let str = false;
+    let maxBytes = 1;
+    for (const row of rows) {
+        const v = row[col];
+        if (v == null) continue;
+        if (sample === null) sample = v;
+        let bytes: number;
+        if (typeof v === "string") {
+            str = true;
+            bytes = Buffer.byteLength(v, "utf8");
+        } else if (typeof v === "number") {
+            num = true;
+            bytes = String(v).length;
+        } else if (v instanceof Date) {
+            continue;
+        } else {
+            bytes = Buffer.isBuffer(v) ? v.length : Buffer.byteLength(String(v), "utf8");
+        }
+        if (bytes > maxBytes) maxBytes = bytes;
+    }
+    return { sample, mixed: num && str, maxBytes };
+}
+
+/**
+ * Runs a single autoCommit statement on a borrowed connection. A failed
+ * statement commits nothing; it is rolled back here before the connection
+ * goes back to the pool, so no partial batch can leak into the next borrower.
+ */
+async function autoCommitted<T>(conn: DbConnection, fn: () => Promise<T>): Promise<T> {
+    try {
+        return await fn();
+    } catch (err) {
+        await conn.rollback().catch(() => {});
+        throw err;
+    }
+}
+
 /**
  * RETURNING clause for a statement that may touch MANY rows (updateMany / deleteMany).
  * Each column gets an array out-bind; node-oracledb fills it with one value per row.
@@ -162,6 +254,11 @@ function _returnedRows(cols: string[], outBinds: unknown): Array<Record<string, 
     return Array.from({ length: n }, (_, i) => Object.fromEntries(cols.map((c, k) => [c, columns[k][i] ?? null])));
 }
 
+/**
+ * WHERE clause that picks ONE matching row for updateOne / replaceOne /
+ * deleteOne. An empty filter yields no WHERE from parseFilter, so appending
+ * "AND ROWNUM = 1" would produce invalid SQL ("… t0  AND ROWNUM = 1").
+ */
 function _firstRowWhere(whereClause: string): string {
     return whereClause ? `${whereClause} AND ROWNUM = 1` : "WHERE ROWNUM = 1";
 }
@@ -806,6 +903,10 @@ class OracleCollection {
      * @param {Object} [options]
      *   - returning: Array of column names to RETURN per inserted row
      *     (e.g. ['ORDER_ID']). Defaults to ['ID'] for backward compatibility.
+     *     With the default, when every document supplies a safe-integer ID and the
+     *     table cannot change it (own table, NUMBER ID with no scale, no INSERT
+     *     trigger), the supplied IDs are reported and no RETURNING is sent. An
+     *     explicit `returning` always reads the stored values back.
      *     Pass [] for tables without a returnable key column. RETURNING is
      *     intended for NUMBER key columns (IDENTITY / sequence values).
      *   - batchErrors: When true, row-level errors (e.g. ORA-00001) do NOT
@@ -863,7 +964,7 @@ class OracleCollection {
         // document had, so documents are grouped by their column set: one INSERT per
         // group, each omitted column keeps its DEFAULT, and results come back in the
         // caller's order. Every group runs on the same connection (one transaction).
-        const insertGroup = async (conn: DbConnection, docs: Array<Record<string, unknown>>) => {
+        const insertGroup = async (conn: DbConnection, docs: Array<Record<string, unknown>>, autoCommit: boolean, returningCols: string[]) => {
             const cols = Object.keys(docs[0]);
             const placeholders = cols.map((_, i) => `:v${i}`).join(", ");
 
@@ -877,77 +978,58 @@ class OracleCollection {
             }
             const sql = `INSERT INTO ${quoteIdentifier(this.tableName)} (${cols.map(quoteIdentifier).join(", ")}) VALUES (${placeholders})${returningSql}`;
 
-            // Build bind arrays for executeMany
-            const bindDefs: Record<string, import("oracledb").BindDefinition> = {};
-            const textColumns = new Set<string>(); // columns mixing numbers and strings (sent as text)
-            cols.forEach((c, i) => {
-                // Scan all documents for a non-null sample to determine the type
-                let sampleVal: unknown = null;
-                for (const doc of docs) {
-                    if (doc[c] != null) {
-                        sampleVal = doc[c];
-                        break;
-                    }
-                }
-                // maxSize is in BYTES, not characters. Multi-byte UTF-8
-                // (e.g. Filipino/Spanish names with ñ, é) would be
-                // truncated/ORA-06502 if sized by char length, so measure
-                // true byte length over every row's value for this column.
-                const maxBytes = Math.max(
-                    ...docs.map((d) => {
-                        const v = d[c];
-                        if (v == null) return 1;
-                        return Buffer.isBuffer(v) ? v.length : Buffer.byteLength(String(v), "utf8");
-                    }),
-                    1,
-                );
-                const name = `v${i}`;
+            // Bind definitions, by position (:v0, :v1 … then the RETURNING outs).
+            const bindDefs: import("oracledb").BindDefinition[] = [];
+            const textColumn: boolean[] = []; // columns mixing numbers and strings (sent as text)
+            cols.forEach((c) => {
+                // One pass per column: the first non-null value (the bind type), whether
+                // numbers and strings are mixed, and the largest value in BYTES (maxSize
+                // is bytes, not characters: multi-byte UTF-8 such as ñ or é would be
+                // truncated, or raise ORA-06502, if sized by length). A loop, not
+                // Math.max(...values): spreading a million values overflows the stack.
+                const col = scanBindColumn(docs, c);
+                const sampleVal = col.sample;
+                const maxBytes = col.maxBytes;
                 // A column given as numbers in some documents and strings in others
                 // (a typed money column takes both): one text bind, the numbers sent as
                 // their decimal text, which Oracle converts to NUMBER exactly as it does
                 // a money string in insertOne. One bind type per column otherwise.
-                const kinds = new Set(docs.map((d) => typeof d[c]).filter((k) => k === "number" || k === "string"));
-                if (kinds.size === 2) {
-                    textColumns.add(c);
-                    bindDefs[name] = { type: this.db.oracledb.STRING, maxSize: Math.max(maxBytes, 100) };
+                textColumn.push(col.mixed);
+                if (col.mixed) {
+                    bindDefs.push({ type: this.db.oracledb.STRING, maxSize: Math.max(maxBytes, 100) });
                 } else if (typeof sampleVal === "number") {
-                    bindDefs[name] = { type: this.db.oracledb.NUMBER };
+                    bindDefs.push({ type: this.db.oracledb.NUMBER });
                 } else if (sampleVal instanceof Date) {
-                    bindDefs[name] = { type: this.db.oracledb.DATE };
+                    bindDefs.push({ type: this.db.oracledb.DATE });
                 } else if (Buffer.isBuffer(sampleVal)) {
                     // Binary: a RAW-sized bind, or a BLOB bind past 32 KB (the RAW bind limit).
-                    bindDefs[name] = maxBytes > 32767
+                    bindDefs.push(maxBytes > 32767
                         ? { type: this.db.oracledb.DB_TYPE_BLOB }
-                        : { type: this.db.oracledb.BUFFER, maxSize: Math.max(maxBytes, 100) };
+                        : { type: this.db.oracledb.BUFFER, maxSize: Math.max(maxBytes, 100) });
                 } else if (maxBytes > 32767) {
                     // Text past 32 KB (the VARCHAR2 bind limit) can only go to a CLOB: bind it as one.
-                    bindDefs[name] = { type: this.db.oracledb.DB_TYPE_CLOB };
+                    bindDefs.push({ type: this.db.oracledb.DB_TYPE_CLOB });
                 } else {
-                    bindDefs[name] = {
-                        type: this.db.oracledb.STRING,
-                        maxSize: Math.max(maxBytes, 100),
-                    };
+                    bindDefs.push({ type: this.db.oracledb.STRING, maxSize: Math.max(maxBytes, 100) });
                 }
             });
-            for (const c of returningCols) {
-                bindDefs[`out_${bindSafe(c)}`] = {
-                    type: this.db.oracledb.NUMBER,
-                    dir: this.db.oracledb.BIND_OUT,
-                };
+            for (let k = 0; k < returningCols.length; k++) {
+                bindDefs.push({ type: this.db.oracledb.NUMBER, dir: this.db.oracledb.BIND_OUT });
             }
 
+            const width = cols.length;
             const bindRows = docs.map((doc) => {
-                const row: Record<string, unknown> = {};
-                cols.forEach((c, i) => {
-                    const v = doc[c] ?? null;
-                    row[`v${i}`] = textColumns.has(c) && typeof v === "number" ? String(v) : v;
-                });
+                const row: unknown[] = new Array(width);
+                for (let i = 0; i < width; i++) {
+                    const v = doc[cols[i]] ?? null;
+                    row[i] = textColumn[i] && typeof v === "number" ? String(v) : v;
+                }
                 return row;
             });
 
             try {
                 return await conn.executeMany(sql, bindRows, {
-                    autoCommit: false,
+                    autoCommit,
                     bindDefs,
                     ...(batchErrors ? { batchErrors: true } : {}),
                 });
@@ -958,19 +1040,28 @@ class OracleCollection {
             }
         };
 
-        const run = async (conn: DbConnection) => {
-            // Consecutive documents with the same column set (key order does not matter)
-            // form one group, so rows are still inserted in the caller's order (identity
-            // values and sequences follow it): one round trip per change of shape.
-            const groups: number[][] = [];
-            let lastKey = "";
-            documents.forEach((doc, i) => {
-                const key = JSON.stringify(Object.keys(doc).sort());
-                if (groups.length > 0 && key === lastKey) groups[groups.length - 1].push(i);
-                else groups.push([i]);
-                lastKey = key;
-            });
+        // Consecutive documents with the same column set (key order does not matter)
+        // form one group, so rows are still inserted in the caller's order (identity
+        // values and sequences follow it): one round trip per change of shape. A
+        // document with the same keys in the same order as the one before it (the
+        // usual case) joins its group without building the sorted key.
+        const groups: number[][] = [];
+        let lastKey = "";
+        let lastKeys: string[] = [];
+        documents.forEach((doc, i) => {
+            const keys = Object.keys(doc);
+            if (i > 0 && keys.length === lastKeys.length && keys.every((k, j) => k === lastKeys[j])) {
+                groups[groups.length - 1].push(i);
+                return;
+            }
+            const key = JSON.stringify(keys.slice().sort());
+            if (groups.length > 0 && key === lastKey) groups[groups.length - 1].push(i);
+            else groups.push([i]);
+            lastKey = key;
+            lastKeys = keys;
+        });
 
+        const run = async (conn: DbConnection, autoCommit: boolean) => {
             const response: { acknowledged: boolean; insertedCount: number; insertedIds: unknown[]; returning?: Record<string, number | null>[]; batchErrors?: Array<{ offset: number; message: string }> } = {
                 acknowledged: true,
                 insertedCount: 0,
@@ -979,17 +1070,26 @@ class OracleCollection {
             const returning: Array<Record<string, number | null>> = [];
             const errors: Array<{ offset: number; message: string }> = [];
 
+            // The default RETURNING "ID" costs out-binds on every row (2.7× the insert alone).
+            // When every document supplies its own ID and the table cannot change it on the
+            // way in, the IDs are the caller's: report them and send no RETURNING. An
+            // explicit `returning` always reads the stored values back.
+            const supplied = options.returning === undefined && await suppliedIdsAreFinal(conn, this.db.connectionName, this.tableName, documents, this.db.oracledb.OUT_FORMAT_OBJECT);
+            const retCols = supplied ? [] : returningCols;
+            if (supplied) documents.forEach((d, i) => { returning[i] = { ID: d.ID as number }; });
+
             for (const positions of groups) {
-                const result = await insertGroup(conn, positions.map((i) => documents[i]));
+                const result = await insertGroup(conn, positions.map((i) => documents[i]), autoCommit, retCols);
                 response.insertedCount += result.rowsAffected ?? 0;
-                if (returningCols.length > 0 && result.outBinds) {
-                    result.outBinds.forEach((ob: Record<string, unknown>, j: number) => {
+                if (retCols.length > 0 && result.outBinds) {
+                    // By position: one entry per row, holding the RETURNING outs in order.
+                    (result.outBinds as unknown as unknown[][]).forEach((ob, j) => {
                         const rowOut: Record<string, number | null> = {};
-                        for (const c of returningCols) {
-                            const val = ob[`out_${bindSafe(c)}`];
+                        returningCols.forEach((c, k) => {
+                            const val = ob[k];
                             const v = Array.isArray(val) ? val[0] : val;
                             rowOut[c] = typeof v === "number" ? v : null; // NUMBER out-bind: a number, or null for a NULL column
-                        }
+                        });
                         returning[positions[j]] = rowOut;
                     });
                 }
@@ -1013,9 +1113,13 @@ class OracleCollection {
             return response;
         };
 
-        // Session-bound collections join the surrounding transaction;
-        // unbound collections keep the original dedicated-transaction shape.
-        return this._conn ? run(this._conn) : this.db.withTransaction(run);
+        // A session-bound collection joins the surrounding transaction. Otherwise one
+        // statement (one column set, no batchErrors) commits with the execute itself
+        // (autoCommit: the commit rides on the same round trip; a failed statement
+        // commits nothing and is rolled back); several statements share one transaction.
+        if (this._conn) return run(this._conn, false);
+        if (groups.length === 1 && !batchErrors) return this.db.withConnection((conn) => autoCommitted(conn, () => run(conn, true)));
+        return this.db.withTransaction((conn) => run(conn, false));
     }
 
     /**
@@ -1079,35 +1183,14 @@ class OracleCollection {
 
         // Bind definitions: same type-scan approach as insertMany.
         const bindDefs: Record<string, import("oracledb").BindDefinition> = {};
-        const defFor = (col: string) => {
-            let sampleVal: unknown = null;
-            for (const row of rows) {
-                if (row[col] != null) {
-                    sampleVal = row[col];
-                    break;
-                }
-            }
-            if (typeof sampleVal === "number") {
-                return { type: this.db.oracledb.NUMBER };
-            }
-            if (sampleVal instanceof Date) {
-                return { type: this.db.oracledb.DATE };
-            }
-            // maxSize is in BYTES — measure true UTF-8 byte length so
-            // multi-byte values (e.g. names with ñ/é) are never truncated.
-            const maxBytes = Math.max(
-                ...rows.map((r) => {
-                    const v = r[col];
-                    return v != null
-                        ? Buffer.byteLength(String(v), "utf8")
-                        : 1;
-                }),
-                1,
-            );
-            return {
-                type: this.db.oracledb.STRING,
-                maxSize: Math.max(maxBytes, 100),
-            };
+        const defFor = (col: string): import("oracledb").BindDefinition => {
+            // One pass (see scanBindColumn): the bind type from the first non-null
+            // value; for text, maxSize in BYTES so multi-byte values (ñ, é) are
+            // never truncated.
+            const { sample, maxBytes } = scanBindColumn(rows, col);
+            if (typeof sample === "number") return { type: this.db.oracledb.NUMBER };
+            if (sample instanceof Date) return { type: this.db.oracledb.DATE };
+            return { type: this.db.oracledb.STRING, maxSize: Math.max(maxBytes, 100) };
         };
         setCols.forEach((c, i) => {
             bindDefs[`s${i}`] = defFor(c);
@@ -1116,21 +1199,19 @@ class OracleCollection {
             bindDefs[`k${i}`] = defFor(c);
         });
 
+        const setNames = setCols.map((_, i) => `s${i}`);
+        const keyNames = keys.map((_, i) => `k${i}`);
         const bindRows = rows.map((row) => {
             const bound: Record<string, unknown> = {};
-            setCols.forEach((c, i) => {
-                bound[`s${i}`] = row[c] ?? null;
-            });
-            keys.forEach((c, i) => {
-                bound[`k${i}`] = row[c] ?? null;
-            });
+            for (let i = 0; i < setCols.length; i++) bound[setNames[i]] = row[setCols[i]] ?? null;
+            for (let i = 0; i < keys.length; i++) bound[keyNames[i]] = row[keys[i]] ?? null;
             return bound;
         });
 
-        const run = async (conn: DbConnection) => {
+        const run = async (conn: DbConnection, autoCommit: boolean) => {
             try {
                 const result = await conn.executeMany(sql, bindRows, {
-                    autoCommit: false,
+                    autoCommit,
                     bindDefs,
                 });
                 return {
@@ -1148,7 +1229,9 @@ class OracleCollection {
             }
         };
 
-        return this._conn ? run(this._conn) : this.db.withTransaction(run);
+        // One statement: outside a session it commits with the execute (see insertMany).
+        if (this._conn) return run(this._conn, false);
+        return this.db.withConnection((conn) => autoCommitted(conn, () => run(conn, true)));
     }
 
     // ─── Update Operations ───────────────────────────────────────
@@ -2329,4 +2412,4 @@ function _buildJoinOn(onSpec: JoinOn, targetTable: string): string {
         .join(" AND ");
 }
 
-export { OracleCollection };
+export { OracleCollection, forgetSuppliedIds };

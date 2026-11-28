@@ -95,6 +95,24 @@ type QueryBuilderOptions = {
 };
 
 /**
+ * Resolves once a node-oracledb query stream has emitted "close" (its result set
+ * is closed and the connection is free to go back to the pool). Call it right
+ * after queryStream(), before any event can fire.
+ *
+ * Why this cannot hang on a link that stopped answering: when the pool sets
+ * callTimeout, the connection's guard (SessionGuard in driver/oracle.ts) bounds each
+ * fetch and the driver's close, destroys the stream with an error when one is cut,
+ * and finishes destroy() within callTimeout + 1 s. "close" is emitted either way.
+ * Without callTimeout nothing is bounded, as documented.
+ */
+function streamClosed(stream: { once(event: "close", fn: () => void): unknown; closed?: boolean }): Promise<void> {
+    return new Promise<void>((resolve) => {
+        if (stream.closed) resolve();
+        else stream.once("close", () => resolve());
+    });
+}
+
+/**
  * The FOR UPDATE clause for a lock mode. Throws on an unknown mode so a typo
  * ("no wait") fails loudly instead of silently waiting forever. Column names
  * in `of` are quoted identifiers; `wait` must be a whole number of seconds.
@@ -535,7 +553,11 @@ class QueryBuilder {
         const resolve = async (obj: unknown): Promise<unknown> => {
             if (obj && typeof obj === "object" && "then" in obj && typeof obj.then === "function") return await obj;
             if (Array.isArray(obj)) return Promise.all(obj.map(resolve));
-            if (obj && typeof obj === "object" && !(obj instanceof Date)) {
+            // Only plain objects are filter structure. A Date, Buffer or sql`…` statement is a
+            // value: copying it field by field lost its class (a sql`` subquery became a plain
+            // object, a Buffer an object of byte fields).
+            const proto = obj && typeof obj === "object" ? Object.getPrototypeOf(obj) : undefined;
+            if (obj && typeof obj === "object" && (proto === Object.prototype || proto === null)) {
                 const result: Record<string, unknown> = {};
                 for (const [k, v] of Object.entries(obj)) {
                     result[k] = await resolve(v);
@@ -669,13 +691,20 @@ class QueryBuilder {
                 const stream = conn.queryStream(sql, binds, {
                     outFormat: this.db.oracledb.OUT_FORMAT_OBJECT,
                 });
+                // The connection is handed back when forEach settles, so it must not
+                // settle before the stream has closed its result set: node-oracledb
+                // closes it between "end" and "close", and a connection released in
+                // between is still in native use (Thick + Bun: another caller's error
+                // text overwritten with DPI-1039 / NJS-003, and crashes).
+                const closed = streamClosed(stream);
                 let done = false;
                 let pending: Promise<unknown> = Promise.resolve();
                 const fail = (err: unknown) => {
                     if (done) return;
                     done = true;
                     stream.destroy();
-                    reject(new Error(MSG.wrapError("QueryBuilder.forEach", err, sql, binds)));
+                    const wrapped = new Error(MSG.wrapError("QueryBuilder.forEach", err, sql, binds));
+                    void closed.then(() => reject(wrapped));
                 };
                 stream.on("data", (row: Record<string, unknown>) => {
                     if (done) return;
@@ -702,7 +731,7 @@ class QueryBuilder {
                     void pending.then(() => {
                         if (done) return;
                         done = true;
-                        resolve();
+                        void closed.then(() => resolve());
                     });
                 });
             });
@@ -731,6 +760,7 @@ class QueryBuilder {
         const decode = this._includes.length > 0 || !!this._json;
         const rows = async function* (this: QueryBuilder, conn: DbConnection) {
             const stream = conn.queryStream(sql, binds, { outFormat: this.db.oracledb.OUT_FORMAT_OBJECT });
+            const closed = streamClosed(stream); // see forEach: the connection waits for "close"
             try {
                 for await (const row of stream as AsyncIterable<Record<string, unknown>>) {
                     if (proj.isExclusion) for (const col of proj.excludedCols) delete row[col];
@@ -740,6 +770,7 @@ class QueryBuilder {
                 throw new Error(MSG.wrapError("QueryBuilder[Symbol.asyncIterator]", err, sql, binds));
             } finally {
                 stream.destroy();
+                await closed;
             }
         }.bind(this);
 

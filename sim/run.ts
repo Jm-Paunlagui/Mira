@@ -128,11 +128,25 @@ await sim.stage("18 operations", async () => {
 
 // ── Report ───────────────────────────────────────────────────────────────────
 const surface = report();
-const stages = sim.stageTimes.map(({ stage, ms }) => {
+const stages = sim.stageTimes.map(({ stage, ms, statements, dbMs }) => {
   const rs = sim.results.filter((r) => r.stage === stage);
-  return { stage, checks: rs.length, passed: rs.filter((r) => r.ok).length, failed: rs.filter((r) => !r.ok).length, seconds: +(ms / 1000).toFixed(1) };
+  return { stage, checks: rs.length, passed: rs.filter((r) => r.ok).length, failed: rs.filter((r) => !r.ok).length, seconds: +(ms / 1000).toFixed(2), statements, dbSeconds: +(dbMs / 1000).toFixed(2) };
 });
 console.table(stages);
+// Recorded with every run: coverage/sim-stages.json, and on CI the job summary. The sim is
+// deterministic, so a stage's statement count only moves when the code (or the stage) does.
+{
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const out = path.join(__dirname, "..", "coverage", "sim-stages.json");
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  const driver = (await import("../src/driver/oracle")).initDriver();
+  fs.writeFileSync(out, JSON.stringify({ at: new Date().toISOString(), driver: driver.mode, bun: Bun.version, platform: `${process.platform}-${process.arch}`, totalSeconds: +((performance.now() - t0) / 1000).toFixed(2), stages }, null, 2));
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    const rows = stages.map((s) => `| ${s.stage} | ${s.passed}/${s.checks} | ${s.seconds} | ${s.statements} | ${s.dbSeconds} |`);
+    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, [`### Simulation stages (${driver.mode} mode)`, "", "| Stage | Checks | Seconds | Statements | In statements (s) |", "| --- | ---: | ---: | ---: | ---: |", ...rows, ""].join("\n"));
+  }
+}
 
 const m = state.model;
 console.log(`  Trading day: ${m.orders.filter((o) => o.receipt !== 9999).length} sales completed, ${m.rejected.filter((r) => r.reason === "stock").length} refused for stock, ${m.rejected.filter((r) => r.reason === "credit").length} for credit; add-ons kept ${m.addOnsKept}, rolled back ${m.addOnsRolledBack}`);

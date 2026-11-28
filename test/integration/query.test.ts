@@ -258,6 +258,18 @@ describe("integration: transactions", () => {
   });
 });
 
+describe("integration: IN-list padding returns the same rows", () => {
+  it("$in / $nin with padded lists match an unpadded count for every length 1..40", async () => {
+    const all = (await users.find({}).project({ ID: 1 }).toArray()).map((r) => (r as { ID: number }).ID);
+    for (let n = 1; n <= Math.min(40, all.length + 5); n++) {
+      const ids = Array.from({ length: n }, (_, i) => all[i % all.length] ?? -i);
+      const expectIn = new Set(ids.filter((x) => all.includes(x))).size;
+      expect([n, await users.countDocuments({ ID: { $in: ids } })]).toEqual([n, expectIn]);
+      expect([n, await users.countDocuments({ ID: { $nin: ids } })]).toEqual([n, all.length - expectIn]);
+    }
+  });
+});
+
 describe("integration: fixed defects, proven live", () => {
   it("$in / $nin over 1,000 values use one collection bind — numbers, strings, dates", async () => {
     const ids = Array.from({ length: 3000 }, (_, i) => i + 1);
