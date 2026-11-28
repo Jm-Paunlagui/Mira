@@ -118,12 +118,16 @@ const show = (label: string, s: Stats) =>
   `${label}: opened=${s.open} sessCache=${s.cache} hard=${s.hard} total=${s.total} failed=${s.failed} vUser=${s.vUser} vOpen=${s.vOpen} vAll=${s.vAll}`;
 const log: string[] = [];
 
-/** Records every SQL text executed while `fn` runs. */
-async function capture<R>(fn: () => Promise<R>): Promise<[R, Set<string>]> {
+/** Records every SQL text executed while `fn` runs, and the texts that failed at execution. */
+async function capture<R>(fn: () => Promise<R>): Promise<[R, Set<string>, Set<string>]> {
   const texts = new Set<string>();
-  const stop = onQuery((e) => void texts.add(e.sql));
+  const failed = new Set<string>();
+  const stop = onQuery((e) => {
+    texts.add(e.sql);
+    if (e.error) failed.add(e.sql);
+  });
   try {
-    return [await fn(), texts];
+    return [await fn(), texts, failed];
   } finally {
     stop();
   }
@@ -378,15 +382,24 @@ describe("reliability/cursors: no server-side cursor leaks, a bounded statement 
       const [, warmTexts] = await capture(() => phase(1));
       const s0 = await stats(conn);
       const v0 = await sharedCursors(warmTexts);
-      const [errors, texts] = await capture(() => phase(50));
+      const [errors, texts, failedTexts] = await capture(() => phase(50));
       const s1 = await stats(conn);
       const v1 = await sharedCursors(warmTexts);
-      const newChildren = [...v0.keys()].filter((t) => v1.has(t) && v1.get(t)!.children > v0.get(t)!.children);
+      const grown = [...v0.keys()].filter((t) => v1.has(t) && v1.get(t)!.children > v0.get(t)!.children);
+      // Thick mode only: after a statement fails at execution (here the ORA-00001 insert), OCI
+      // binds its NUMBER with different flags on the next call (V$SQL_SHARED_CURSOR:
+      // BIND_MISMATCH, oacfl2 0x1000010 vs 0x1000000), so Oracle keeps a second child for it.
+      // Mira passes the same values both times; that one extra child is the client's. Any other
+      // growth (a statement that succeeded, or more than one extra child) is Mira's and fails.
+      const failedKeys = new Set([...failedTexts].map(sqlTextKey));
+      const clientChild = (t: string) => !db.oracledb.thin && failedKeys.has(t) && v1.get(t)!.children - v0.get(t)!.children === 1;
+      const newChildren = grown.filter((t) => !clientChild(t));
       log.push(show("streams/errors before", s0), show("streams/errors after ", s1), `streams/errors: 50 completed + 100 aborted streams, ${errors.length} failed statements, ${texts.size} executed texts`);
       m("cursors: opened cursors current, streams+errors delta", s1.open - s0.open, "count", "150 streams + 150 failures");
       m("cursors: V$OPEN_CURSOR client cursors, streams+errors delta", s1.vUser - s0.vUser, "count");
       m("cursors: hard parses, streams+errors", s1.hard - s0.hard, "count", "session-wide, includes the server's own reloads: recorded, not asserted");
       m("cursors: new child cursors for Mira's texts, streams+errors", newChildren.length, "count", "V$SQL");
+      m("cursors: extra child after an execution failure (Thick client), streams+errors", grown.length - newChildren.length, "count", "V$SQL BIND_MISMATCH");
       m("cursors: failed parses, streams+errors", s1.failed - s0.failed, "count", "ORA-00904 x 100");
 
       // Each consumer failure and each driver error really happened, 50 times each.
