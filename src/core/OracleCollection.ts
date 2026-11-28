@@ -131,25 +131,28 @@ function _deepClone(value: unknown): unknown {
     return out;
 }
 
-/**
- * WHERE clause that picks ONE matching row for updateOne / replaceOne /
- * deleteOne. An empty filter yields no WHERE from parseFilter, so appending
- * "AND ROWNUM = 1" would produce invalid SQL ("… t0  AND ROWNUM = 1").
- */
 /** Per pool and table: can a supplied ID be reported as stored? Cached briefly (see suppliedIdsAreFinal). */
 const _idsFinalCache = new Map<string, { at: number; ok: Promise<boolean> }>();
 /** How long a table's answer is reused. A trigger added by raw DDL is seen within this window. */
 const IDS_FINAL_TTL_MS = 60_000;
+
+/** Forgets the cached answers for one pool (its Mira instance closed; a new pool of that name may point elsewhere). */
+function forgetSuppliedIds(pool: string): void {
+    for (const key of _idsFinalCache.keys()) if (key.startsWith(`${pool}\u0000`)) _idsFinalCache.delete(key);
+}
 
 /**
  * insertMany's default RETURNING "ID" can be skipped only when the database is
  * certain to store exactly the ID each document supplied:
  *   - every document has an ID that is a safe integer (a string "5" would come
  *     back as the number 5; a fraction could be rounded by the column's scale);
- *   - the table is the session's own (USER_TABLES): a view, synonym or another
- *     schema's table falls back to RETURNING;
+ *   - the session writes to its own schema (CURRENT_SCHEMA = SESSION_USER, so an
+ *     unqualified name is the login user's table) and the table is in USER_TABLES:
+ *     a view, synonym or another schema's table falls back to RETURNING;
  *   - its ID column is NUMBER with no fractional scale;
- *   - no enabled trigger fires on INSERT (a BEFORE INSERT trigger may rewrite :NEW.ID).
+ *   - no enabled trigger on the table fires on INSERT, whoever owns the trigger
+ *     (ALL_TRIGGERS: a DBA or audit schema can own a trigger on our table, and a
+ *     BEFORE INSERT trigger may rewrite :NEW.ID).
  * Any doubt, including a failed dictionary read, keeps RETURNING. One dictionary
  * query per pool and table per minute; concurrent calls share it.
  */
@@ -160,14 +163,19 @@ async function suppliedIdsAreFinal(conn: DbConnection, pool: string, table: stri
     const hit = _idsFinalCache.get(key);
     if (hit && Date.now() - hit.at < IDS_FINAL_TTL_MS) return hit.ok;
     const ok = conn
-        .execute<{ DATA_TYPE: string; DATA_SCALE: number | null; TRG: number }>(
-            `SELECT c.DATA_TYPE, c.DATA_SCALE, (SELECT COUNT(*) FROM USER_TRIGGERS g WHERE g.TABLE_NAME = :t AND g.STATUS = 'ENABLED' AND g.TRIGGERING_EVENT LIKE '%INSERT%') AS TRG FROM USER_TAB_COLUMNS c JOIN USER_TABLES u ON u.TABLE_NAME = c.TABLE_NAME WHERE c.TABLE_NAME = :t AND c.COLUMN_NAME = 'ID'`,
+        .execute<{ DATA_TYPE: string; DATA_SCALE: number | null; TRG: number; SAME: number }>(
+            `SELECT c.DATA_TYPE, c.DATA_SCALE,
+                    (SELECT COUNT(*) FROM ALL_TRIGGERS g WHERE g.TABLE_OWNER = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AND g.TABLE_NAME = :t
+                        AND g.BASE_OBJECT_TYPE = 'TABLE' AND g.STATUS = 'ENABLED' AND g.TRIGGERING_EVENT LIKE '%INSERT%') AS TRG,
+                    CASE WHEN SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') = SYS_CONTEXT('USERENV', 'SESSION_USER') THEN 1 ELSE 0 END AS SAME
+               FROM USER_TAB_COLUMNS c JOIN USER_TABLES u ON u.TABLE_NAME = c.TABLE_NAME
+              WHERE c.TABLE_NAME = :t AND c.COLUMN_NAME = 'ID'`,
             { t: table },
             { outFormat },
         )
         .then((r) => {
             const row = r.rows?.[0];
-            return !!row && row.DATA_TYPE === "NUMBER" && !row.DATA_SCALE && Number(row.TRG) === 0;
+            return !!row && Number(row.SAME) === 1 && row.DATA_TYPE === "NUMBER" && !row.DATA_SCALE && Number(row.TRG) === 0;
         }, () => false);
     _idsFinalCache.set(key, { at: Date.now(), ok });
     return ok;
@@ -246,6 +254,11 @@ function _returnedRows(cols: string[], outBinds: unknown): Array<Record<string, 
     return Array.from({ length: n }, (_, i) => Object.fromEntries(cols.map((c, k) => [c, columns[k][i] ?? null])));
 }
 
+/**
+ * WHERE clause that picks ONE matching row for updateOne / replaceOne /
+ * deleteOne. An empty filter yields no WHERE from parseFilter, so appending
+ * "AND ROWNUM = 1" would produce invalid SQL ("… t0  AND ROWNUM = 1").
+ */
 function _firstRowWhere(whereClause: string): string {
     return whereClause ? `${whereClause} AND ROWNUM = 1` : "WHERE ROWNUM = 1";
 }
@@ -2399,4 +2412,4 @@ function _buildJoinOn(onSpec: JoinOn, targetTable: string): string {
         .join(" AND ");
 }
 
-export { OracleCollection };
+export { OracleCollection, forgetSuppliedIds };

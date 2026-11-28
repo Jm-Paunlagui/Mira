@@ -40,13 +40,27 @@ describe("chaos: database unreachable / misconfigured", () => {
   // left running, it retries (create → refuse → close) through every later test.
   afterAll(async () => { await config.closePool("chaos_badhost"); await config.closePool("chaos_badcreds"); });
 
-  it("dead host: bounded failure with a clear error; appDb unaffected", async () => {
+  it("dead host: a caller is not held for the whole creation (MIRA_POOL_OPENING at connectTimeout); the creation then fails with a clear error; appDb unaffected", async () => {
+    // A refused connect fails at once, so the creation lasts only its back-off: full jitter,
+    // random × (1 + 2 + 4) s. When that is still running at connectTimeout (2 s) the caller
+    // gets MIRA_POOL_OPENING then; when all 4 attempts end sooner, it gets the creation's own
+    // refusal. Which one is chance, so the outcome is checked against when it came. (The
+    // always-still-opening case is pinned down over a stalled link in network.test.ts.)
     const [err, ms] = await timeIt(() => config.withConnection("chaos_badhost", async () => 1).catch((e: Error) => e));
     expect(err).toBeInstanceOf(Error);
-    expect((err as Error).message).toMatch(/chaos_badhost/);
-    expect((err as Error).message).toMatch(/ECONNREFUSED|NJS-503|NJS-500|NJS-510|ORA-12541|DPI-|refused/i);
-    m("dead host time-to-error (4 create attempts + backoff)", ms, "ms");
-    expect(ms).toBeLessThan(20000);
+    const msg = (err as Error).message;
+    expect(msg).toMatch(/chaos_badhost/);
+    m("dead host: caller time-to-error (connectTimeout 2000)", ms, "ms");
+    expect(ms).toBeLessThan(3000);
+    if (msg.includes("[MIRA_POOL_OPENING]")) expect(ms).toBeGreaterThanOrEqual(1900);
+    else expect(msg).toMatch(/Could not create pool[\s\S]*(ECONNREFUSED|NJS-503|NJS-500|NJS-510|ORA-12541|DPI-|refused)/i);
+    // The creation itself ends with the refusal, named (what mira.open() and a later caller see).
+    const [res, openMs] = await timeIt(() => config.initializePools(["chaos_badhost"]));
+    expect(res[0].success).toBe(false);
+    expect(res[0].error).toMatch(/Could not create pool/);
+    expect(res[0].error).toMatch(/ECONNREFUSED|NJS-503|NJS-500|NJS-510|ORA-12541|DPI-|refused/i);
+    m("dead host: time to the end of the creation (4 create attempts + backoff)", ms + openMs, "ms");
+    expect(ms + openMs).toBeLessThan(20000);
     await appDbAlive();
   }, 30000);
 

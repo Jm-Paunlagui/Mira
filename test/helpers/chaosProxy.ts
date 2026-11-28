@@ -6,9 +6,15 @@
  *   pool config: { ...app, connectString: proxy.connectString }
  *   proxy.stall()    // packets stop flowing both ways; sockets stay open (a dropped link)
  *   proxy.resume()   // traffic flows again; buffered bytes are delivered in order
+ *   proxy.blackholeExisting() // only the connections open NOW go dead for good (resume() does not revive
+ *                    them); connections made afterwards flow normally — a link whose old sockets died
+ *                    without a reset while the database is reachable again on new ones
  *   proxy.reset()    // every open connection is cut (what a database restart looks like to a client)
  *   proxy.refuse(on) // new connections are refused / accepted again
  *   await proxy.close()
+ *
+ * A blackhole unpipes both directions before pausing, so pipe's drain handling can never resume the
+ * pair; bytes already buffered are never delivered and the socket is never closed, until reset() / close().
  *
  * A stall pauses both sockets, so the kernel buffers fill and the sender blocks,
  * like a link that drops packets: nothing errors until a timeout fires.
@@ -41,8 +47,11 @@ export type ChaosProxy = {
   port: number;
   /** Connections currently open through the proxy. */
   readonly open: number;
+  /** Connections made dead by blackholeExisting() and not yet closed. */
+  readonly blackholed: number;
   stall(): void;
   resume(): void;
+  blackholeExisting(): void;
   reset(): void;
   refuse(on: boolean): void;
   close(): Promise<void>;
@@ -50,7 +59,9 @@ export type ChaosProxy = {
 
 export async function startChaosProxy(connectString = process.env.MIRA_DB_CONNECT_STRING ?? ""): Promise<ChaosProxy> {
   const target = targetOf(connectString);
-  const pairs = new Set<{ a: net.Socket; b: net.Socket }>();
+  type Pair = { a: net.Socket; b: net.Socket };
+  const pairs = new Set<Pair>();
+  const blackholed = new Set<Pair>();
   let stalled = false;
   let refusing = false;
 
@@ -61,6 +72,7 @@ export async function startChaosProxy(connectString = process.env.MIRA_DB_CONNEC
     pairs.add(pair);
     const drop = () => {
       pairs.delete(pair);
+      blackholed.delete(pair);
       client.destroy();
       upstream.destroy();
     };
@@ -82,6 +94,9 @@ export async function startChaosProxy(connectString = process.env.MIRA_DB_CONNEC
     get open() {
       return pairs.size;
     },
+    get blackholed() {
+      return blackholed.size;
+    },
     stall() {
       stalled = true;
       for (const { a, b } of pairs) {
@@ -91,9 +106,19 @@ export async function startChaosProxy(connectString = process.env.MIRA_DB_CONNEC
     },
     resume() {
       stalled = false;
-      for (const { a, b } of pairs) {
-        a.resume();
-        b.resume();
+      for (const pair of pairs) {
+        if (blackholed.has(pair)) continue;
+        pair.a.resume();
+        pair.b.resume();
+      }
+    },
+    blackholeExisting() {
+      for (const pair of pairs) {
+        pair.a.unpipe(pair.b);
+        pair.b.unpipe(pair.a);
+        pair.a.pause();
+        pair.b.pause();
+        blackholed.add(pair);
       }
     },
     reset() {
@@ -102,6 +127,7 @@ export async function startChaosProxy(connectString = process.env.MIRA_DB_CONNEC
         b.destroy();
       }
       pairs.clear();
+      blackholed.clear();
     },
     refuse(on: boolean) {
       refusing = on;

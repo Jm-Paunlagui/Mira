@@ -210,7 +210,7 @@ describe("unit/errors: one-statement batches commit with the execute", () => {
 });
 
 describe("unit: insertMany reports supplied IDs only when the table cannot change them", () => {
-  const DICT = /USER_TRIGGERS/;
+  const DICT = /ALL_TRIGGERS/;
   /** A stub whose dictionary read returns `meta` (or throws), and whose inserts echo RETURNING outs. */
   const tableStub = (meta: unknown) => stubConn((sql, binds) => {
     if (DICT.test(sql)) {
@@ -224,7 +224,7 @@ describe("unit: insertMany reports supplied IDs only when the table cannot chang
   const sqls = (conn: ReturnType<typeof stubConn>) => conn.calls.map((c) => (DICT.test(c.sql) ? "dict" : /RETURNING/.test(c.sql) ? "insert+returning" : "insert"));
 
   it("own table, NUMBER ID, no INSERT trigger: the supplied IDs, no RETURNING, dictionary read once", async () => {
-    const conn = tableStub([{ DATA_TYPE: "NUMBER", DATA_SCALE: 0, TRG: 0 }]);
+    const conn = tableStub([{ DATA_TYPE: "NUMBER", DATA_SCALE: 0, TRG: 0, SAME: 1 }]);
     expect((await insert(conn, "T_IDS_OK", [{ ID: 1, A: 1 }, { ID: 2, A: 2 }])).insertedIds).toEqual([1, 2]);
     expect((await insert(conn, "T_IDS_OK", [{ ID: 3, A: 3 }])).returning).toEqual([{ ID: 3 }]);
     expect(sqls(conn)).toEqual(["dict", "insert", "insert"]);
@@ -232,9 +232,10 @@ describe("unit: insertMany reports supplied IDs only when the table cannot chang
 
   it("keeps RETURNING (the stored values) for a trigger, a scale, a missing table or a failed read", async () => {
     const cases: Array<[string, unknown]> = [
-      ["T_IDS_TRG", [{ DATA_TYPE: "NUMBER", DATA_SCALE: null, TRG: 1 }]],
-      ["T_IDS_DEC", [{ DATA_TYPE: "NUMBER", DATA_SCALE: 2, TRG: 0 }]],
-      ["T_IDS_RAW", [{ DATA_TYPE: "VARCHAR2", DATA_SCALE: null, TRG: 0 }]],
+      ["T_IDS_TRG", [{ DATA_TYPE: "NUMBER", DATA_SCALE: null, TRG: 1, SAME: 1 }]],
+      ["T_IDS_SCHEMA", [{ DATA_TYPE: "NUMBER", DATA_SCALE: 0, TRG: 0, SAME: 0 }]], // ALTER SESSION SET CURRENT_SCHEMA
+      ["T_IDS_DEC", [{ DATA_TYPE: "NUMBER", DATA_SCALE: 2, TRG: 0, SAME: 1 }]],
+      ["T_IDS_RAW", [{ DATA_TYPE: "VARCHAR2", DATA_SCALE: null, TRG: 0, SAME: 1 }]],
       ["T_IDS_VIEW", []],
       ["T_IDS_ERR", oraError(942)],
     ];
@@ -253,7 +254,7 @@ describe("unit: insertMany reports supplied IDs only when the table cannot chang
       ["OTHER.T_IDS_D", [{ ID: 1 }], undefined],
       ["T_IDS_E", [{ ID: 1 }], { returning: ["ID"] }],
     ] as Array<[string, Array<Record<string, unknown>>, object | undefined]>) {
-      const conn = tableStub([{ DATA_TYPE: "NUMBER", DATA_SCALE: 0, TRG: 0 }]);
+      const conn = tableStub([{ DATA_TYPE: "NUMBER", DATA_SCALE: 0, TRG: 0, SAME: 1 }]);
       await insert(conn, table, docs, opts);
       expect(sqls(conn)).toEqual(["insert+returning"]);
     }

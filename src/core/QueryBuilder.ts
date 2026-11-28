@@ -95,14 +95,15 @@ type QueryBuilderOptions = {
 };
 
 /**
- * The FOR UPDATE clause for a lock mode. Throws on an unknown mode so a typo
- * ("no wait") fails loudly instead of silently waiting forever. Column names
- * in `of` are quoted identifiers; `wait` must be a whole number of seconds.
- */
-/**
  * Resolves once a node-oracledb query stream has emitted "close" (its result set
  * is closed and the connection is free to go back to the pool). Call it right
  * after queryStream(), before any event can fire.
+ *
+ * Why this cannot hang on a link that stopped answering: when the pool sets
+ * callTimeout, the connection's guard (SessionGuard in driver/oracle.ts) bounds each
+ * fetch and the driver's close, destroys the stream with an error when one is cut,
+ * and finishes destroy() within callTimeout + 1 s. "close" is emitted either way.
+ * Without callTimeout nothing is bounded, as documented.
  */
 function streamClosed(stream: { once(event: "close", fn: () => void): unknown; closed?: boolean }): Promise<void> {
     return new Promise<void>((resolve) => {
@@ -111,6 +112,11 @@ function streamClosed(stream: { once(event: "close", fn: () => void): unknown; c
     });
 }
 
+/**
+ * The FOR UPDATE clause for a lock mode. Throws on an unknown mode so a typo
+ * ("no wait") fails loudly instead of silently waiting forever. Column names
+ * in `of` are quoted identifiers; `wait` must be a whole number of seconds.
+ */
 function _forUpdateClause(mode: unknown): string {
     if (mode === true) return " FOR UPDATE";
     if (mode === "nowait") return " FOR UPDATE NOWAIT";

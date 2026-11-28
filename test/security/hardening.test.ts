@@ -13,6 +13,13 @@ const fakeDb = { oracledb, withConnection: async (cb: (c: unknown) => unknown) =
 const nest = (depth: number, leaf: unknown = { A: 1 }) => { let v: unknown = leaf; for (let i = 0; i < depth; i++) v = { $and: [v] }; return v as Record<string, unknown>; };
 
 describe("security: DDL fragments (types, DEFAULT, CHECK)", () => {
+  it("national q-quoted literals (Nq'…') are refused like q'…', so they cannot hide a top-level comma", () => {
+    expect(sqlFragmentProblem("NUMBER DEFAULT Nq'{'}',EVIL NUMBER,Z NUMBER DEFAULT nq'{'}'")).toMatch(/q-quoted/);
+    expect(sqlFragmentProblem("VARCHAR2(9) DEFAULT nQ'[a,b]'")).toMatch(/q-quoted/);
+    expect(sqlFragmentProblem("NUMBER CHECK (COLUMNq > 0)")).toBeNull(); // a q inside a name is not a quote
+    expect(sqlFragmentProblem("VARCHAR2(9) DEFAULT 'q'")).toBeNull();
+  });
+
   it("sqlFragmentProblem accepts real types and expressions", () => {
     for (const ok of ["NUMBER", "NUMBER(19,4)", "VARCHAR2(100 CHAR)", "TIMESTAMP(6) WITH TIME ZONE", "INTERVAL DAY(2) TO SECOND(6)", "NUMBER GENERATED ALWAYS AS (DEBIT - CREDIT) VIRTUAL", "SYS.ODCIVARCHAR2LIST", "'open'", "SYSTIMESTAMP", "AGE > 0 AND AGE < 150", "STATUS IN ('a', 'b')", `"Weird Col" > 0`, "'it''s'", "NAME <> 'a--b;c/*d'"]) {
       expect([ok, sqlFragmentProblem(ok)]).toEqual([ok, null]);
@@ -120,6 +127,16 @@ describe("security: nesting depth (stack exhaustion)", () => {
     expect(() => parseFilter(f)).toThrow(/refers to itself/);
   });
 
+  it("a shallow value that reuses one sub-object at every level is refused, not walked exponentially", () => {
+    let shared: Record<string, unknown> = { A: 1 };
+    for (let i = 0; i < 40; i++) shared = { x: shared, y: shared }; // 2^40 paths, 41 levels
+    const start = performance.now();
+    expect(() => assertMaxDepth(shared, "t")).toThrow(/more than 100000 objects/);
+    expect(performance.now() - start).toBeLessThan(2000);
+    const wide = { $or: Array.from({ length: 5000 }, (_, i) => ({ ID: i })) };
+    expect(() => assertMaxDepth(wide, "t")).not.toThrow(); // a big real filter is fine
+  });
+
   it("assertMaxDepth treats class instances, Dates and Buffers as leaves", () => {
     const qb = new OracleCollection("T", fakeDb).find({});
     expect(() => assertMaxDepth({ A: { $in: [qb, new Date(), Buffer.from("x")] } }, "t", 4)).not.toThrow();
@@ -143,6 +160,21 @@ describe("security: inlined binds (CREATE VIEW / materialized view)", () => {
     expect(inlineBinds(`X = :a`, { a: "it's" }, "t")).toBe(`X = 'it''s'`);
     const r = renameBinds(`A = :a AND B = :p_a AND C = ':a' AND "x:a" = 1`, { a: 1, p_a: 2 }, "p_");
     expect(r).toEqual({ sql: `A = :p_a AND B = :p_p_a AND C = ':a' AND "x:a" = 1`, binds: { p_a: 1, p_p_a: 2 } });
+  });
+
+  it("a negative number is parenthesised, so a '-' before its placeholder cannot make a '--' comment", async () => {
+    const { inlineBinds } = await import("../../src/shared/utils");
+    expect(inlineBinds(`A = 10-:n AND T = :t`, { n: -5, t: 7 }, "t")).toBe(`A = 10-(-5) AND T = 7`);
+    expect(inlineBinds(`A = 10-:n`, { n: -0 }, "t")).toBe(`A = 10-(0)`);
+    expect(inlineBinds(`A = 10-:n`, { n: -5n }, "t")).toBe(`A = 10-(-5)`);
+    expect(inlineBinds(`A = :n`, { n: 5 }, "t")).toBe(`A = 5`);
+  });
+
+  it("placeholders inside comments and q-quoted literals are left alone", async () => {
+    const { inlineBinds, renameBinds } = await import("../../src/shared/utils");
+    const sql = `SELECT q'[:a]', Nq'{it's :a}', q'!:a!' FROM T -- don't touch :a\n WHERE /* it's :a */ X = :a`;
+    expect(inlineBinds(sql, { a: "v" }, "t")).toBe(`SELECT q'[:a]', Nq'{it's :a}', q'!:a!' FROM T -- don't touch :a\n WHERE /* it's :a */ X = 'v'`);
+    expect(renameBinds(sql, { a: 1 }, "p_").sql).toBe(`SELECT q'[:a]', Nq'{it's :a}', q'!:a!' FROM T -- don't touch :a\n WHERE /* it's :a */ X = :p_a`);
   });
 });
 

@@ -174,6 +174,8 @@ const oracleMongoWrapperMessages = {
     `[filterParser] $inSelect takes a query (collection.find(…).project(…)), a sql\`…\` statement or an array of values, not ${/^[aeiou]/.test(got) ? "an" : "a"} ${got}. A plain SQL string is no longer run: write it as sql\`SELECT … WHERE X = \${value}\`.`,
   UNTRUSTED_FILTER: (path: string, why: string) =>
     `[sanitizeFilter] ${path}: ${why}. Untrusted input may only give plain values (string, number, boolean, null, Date); build operators in code.`,
+  QUERY_TOO_LARGE: (where: string, max: number) =>
+    `[${where}] the query holds more than ${max} objects and arrays (a value reused under several keys is counted once per use).`,
   QUERY_TOO_DEEP: (where: string, max: number) =>
     `[${where}] The input is nested more than ${max} levels deep (or refers to itself). Flatten it, e.g. combine conditions in one $and / $or list.`,
   PIPELINE_OPERAND_INVALID: (val: unknown) =>
