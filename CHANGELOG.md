@@ -21,6 +21,14 @@ Theme: security hardening, then performance. A red-team pass (a new SQL-text fuz
 - **`insertMany()` skips `RETURNING` when it is certain of the IDs.** With the default options, if every document supplies a safe-integer `ID`, the table is in the session's schema, its `ID` is a `NUMBER` with no scale, and no enabled trigger fires on insert, the supplied IDs are reported and no `RETURNING` (one out-bind per row) is sent. Otherwise, including when the dictionary read fails, nothing changes. The check is one dictionary query per pool and table per minute. Default `insertMany` of 1,000 rows: 5.1 → 2.1 ms (2.74× → 1.11× the raw driver). A trigger that rewrites the ID keeps `RETURNING`, so the stored value is reported. An explicit `returning: ["ID"]` always reads back.
 - **`insertMany()` and `bulkUpdateByKeys()`: one round trip, less CPU.** A batch that is one statement (one column set, no `batchErrors`) and not inside a transaction now commits with the execute itself (`autoCommit`) instead of a separate `COMMIT`. A failed batch still commits nothing and is rolled back before the connection goes back to the pool. Binds are built in one pass per column, by position. Against the raw driver running the same SQL, `insertMany` of 1,000 rows went from 1.32× to 1.07×, and Mira's own CPU per 1,000 rows from 347 to 67 µs.
 
+### Reliability
+
+- **A database that stops answering no longer hangs Mira.** Found with a new TCP chaos proxy that stalls the link (packets stop, sockets stay open):
+  - **New pool option `callTimeout`** (ms, default 0 = no limit; env `<P>_CALL_TIMEOUT`). It is set on every borrowed connection. Mira also bounds each round trip in JS at `callTimeout` + 1 s, because in Thin mode the driver's own timeout sends a break and then waits forever on a dead link. A call that hits the bound fails, and its connection is dropped instead of reused. The old `POOL_DEFAULTS.callTimeout` (60 s) was never applied (the driver ignores it in `createPool`) and is removed.
+  - **New pool option `expireTime`** (minutes, default 0; env `<P>_EXPIRE_TIME`): keepalive probes, so a connection a firewall silently dropped is noticed.
+  - **Health checks are bounded** at `connectTimeout`. Before, a check on a stalled link never finished, so the circuit breaker never opened and callers kept piling on. Now the breaker opens about 5 s into a stall and closes within a second of recovery, with one `onChange` per transition.
+  - **Opening a pool is bounded** in Thick mode too (each step at twice `connectTimeout`). Thick mode does not apply `connectTimeout`, and a failed attempt's pool close is no longer awaited: queued behind hung native connects, it blocked every retry.
+
 ### Fixed
 
 - A `Buffer` or a ``sql`…` `` statement inside a filter kept its type: the filter-resolution step copied every object field by field.
@@ -37,6 +45,7 @@ Theme: security hardening, then performance. A red-team pass (a new SQL-text fuz
 - `test/security/fuzz.test.ts` takes about 60 call shapes covering every public builder and sends each through every mutation: each string, key and number replaced by 19 hostile payloads, in both string and `toString()` object form. A SQL lexer, which also reads inside `EXECUTE IMMEDIATE` strings, checks that no payload ever appears as bare SQL.
 - `test/security/hardening.test.ts`: a regression test for each fix above.
 - `test/performance/budgets.test.ts`: bounds that fail on a 2× regression on any machine. SQL-building cost is measured against a fixed calibration workload in the same run; statements per call are exact counts; overhead over the raw driver is a ratio of interleaved medians.
+- `test/chaos/network.test.ts` (with `test/helpers/chaosProxy.ts`): a stalled link, a database restart (every connection cut), a flapping link, `close()` with work and a stream in flight, and connections cut at random points in `withTransaction`, `bulkWrite` and `insertMany` (all or nothing). It needs no database privileges.
 - The simulation records each stage's time, statement count and time spent in statements (`coverage/sim-stages.json`, and the CI job summary).
 
 ## [3.0.0] — 2026-11-28

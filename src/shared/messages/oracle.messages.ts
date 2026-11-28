@@ -52,6 +52,12 @@ const oracleMessages = {
   SLOW_OP: (name: unknown, ms: unknown) => `Slow op on "${name}": ${ms}ms`,
   ACQUIRE_RETRY: (name: unknown, attempt: unknown, max: unknown, err: unknown) =>
     `Connection acquire failed on "${name}" (attempt ${attempt}/${max}), retrying: ${err}`,
+  POOL_OPEN_TIMED_OUT: (name: unknown, ms: unknown) =>
+    `Timed out opening pool "${name}" after ${ms} ms (the database did not answer).`,
+  HEALTH_CHECK_TIMED_OUT: (name: unknown, ms: unknown) =>
+    `Timed out checking pool "${name}" after ${ms} ms (the database did not answer).`,
+  CALL_TIMED_OUT: (name: unknown, ms: unknown) =>
+    `A call on "${name}" did not finish within ${ms} ms (the database stopped answering); the connection was dropped.`,
   ACQUIRE_ORPHAN_CLOSED: (name: unknown) =>
     `Discarded a connection from "${name}" that arrived after its acquire had already failed.`,
   ROLLBACK_FAILED: (name: unknown, err: unknown) => `Rollback failed on "${name}": ${err}`,

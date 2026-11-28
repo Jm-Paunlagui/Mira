@@ -94,9 +94,11 @@ process.on("SIGTERM", () => void mira.close());
 | `queueMax` | 40 | Most callers waiting for a connection; one more fails at once with NJS-076. `0` disables queuing. |
 | `queueTimeout` | 15000 | Milliseconds a caller waits in the queue (NJS-040). `0` waits forever. |
 | `poolTimeout` | 30 | Seconds an idle connection above `poolMin` stays open. `0` keeps it. |
-| `connectTimeout` | 15000 | Milliseconds to open one connection (Thin mode). |
+| `connectTimeout` | 15000 | Milliseconds to open one connection. Thin mode applies it in the driver; Mira also bounds opening a pool (each step at twice this) and every health check (at this), in both modes, so a database that stops answering cannot hold them forever. |
 | `poolPingInterval` | 30 | Seconds idle before a connection is pinged on checkout; negative never pings. |
 | `stmtCacheSize` | 50 | Statements cached per connection. |
+| `callTimeout` | 0 | Milliseconds one round trip (`execute`, `executeMany`, `commit`, `rollback`) may take, set on every borrowed connection. A call on a link that stopped answering then fails (DPI-1067, or Mira's own bound at `callTimeout` + 1 s, which Thin mode needs on a dead link) and its connection is dropped. `0`: no limit. Set it above your slowest legitimate statement. |
+| `expireTime` | 0 | Minutes between keepalive probes on open connections, so one a firewall silently dropped is noticed. `0`: none. |
 
 A config that cannot work throws one `MiraConfigError` listing every problem (`err.issues`), before anything connects. Unknown keys are refused, so a typo such as `poolmax` is not silently ignored. Messages name keys, never values. `defineConfig(config)` runs the same checks and returns the config frozen, for apps that build it in one place and use it in another.
 

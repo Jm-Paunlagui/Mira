@@ -896,3 +896,99 @@ describe("unit/adapter: session time zone per pooled session (3.0)", () => {
     });
   });
 });
+
+describe("unit/adapter: a database that stops answering (3.1)", () => {
+  let B: Adapter; // a fresh instance: earlier scenarios shut the shared one down
+  beforeAll(async () => { B = await loadAdapter(makeDriver()); });
+  afterAll(async () => { await B.closeAll(); });
+
+  /** A promise held open until release() — a native call on a stalled link. */
+  function hang<T>() {
+    let release!: (v: T) => void;
+    const p = new Promise<T>((r) => { release = r; });
+    return { p, release };
+  }
+
+  it("pool open is bounded at each step; whatever arrives late is closed", async () => {
+    timeScale = 0.01; // retry back-off 1–4 s → 10–40 ms
+    const pools: Array<ReturnType<typeof hang<void>>> = [];
+    let poolCloses = 0;
+    register("s_hang_create", { create: () => { const h = hang<void>(); pools.push(h); return h.p; }, close: async () => { poolCloses++; } }, { connectTimeout: 20 });
+    await expect(B.withConnection("s_hang_create", async () => 1)).rejects.toThrow(/Timed out opening pool "s_hang_create"/);
+    expect(pools.length).toBe(4); // every attempt timed out
+    for (const h of pools) h.release();
+    for (let i = 0; i < 50 && poolCloses < 4; i++) await wait(5);
+    expect(poolCloses).toBe(4); // each late pool is closed
+
+    const late = hang<StubConn>();
+    const closes: unknown[] = [];
+    let first = true;
+    register("s_hang_conn", {
+      getConnection: () => (first ? ((first = false), late.p) : Promise.resolve(conn({ ping: () => new Promise<void>(() => {}), close: async (o?: unknown) => void closes.push(o ?? "plain") } as never))),
+    }, { connectTimeout: 20 });
+    await expect(B.withConnection("s_hang_conn", async () => 1)).rejects.toThrow(/Timed out opening pool "s_hang_conn"/);
+    late.release(conn({ close: async () => void closes.push("late") } as never));
+    for (let i = 0; i < 50 && !closes.includes("late"); i++) await wait(5);
+    expect(closes).toContain("late"); // the late first connection is returned
+    expect(closes).toContainEqual({ drop: true }); // a connection whose ping hung is dropped
+    timeScale = 1;
+    await B.closePool("s_hang_create");
+    await B.closePool("s_hang_conn");
+  });
+
+  it("a health check on a stalled link fails within connectTimeout instead of hanging (getConnection or ping)", async () => {
+    let mode: "ok" | "acquire" | "ping" = "ok";
+    const late = hang<StubConn>();
+    const closes: unknown[] = [];
+    register("s_hang_check", {
+      getConnection: async () => {
+        if (mode === "acquire") return late.p;
+        return conn({ ping: () => (mode === "ping" ? new Promise<void>(() => {}) : Promise.resolve()), close: async (o?: unknown) => void closes.push(o ?? "plain") } as never);
+      },
+    }, { connectTimeout: 20 });
+    await B.withConnection("s_hang_check", async () => 1);
+    const checks: boolean[] = [];
+    const off = B.onPoolHealthCheck((c) => { if (c.name === "s_hang_check") checks.push(c.ok); });
+    for (const m of ["acquire", "ping"] as const) {
+      mode = m;
+      const before = checks.length;
+      B.nudgePoolHealth("s_hang_check");
+      for (let i = 0; i < 100 && checks.length === before; i++) await wait(10);
+      expect(checks.slice(before)).toEqual([false]);
+    }
+    off();
+    expect(closes).toContainEqual({ drop: true }); // the hung ping's connection is dropped
+    late.release(conn({ close: async () => void closes.push("late") } as never));
+    for (let i = 0; i < 50 && !closes.includes("late"); i++) await wait(5);
+    expect(closes).toContain("late");
+    mode = "ok";
+    await B.closePool("s_hang_check");
+  });
+
+  it("callTimeout: set on each borrowed connection, a hung call is cut off in JS and its connection dropped; methods are restored", async () => {
+    timeScale = 0.01; // the JS backstop (callTimeout + 1 s) → ~10 ms
+    const closes: unknown[] = [];
+    let hangNext = false;
+    const c = conn({
+      execute: async () => (hangNext ? new Promise(() => {}) : { rows: [] }),
+      close: async (o?: unknown) => void closes.push(o ?? "plain"),
+    } as never) as StubConn & { callTimeout?: number };
+    const ownExecute = c.execute;
+    register("s_calltimeout", { getConnection: async () => c }, { callTimeout: 50 });
+    expect(await B.withConnection("s_calltimeout", async (k: { callTimeout: number }) => k.callTimeout)).toBe(50);
+    expect(c.execute).toBe(ownExecute); // put back on release
+    expect(c.callTimeout).toBe(0);
+    hangNext = true;
+    await expect(B.withConnection("s_calltimeout", (k: StubConn) => k.execute("SELECT 1 FROM DUAL"))).rejects.toThrow(/did not finish within 1050 ms/);
+    expect(closes.at(-1)).toEqual({ drop: true });
+    hangNext = false;
+    // Other errors pass through unchanged and keep the connection.
+    const failing = conn({ execute: async () => { throw new Error("ORA-00942: no table"); }, close: async (o?: unknown) => void closes.push(o ?? "plain") } as never);
+    register("s_calltimeout2", { getConnection: async () => failing }, { callTimeout: 50 });
+    await expect(B.withConnection("s_calltimeout2", (k: StubConn) => k.execute("SELECT 1 FROM T"))).rejects.toThrow(/ORA-00942/);
+    expect(closes.at(-1)).toBe("plain");
+    timeScale = 1;
+    await B.closePool("s_calltimeout");
+    await B.closePool("s_calltimeout2");
+  });
+});

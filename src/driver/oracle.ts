@@ -233,11 +233,9 @@ const POOL_DEFAULTS = Object.freeze({
     queueTimeout: 15000,
     poolPingInterval: 30,
     connectTimeout: 15000,
-    // NOTE: node-oracledb 6.x ignores `callTimeout` in createPool() (it is a
-    // CONNECTION property only), so this value does NOT bound single calls. It
-    // is kept as documentation of intent; bound a single call per connection
-    // (conn.callTimeout) where a hard per-call limit is needed.
-    callTimeout: 60000,
+    // No callTimeout here: node-oracledb takes it per CONNECTION, not in createPool().
+    // A pool's `callTimeout` (default 0: no limit) is applied to each borrowed
+    // connection by withConnection; see _applySessionLimits.
     stmtCacheSize: 50,
     homogeneous: true,
     externalAuth: false,
@@ -419,11 +417,20 @@ class PoolHealthMonitor extends EventEmitter {
     async checkPool(name: string) {
         const meta = this._ensure(name);
         try {
-            const pool = await _getOrCreatePool(name);
-            let conn;
+            const pool: import("oracledb").Pool = await _getOrCreatePool(name);
+            // Bounded: on a stalled link getConnection / ping never return, and a
+            // check that never finishes never opens the breaker.
+            const checkMs = _connectTimeoutMs(getConnectionConfig(name) as unknown as Record<string, unknown>);
+            const timedOut = oracleMessages.HEALTH_CHECK_TIMED_OUT(name, checkMs);
+            let conn: import("oracledb").Connection | undefined;
             try {
-                conn = await pool.getConnection();
-                await conn.ping();
+                conn = await _bounded(pool.getConnection(), checkMs, timedOut, _closeConnQuietly);
+                await _bounded(conn.ping(), checkMs, timedOut);
+            } catch (err) {
+                // A connection whose ping hung is dropped, not returned to the pool.
+                if (conn) _dropConnQuietly(conn);
+                conn = undefined;
+                throw err;
             } finally {
                 // Release on every path: a ping that rejects (half-dead network)
                 // must not leave the connection checked out, one leak per tick.
@@ -593,7 +600,94 @@ healthMonitor.start();
  * nudge the health monitor; an ORA-00942 says nothing about connectivity.
  */
 const CONNECTIVITY_ERROR_RE =
-    /ORA-(12541|12514|12170|12537|12547|12560|03113|03114|03135|12528|01033|01034|01089)|NJS-(500|501|503|510|521)|DPI-1080|Timed out getting connection/;
+    /ORA-(12541|12514|12170|12537|12547|12560|03113|03114|03135|12528|01033|01034|01089)|NJS-(500|501|503|510|521)|DPI-1080|DPI-1067|NJS-123|Timed out (getting connection|opening pool|checking pool)|did not finish within/;
+
+/**
+ * Races `work` against a timer. On timeout it rejects with `message`; whatever
+ * `work` resolves to later is handed to `onLate` (to close a pool or a connection
+ * nobody holds any more), and a later rejection is swallowed. The losing native
+ * call is not cancelled: it ends when the driver gives up on it.
+ */
+async function _bounded<T>(work: Promise<T>, ms: number, message: string, onLate?: (value: T) => unknown): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    try {
+        return await Promise.race([
+            work,
+            new Promise<never>((_, reject) => {
+                timer = setTimeout(() => {
+                    timedOut = true;
+                    reject(new Error(message));
+                }, ms);
+            }),
+        ]);
+    } finally {
+        clearTimeout(timer);
+        if (timedOut) work.then((v) => onLate?.(v), _ignore);
+    }
+}
+
+/** Swallows a rejection nobody waits for (a background close). */
+function _ignore(): void {}
+/** Closes a pool that arrived after nobody wanted it, without waiting. */
+function _closePoolQuietly(pool: import("oracledb").Pool): void {
+    pool.close(0).catch(_ignore);
+}
+/** Returns a connection that arrived after nobody wanted it, without waiting. */
+function _closeConnQuietly(conn: import("oracledb").Connection): void {
+    conn.close().catch(_ignore);
+}
+/** Drops a connection whose round trip hung, without waiting (the close may never finish). */
+function _dropConnQuietly(conn: import("oracledb").Connection): void {
+    conn.close({ drop: true }).catch(_ignore);
+}
+
+/** Connection methods that make a round trip and are bounded by a pool's callTimeout. */
+const BOUNDED_CALLS = ["execute", "executeMany", "commit", "rollback"] as const;
+
+/**
+ * Applies the pool's callTimeout to a connection just borrowed: the driver's
+ * conn.callTimeout, plus a backstop in JS (callTimeout + 1 s) on each round-trip
+ * method. The backstop is what bounds Thin mode on a link that stopped answering:
+ * there the driver's timeout sends a break and then waits for its reply forever.
+ * A call that hits the backstop marks the connection dead, so it is dropped
+ * instead of going back to the pool. `release()` removes the wrappers.
+ * Without a callTimeout this does nothing.
+ */
+function _applySessionLimits(name: string, conn: import("oracledb").Connection, cfg: Record<string, unknown>): { dead(): boolean; release(): void } {
+    const callTimeout = cfg.callTimeout;
+    if (typeof callTimeout !== "number" || callTimeout <= 0) return { dead: () => false, release: () => {} };
+    conn.callTimeout = callTimeout;
+    const limit = callTimeout + 1000;
+    let dead = false;
+    const target = conn as unknown as Record<string, unknown>;
+    // What to put back on release: an own property (a wrapped or plain-object
+    // connection) is restored; a prototype method is uncovered by deleting ours.
+    const saved = BOUNDED_CALLS.map((m) => ({ m, own: Object.prototype.hasOwnProperty.call(target, m), value: target[m] }));
+    for (const m of BOUNDED_CALLS) {
+        const original = target[m] as (...a: unknown[]) => Promise<unknown>;
+        target[m] = (...args: unknown[]) =>
+            _bounded(original.apply(conn, args), limit, oracleMessages.CALL_TIMED_OUT(name, limit)).catch((err: Error) => {
+                if (err.message.includes("did not finish within")) dead = true;
+                throw err;
+            });
+    }
+    return {
+        dead: () => dead,
+        release: () => {
+            for (const { m, own, value } of saved) {
+                if (own) target[m] = value;
+                else delete target[m];
+            }
+        },
+    };
+}
+
+/** A pool's connectTimeout in ms, from the registry (the live pool object does not expose it). */
+function _connectTimeoutMs(cfg: Record<string, unknown>): number {
+    const v = cfg.connectTimeout;
+    return typeof v === "number" && v > 0 ? v : POOL_DEFAULTS.connectTimeout;
+}
 
 // ── Pool lifecycle ────────────────────────────────────────────────────────────
 
@@ -660,6 +754,8 @@ async function _createPool(name: string, dbConfig: import("oracledb").PoolAttrib
     };
     // App config is ms; the driver wants seconds (the acquire race elsewhere stays ms).
     config.connectTimeout = toDriverConnectTimeoutSec(config.connectTimeout);
+    // A per-connection setting (applied on every checkout), not a pool attribute.
+    delete (config as Record<string, unknown>).callTimeout;
 
     // Safe log — no credentials
     const logSafe = { ...config };
@@ -667,25 +763,32 @@ async function _createPool(name: string, dbConfig: import("oracledb").PoolAttrib
     delete logSafe.user;
     log().info(`Creating pool "${name}"…`);
 
+    // Opening is bounded in JS as well as by the driver: Thick mode does not apply
+    // connectTimeout, so a database that accepts the TCP connection and then stops
+    // answering (a stalled link) would hold createPool() / the first connection forever.
+    // Each step gets twice the connect timeout; a step that finishes late is closed.
+    const openMs = 2 * _connectTimeoutMs(dbConfig as Record<string, unknown>);
+    const timedOut = oracleMessages.POOL_OPEN_TIMED_OUT(name, openMs);
     let pool;
     try {
-        pool = await oracledb.createPool(config);
-        const conn = await pool.getConnection();
-        await conn.ping();
+        pool = await _bounded(oracledb.createPool(config), openMs, timedOut, _closePoolQuietly);
+        const conn = await _bounded(pool.getConnection(), openMs, timedOut, _closeConnQuietly);
+        try {
+            await _bounded(conn.ping(), openMs, timedOut);
+        } catch (err) {
+            _dropConnQuietly(conn);
+            throw err;
+        }
         await conn.close();
 
         log().notice(oracleMessages.POOL_READY(name, pool));
         _warnIfThreadPoolTooSmall(name, pool.poolMax);
         return pool;
     } catch (err) {
-        // Destroy the partially-created pool so the alias is freed for retries
-        if (pool) {
-            try {
-                await pool.close(0);
-            } catch (_) {
-                /* ignore close errors */
-            }
-        }
+        // Destroy the partially-created pool. Not awaited: each attempt has its own
+        // alias, and in Thick mode a close queued behind hung native connects (a
+        // stalled link holds libuv's worker threads) would block the retry forever.
+        if (pool) _closePoolQuietly(pool);
 
         // A pool closed while it was being created does not retry: close() waits on this promise.
         if (_generationOf(name) !== generation) throw new Error(oracleMessages.POOL_CLOSED_DURING_CREATE(name));
@@ -936,9 +1039,11 @@ async function withConnection<T>(connectionName: string, callback: (conn: import
     const pool = await _getOrCreatePool(connectionName);
     const start = Date.now();
     let conn;
+    let limits: ReturnType<typeof _applySessionLimits> | undefined;
 
     try {
         conn = await _acquireConnection(connectionName, pool);
+        limits = _applySessionLimits(connectionName, conn, getConnectionConfig(connectionName) as unknown as Record<string, unknown>);
 
         const result = await callback(conn);
         const elapsed = Date.now() - start;
@@ -986,14 +1091,18 @@ async function withConnection<T>(connectionName: string, callback: (conn: import
             // NJS-500 / ORA-03156), the reset itself throws DPI-1010. That must
             // neither replace the caller's error nor skip the release: the
             // connection is dropped from the pool instead of returned to it.
-            let dead = false;
+            limits?.release();
+            let dead = limits?.dead() ?? false;
             try {
                 if (conn.callTimeout) conn.callTimeout = 0;
             } catch {
                 dead = true;
             }
             try {
-                await (dead ? conn.close({ drop: true }) : conn.close());
+                // A connection whose call hung is dropped without waiting: its
+                // round trip may never finish, and the caller already has its error.
+                if (limits?.dead()) _dropConnQuietly(conn);
+                else await (dead ? conn.close({ drop: true }) : conn.close());
             } catch (e) {
                 log().warning(
                     oracleMessages.CLOSE_FAILED(connectionName, e.message),
