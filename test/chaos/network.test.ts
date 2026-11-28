@@ -157,8 +157,8 @@ describe("chaos: a stalled network link", () => {
       const open = await settle(mira.collection(T).countDocuments());
       expect(open.message).toMatch(/NJS-503/);
     } finally {
-      proxy.resume();
       proxy.reset();
+      proxy.resume();
     }
     // The link is back: the pool opens (a check does it), the breaker half-opens and closes.
     for (let i = 0; i < 160 && !mira.health.isHealthy(); i++) await sleep(250);
@@ -178,8 +178,8 @@ describe("chaos: a stalled network link", () => {
       expect(res.success).toBe(false);
       expect(res.error).toMatch(/Could not create pool/);
     } finally {
-      proxy.resume();
       proxy.reset();
+      proxy.resume();
     }
   }, 120000);
 });
@@ -339,10 +339,12 @@ describe("chaos: calls and streams on a connection whose link stops answering (t
       expect(read.outcome).toBe("error");
       expect((read.error as MiraDbError).outcomeUnknown).toBe(false);
     } finally {
-      proxy.resume();
+      // Cut first, then let traffic flow: resume() delivers what the stall buffered, in order, so
+      // resuming first could still hand the INSERT to the database (it did on CI) before the cut.
       proxy.reset();
+      proxy.resume();
     }
-    expect(await coll(T).countDocuments({ ID: 7001 })).toBe(0); // the packets never left: nothing was written
+    expect(await coll(T).countDocuments({ ID: 7001 })).toBe(0); // the buffered packets were dropped: nothing was written
   }, 60000);
 
   it("a stream whose link goes dead ends with an error inside callTimeout + 2.5 s, and the next call works (forEach, for await, raw)", async () => {
