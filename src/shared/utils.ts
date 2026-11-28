@@ -160,6 +160,65 @@ function mergeBinds(a: Record<string, unknown>, b: Record<string, unknown>): Rec
 }
 
 // ─── renameBinds ────────────────────────────────────────────────
+/** The closing delimiter of a q-quoted literal opened with `open` (q'[…]', q'{…}', q'(…)', q'<…>', q'!…!'). */
+const Q_CLOSE: Readonly<Record<string, string>> = { "[": "]", "{": "}", "(": ")", "<": ">" };
+/** Characters a bind name may continue with after its first letter or underscore. */
+const BIND_NAME_REST = /[A-Za-z0-9_$#]/;
+/** A character a bind name may start with. */
+const BIND_NAME_START = /[A-Za-z_]/;
+
+/**
+ * Rewrites the bind placeholders (`:name`) of `sql` in ONE left-to-right pass, skipping
+ * q-quoted literals (q'[…]', nq'{…}', q'!…!'), 'string literals', "quoted identifiers",
+ * -- line comments and block comments, so a placeholder written inside them is left as
+ * text and a value is never spliced there. `replace` returns the new text for a name, or
+ * undefined to keep it.
+ *
+ * Linear in the length of `sql`: every character is looked at a bounded number of times.
+ * (A regular expression for the same tokens was polynomial: an unterminated q-quote made
+ * it rescan the rest of the text from every later "nq'[".) Text after a quote or comment
+ * that never closes is invalid SQL; it is kept as it is, with nothing filled in.
+ */
+function rewriteBinds(sql: string, replace: (name: string) => string | undefined): string {
+  let out = "";
+  let i = 0;
+  const n = sql.length;
+  // Copies sql[i, end) unchanged and moves past it; end -1 means "to the end of the text".
+  const skipTo = (end: number) => {
+    const stop = end < 0 ? n : end;
+    out += sql.slice(i, stop);
+    i = stop;
+  };
+  while (i < n) {
+    const c = sql[i];
+    const next = sql[i + 1];
+    if ((c === "q" || c === "Q") && next === "'" && i + 2 < n && !/\s/.test(sql[i + 2])) {
+      const close = (Q_CLOSE[sql[i + 2]] ?? sql[i + 2]) + "'";
+      const at = sql.indexOf(close, i + 3);
+      skipTo(at < 0 ? -1 : at + 2);
+    } else if (c === "'" || c === '"') {
+      let j = i + 1;
+      while (j < n && !(sql[j] === c && sql[j + 1] !== c)) j += sql[j] === c ? 2 : 1;
+      skipTo(j < n ? j + 1 : -1);
+    } else if (c === "-" && next === "-") {
+      skipTo(sql.indexOf("\n", i));
+    } else if (c === "/" && next === "*") {
+      const at = sql.indexOf("*/", i + 2);
+      skipTo(at < 0 ? -1 : at + 2);
+    } else if (c === ":" && next !== undefined && BIND_NAME_START.test(next)) {
+      let j = i + 2;
+      while (j < n && BIND_NAME_REST.test(sql[j])) j++;
+      const name = sql.slice(i + 1, j);
+      out += replace(name) ?? sql.slice(i, j);
+      i = j;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
 /**
  * Gives every bind of a sub-statement a prefix, in its SQL and its bind object.
  *
@@ -173,23 +232,12 @@ function mergeBinds(a: Record<string, unknown>, b: Record<string, unknown>): Rec
  *   renameBinds('"A" = :where_A_0', { where_A_0: 1 }, "sq0_")
  *   // → { sql: '"A" = :sq0_where_A_0', binds: { sq0_where_A_0: 1 } }
  */
-/**
- * One token of SQL text, for the one-pass bind rewriters below: a q-quoted literal
- * (q'[…]', nq'{…}', q'!…!'), a 'string literal', a "quoted identifier", a -- line or
- * block comment, or a bind name (group 2). Literals and comments are skipped, so a
- * placeholder written inside them is left as text and a value is never spliced there.
- */
-const SQL_TOKEN_RE =
-  /[nN]?[qQ]'(?:\[[\s\S]*?\]|\{[\s\S]*?\}|\([\s\S]*?\)|<[\s\S]*?>|([^\s([{<])[\s\S]*?\1)'|'(?:[^']|'')*'|"(?:[^"]|"")*"|--[^\n]*|\/\*[\s\S]*?\*\/|:([A-Za-z_][A-Za-z0-9_$#]*)/g;
-
 function renameBinds(sql: string, binds: Record<string, unknown>, prefix: string): { sql: string; binds: Record<string, unknown> } {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(binds)) out[`${prefix}${k}`] = v;
   // One pass, skipping quoted text, so a renamed placeholder is never renamed again
   // (binds "A" and "p_A" with prefix "p_") and a quoted name or literal is left alone.
-  const renamed = sql.replace(SQL_TOKEN_RE, (m, _q?: string, name?: string) =>
-    name !== undefined && Object.prototype.hasOwnProperty.call(binds, name) ? `:${prefix}${name}` : m,
-  );
+  const renamed = rewriteBinds(sql, (name) => (Object.prototype.hasOwnProperty.call(binds, name) ? `:${prefix}${name}` : undefined));
   return { sql: renamed, binds: out };
 }
 
@@ -220,9 +268,7 @@ function inlineBinds(sql: string, binds: Record<string, unknown>, where: string)
   // One pass over the SQL, skipping 'literals' and "identifiers". Replacing bind by
   // bind (2.x–3.0.0) re-scanned literals already inlined: a value containing the text
   // ":where_B_1" pulled the next value into it and broke out of the quotes.
-  return sql.replace(SQL_TOKEN_RE, (m, _q?: string, name?: string) =>
-    name !== undefined && literals.has(name) ? literals.get(name)! : m,
-  );
+  return rewriteBinds(sql, (name) => literals.get(name));
 }
 
 // ─── buildOrderBy ───────────────────────────────────────────────

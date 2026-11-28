@@ -226,3 +226,28 @@ describe("security: connect-string validation is linear (no ReDoS)", () => {
     expect(performance.now() - start).toBeLessThan(200);
   });
 });
+
+describe("security: the bind rewriters are linear (no ReDoS)", () => {
+  it("unterminated q-quotes, strings and comments repeated 50,000 times are rewritten quickly", async () => {
+    const { inlineBinds, renameBinds } = await import("../../src/shared/utils");
+    const hostile = ["Q'[" + "nq'[".repeat(50_000), "Q'!" + "nq'!".repeat(50_000), "'" + "x'' ".repeat(50_000), "/*" + "nq'(".repeat(50_000), ":a " + "nq'<".repeat(50_000)];
+    const start = performance.now();
+    for (const sql of hostile) {
+      expect(inlineBinds(sql, { a: 1 }, "t").length).toBeGreaterThanOrEqual(sql.length - 2);
+      expect(renameBinds(sql, { a: 1 }, "p_").sql.length).toBeGreaterThanOrEqual(sql.length);
+    }
+    expect(performance.now() - start).toBeLessThan(200);
+  });
+
+  it("tokens: what is skipped stays as written; text after a quote or comment that never closes is left unfilled", async () => {
+    const { inlineBinds } = await import("../../src/shared/utils");
+    const b = { a: 1, b: 2 };
+    expect(inlineBinds(`q'[:a]' || Nq'{:a}' || q'(:a)' || q'<:a>' || q'!:a!' || :b`, b, "t")).toBe(`q'[:a]' || Nq'{:a}' || q'(:a)' || q'<:a>' || q'!:a!' || 2`);
+    expect(inlineBinds(`q' :a'`, b, "t")).toBe(`q' :a'`); // whitespace is no q delimiter: an ordinary 'string'
+    expect(inlineBinds(`'it''s :a' || :a`, b, "t")).toBe(`'it''s :a' || 1`);
+    expect(inlineBinds(`"x"":a" || :a -- :a\n:b /* :a */ :a`, b, "t")).toBe(`"x"":a" || 1 -- :a\n2 /* :a */ 1`);
+    expect(inlineBinds(`:a -- :b`, b, "t")).toBe(`1 -- :b`); // a line comment at the very end
+    for (const open of [`q'[ :a`, `' :a`, `" :a`, `/* :a`]) expect(inlineBinds(`:b ${open}`, b, "t")).toBe(`2 ${open}`);
+    expect(inlineBinds(`:1 :_x : :a`, { _x: 3, a: 1 }, "t")).toBe(`:1 3 : 1`); // a name starts with a letter or _
+  });
+});
