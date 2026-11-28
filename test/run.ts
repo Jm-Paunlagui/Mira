@@ -24,21 +24,39 @@ const runId = `${new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14)}_${
 fs.mkdirSync(path.dirname(junit), { recursive: true });
 fs.rmSync(junit, { force: true });
 
-const child = Bun.spawn(["bun", "test", "--timeout", "180000", "--reporter=junit", `--reporter-outfile=${junit}`, ...process.argv.slice(2)], {
-  cwd: root,
-  stdio: ["inherit", "inherit", "inherit"],
-  env: { ...process.env, MIRA_RUN_ID: runId },
-});
-const code = await child.exited;
+// macOS + Thick mode: Bun 1.4.5 intermittently segfaults when the whole suite runs in one
+// process (see docs/ROADMAP-3.1.md, Reliability). Unless coverage or a file filter is asked
+// for, the chaos suite then runs in a second process. MIRA_TEST_SPLIT=1 / 0 forces it on / off.
+const args = process.argv.slice(2);
+const wantsSplit = process.env.MIRA_TEST_SPLIT
+  ? process.env.MIRA_TEST_SPLIT === "1"
+  : process.platform === "darwin" && process.env.MIRA_DRIVER_MODE === "thick" && !args.some((a) => !a.startsWith("-") || a === "--coverage");
+const runs: string[][] = wantsSplit
+  ? [["./test/unit", "./test/integration", "./test/performance", "./test/reliability", "./test/security", ...args], ["./test/chaos", ...args]]
+  : [args];
+if (wantsSplit) console.log("Thick mode on macOS: the chaos suite runs in its own process (MIRA_TEST_SPLIT=0 to run everything in one).");
 
-if (!fs.existsSync(junit)) {
-  console.error("No JUnit report produced.");
-  process.exit(code || 1);
+const reports: string[] = [];
+let code = 0;
+for (const [i, runArgs] of runs.entries()) {
+  const out = runs.length === 1 ? junit : junit.replace(/\.xml$/, `.${i + 1}.xml`);
+  fs.rmSync(out, { force: true });
+  const child = Bun.spawn(["bun", "test", "--timeout", "180000", "--reporter=junit", `--reporter-outfile=${out}`, ...runArgs], {
+    cwd: root,
+    stdio: ["inherit", "inherit", "inherit"],
+    env: { ...process.env, MIRA_RUN_ID: runId },
+  });
+  code ||= await child.exited;
+  if (!fs.existsSync(out)) {
+    console.error("No JUnit report produced.");
+    process.exit(code || 1);
+  }
+  reports.push(out);
 }
 
 type Row = { category: string; suite: string; title: string; state: "passed" | "failed" | "skipped"; ms: number; error: string | null; known: boolean };
 const unescape = (s: string) => s.replace(/&#10;/g, "\n").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
-const xml = fs.readFileSync(junit, "utf8");
+const xml = reports.map((f) => fs.readFileSync(f, "utf8")).join("\n");
 const rows: Row[] = [];
 const re = /<testcase name="([^"]*)" classname="([^"]*)" time="([^"]*)" file="([^"]*)"[^>]*?(\/>|>([\s\S]*?)<\/testcase>)/g;
 for (const mt of xml.matchAll(re)) {

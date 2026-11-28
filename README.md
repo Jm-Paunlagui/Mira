@@ -1831,7 +1831,7 @@ bun run test:coverage   # + coverage (threshold 100% lines and functions for eve
 bun run test:unit       # or :integration / :performance / :chaos / :security / :reliability
 ```
 
-**Database prerequisites.** The schema user needs `CREATE TABLE`, `CREATE VIEW`, `CREATE SEQUENCE`, `CREATE SYNONYM`, `CREATE MATERIALIZED VIEW`, `CREATE TRIGGER` (one integration test) and a tablespace quota (`ALTER USER <user> QUOTA UNLIMITED ON USERS;`). Every suite creates its own `MIRA_<suite>_*` tables and drops them afterwards.
+**Database prerequisites.** The schema user needs `CREATE TABLE`, `CREATE VIEW`, `CREATE SEQUENCE`, `CREATE SYNONYM`, `CREATE MATERIALIZED VIEW`, `CREATE TRIGGER` (one integration test), `SELECT` on `V_$OPEN_CURSOR`, `V_$MYSTAT` and `V_$STATNAME` (the reliability suite's leak checks) and a tablespace quota (`ALTER USER <user> QUOTA UNLIMITED ON USERS;`). Every suite creates its own `MIRA_<suite>_*` tables and drops them afterwards.
 
 **Results.** The runner prints a scorecard per category. Tests named `DEFECT:` / `SECURITY:` assert the *fixed* behaviour of a known open issue and are reported separately from unexpected failures. Each run is stored under one `RUN_ID` in two tables that are kept between runs: `MIRA_TEST_RESULTS` (one row per test) and `MIRA_TEST_METRICS` (latencies, throughput, counts). Set `MIRA_SKIP_PERSIST=1` to skip writing them; performance budgets can be tightened with `MIRA_PERF_*` env vars (see `test/performance/perf.test.ts`).
 
