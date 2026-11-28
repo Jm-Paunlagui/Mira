@@ -30,10 +30,16 @@ beforeAll(async () => {
 });
 afterAll(async () => {
   await dropIfExists(A);
-  for (const k of Object.keys(conns)) if (k.startsWith("chaos_")) delete conns[k];
+  // Close the injected pools before forgetting their configs: a failed pool left in the
+  // registry is re-created by the health monitor for the rest of the process.
+  for (const k of Object.keys(conns)) if (k.startsWith("chaos_")) { await config.closePool(k); delete conns[k]; }
 });
 
 describe("chaos: database unreachable / misconfigured", () => {
+  // Stop the dead pool's background re-creation as soon as these tests are done:
+  // left running, it retries (create → refuse → close) through every later test.
+  afterAll(async () => { await config.closePool("chaos_badhost"); await config.closePool("chaos_badcreds"); });
+
   it("dead host: bounded failure with a clear error; appDb unaffected", async () => {
     const [err, ms] = await timeIt(() => config.withConnection("chaos_badhost", async () => 1).catch((e: Error) => e));
     expect(err).toBeInstanceOf(Error);

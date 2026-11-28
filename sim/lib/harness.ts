@@ -8,18 +8,27 @@
  * query builders being checked).
  */
 import { isDeepStrictEqual, inspect } from "node:util";
+// Straight from src (not through the tracker): counting statements is the harness's job, not API use.
+import { onQuery } from "../../src/core/events";
 
 type Result = { stage: string; label: string; ok: boolean; detail?: string };
 
 export class Sim {
   results: Result[] = [];
-  stageTimes: { stage: string; ms: number; error?: string }[] = [];
+  /** Per stage: wall time, statements sent (every execute / executeMany) and the time spent in them. */
+  stageTimes: { stage: string; ms: number; statements: number; dbMs: number; error?: string }[] = [];
   private current = "";
 
   async stage(name: string, fn: () => Promise<void>): Promise<void> {
     this.current = name;
     const t0 = performance.now();
     let error: string | undefined;
+    let statements = 0;
+    let dbMs = 0;
+    const stop = onQuery((e) => {
+      statements++;
+      dbMs += e.durationMs;
+    });
     try {
       await fn();
     } catch (e) {
@@ -27,7 +36,8 @@ export class Sim {
       error = (e as Error).stack?.split("\n").slice(0, 4).join("\n") ?? String(e);
       this.results.push({ stage: name, label: "stage completed without an uncaught error", ok: false, detail: error });
     }
-    this.stageTimes.push({ stage: name, ms: performance.now() - t0, error });
+    stop();
+    this.stageTimes.push({ stage: name, ms: performance.now() - t0, statements, dbMs, error });
   }
 
   ok(label: string, cond: boolean, detail?: unknown): void {

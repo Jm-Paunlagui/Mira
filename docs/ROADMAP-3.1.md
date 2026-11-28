@@ -1,13 +1,13 @@
 # Mira 3.1.0: security, performance, chaos, reliability
 
-**Status:** security done (`05515d0`); performance in progress (baseline and IN-list padding done); chaos and reliability next · **Base:** v3.0.0 · **Branch:** `security/hardening`
+**Status:** security done (`05515d0`); performance in progress (baseline, IN-list padding, budgets, `insertMany` round trip done); chaos and reliability next · **Base:** v3.0.0 · **Branch:** `security/hardening`
 
 3.1.0 works on four areas. Each one is done when its unit and integration tests pass, its own suite under `test/<area>/` passes, the sim's real-world stages pass, and CI is green across all four live jobs (Thin/Thick × failover/Easy Connect) plus the Windows job.
 
 | Area | Suite | Tests now | Status |
 | --- | --- | --- | --- |
 | Security | `test/security` | 97 | ✅ done: 9 holes closed (see CHANGELOG 3.1.0) |
-| Performance | `test/performance` | 10 (+4 unit, +1 integration) | 🔶 baseline recorded; IN-list padding landed; budgets next |
+| Performance | `test/performance` | 41 (+8 unit, +2 integration) | 🔶 budgets in CI; hot-path review partly done |
 | Chaos | `test/chaos` | 17 | ⏳ evaluate: add failure modes not yet covered |
 | Reliability | `test/reliability` | 12 | ⏳ evaluate: longer soak, leak and drift checks |
 
@@ -47,14 +47,25 @@ Goal: know what each common call costs, make the hot paths cheaper, and fail CI 
 - [x] **SQL build cost without a database** (µs per call, v3.0.0 → 3.1.0): typical `parseFilter` 1.00 → 1.20, `find().sort().limit()` 1.22 → 1.49, 6-stage pipeline 5.09 → 5.14, `$in` 5,000 values 8.4 → 12.3. The security guards (depth walk) cost about 0.2 µs per query, against about 150 µs per round trip. The walk was rewritten with two flat stacks (`$in` 5k: 17.6 → 12.3 µs).
 - [x] **IN-list padding.** `$in`/`$nin` lists of up to 1,000 values are sent at power-of-two lengths (repeating the last value), so lengths 1–1,000 map to 11 SQL texts and Oracle reuses the cursor instead of hard-parsing each length. Measured on 500k rows, p95 (plain → padded): 5 values 1.40 → 0.49 ms, 30 values 1.26 → 0.61 ms, 300 values 3.96 → 1.99 ms, 700 values 11.56 → 2.95 ms.
 - [x] **Collection bind (`TABLE(:b)`) for more than 1,000 values:** checked on 2M rows. The static plan shows a full scan, but the adaptive plan switches to the index at runtime (10 values: 0.86 ms), so no cardinality hint is needed.
-- [ ] **SQL build cost without a database.** Micro-benchmarks of `parseFilter`, `buildAggregateSQL`, `include()` and the new guards (depth walk, fragment checks), so a builder regression shows up even with the database idle.
+- [x] **SQL build cost without a database** (`budgets.test.ts`, part A). Eleven builders and calls on a recording connection, each as a ratio to a fixed calibration workload in the same run (so a slower CPU slows both). Budget: 2× the recorded ratio; each sample is the fastest of nine rounds. Checked that the budgets bite: at half the factor all eleven fail, and the 3.0 `insertMany` (ratio 194 against a budget of 86) would have failed.
+- [x] **Statements per call** (part B): exact counts from `onQuery()`. One statement for every read, write and bulk call; two for `findOneAndUpdate` / `findOneAndDelete` (SELECT, then DML by ROWID). The session time-zone `ALTER SESSION` runs once per new pooled session, not per checkout.
+- [x] **Overhead over the raw driver** (part C): Mira against `conn.execute` / `executeMany` with the same SQL, interleaved samples, ratio of medians, bound 1.5×. Thin, local 19c:
+
+  | Call | Mira / raw p50 |
+  | --- | ---: |
+  | `findOne` by PK | 1.00–1.04 |
+  | find + sort + page of 20 | 1.01–1.02 |
+  | `toArray` 10,000 rows | 1.00–1.01 |
+  | `updateOne` by PK | 1.02–1.17 |
+  | `insertMany` 1,000 rows | 1.05–1.09 (was 1.32) |
+
 - [ ] **Hot-path review.**
-  - Statement cache hit rate (Mira builds the same SQL text for the same call shape, so the cache can hit).
-  - `fetchArraySize` / `prefetchRows` for large reads.
-  - `executeMany` batch size.
-  - Round trips per call (`insertOne` RETURNING, `findOneAndUpdate`, `include`).
-- [ ] **Budgets.** Turn the baseline into bounds, so that a 2× regression fails, with headroom for the CI runners.
-- [ ] **Sim.** Time the trading-day and reporting stages and record them with each run.
+  - [x] `insertMany` / `bulkUpdateByKeys`: the separate `COMMIT` round trip (now `autoCommit` for a one-statement batch outside a transaction) and per-row bind building (now one pass per column, positional). 347 → 67 µs of CPU per 1,000 rows.
+  - [x] `insertMany`'s default `returning: ["ID"]` cost about +3.2 ms per 1,000 rows (2.7×). RETURNING is now skipped only when the database cannot change a supplied ID: every ID a safe integer, an own table, `NUMBER` with no scale, no enabled INSERT trigger (checked in the dictionary, cached 60 s per pool and table). A rewriting trigger, a scaled key, a view/synonym, a failed dictionary read or an explicit `returning` all keep RETURNING. 5.1 → 2.1 ms per 1,000 rows (1.11× the raw driver). Live test: a trigger that adds 1,000 to the key reports the stored 1007/1008.
+  - [x] Large reads: `fetchArraySize` is already 1,000 (`src/driver/oracle.ts`) and `toArray` of 10,000 rows runs at 1.00× the raw driver. Statement cache: 50 per pool, and Mira's SQL text is stable per call shape (IN-list padding included).
+  - [x] `executeMany` batch size: one call stays fastest (300,000 rows: 1.46M rows/s in one call vs 0.93M rows/s in 10,000-row chunks); memory grows with the input the caller already holds (~0.55 KB per row). No chunking.
+- [x] **Budgets.** In CI via `test/performance/budgets.test.ts` (above). `MIRA_PERF_BUILD_FACTOR` scales part A for study only.
+- [x] **Sim.** Every stage records wall time, statements and time inside statements, in `coverage/sim-stages.json` and the CI job summary. The sim is deterministic, so a stage's statement count moves only when code does. Local Thin run: 1,029 statements, 10.3 s, of which 7 s is stage 4's deliberate wait for flashback history.
 
 ## 3. Chaos ⏳
 
@@ -78,6 +89,7 @@ Already covered: no lost updates, no leaks after 1,000 mixed ops, idempotent mer
 - [ ] Statement-cache and cursor leak check over many distinct call shapes
 - [ ] Concurrency of typed tables, `include()` and `withCTE` under load: same results as sequential
 - [ ] Time zones and DST over a soak in Thick mode (the 3.0 limitation stays documented)
+- [ ] **Bun segfault, Thick mode, macOS** (narrowed 2026-11-28). The crash lands within tests 678–680 of 692: the chaos tests right after the two dead-host tests (`127.0.0.1:1`, connection refused, 4 create attempts). Skipping the dead-host tests: 4/4 full runs clean; with them: about half crash. It is not the background re-creation of the dead pool (the chaos suite now closes its injected pools, and it still crashes), and it is not the bad-credentials test (moving it to a child process did not help). Outside `bun test` it never reproduced: dead pool retrying under load for 2 × 90 s (650k queries each), bad-credential pools ×30, dead host + breaker nudges ×9. Thin mode and CI (Linux Thick) are clean. Next: report it to Bun with `bun test` full-suite repro steps; retest on the next Bun release.
 
 ---
 
@@ -92,3 +104,9 @@ Already covered: no lost updates, no leaks after 1,000 mixed ops, idempotent mer
 | 2026-11-27 | Bug | Buffers and ``sql`` `` statements inside a filter lost their type | filter resolution copies plain objects only |
 | 2026-11-27 | Security | CodeQL: the IPv6 branch of the connect-string host regex was polynomial (ReDoS) | one quantifier per branch, length checked first |
 | 2026-11-27 | Performance | Every distinct `$in` length was a new SQL text (a hard parse, and shared-pool churn) | IN-list padding to powers of two: p95 2–4× lower |
+| 2026-11-28 | Reliability | `insertMany` / `bulkUpdateByKeys` sized binds with `Math.max(...values)`: a stack overflow from ~125k rows on Node, 1M on Bun | loop per column |
+| 2026-11-28 | Performance | One-statement `insertMany` / `bulkUpdateByKeys` paid a separate `COMMIT` round trip and per-row bind objects (1.32× the raw driver) | `autoCommit` + rollback on failure; positional binds: 1.07× |
+| 2026-11-28 | Bug | Messages read "a object" | article chosen by the word |
+| 2026-11-28 | Reliability | Intermittent Bun segfault in a whole-suite Thick run on macOS (older than this work) | open: see Reliability |
+| 2026-11-28 | Performance | `insertMany`'s default RETURNING "ID" cost 2.7× the insert alone | skipped when the dictionary proves a supplied ID is stored as given: 1.11× |
+| 2026-11-28 | Reliability | The chaos suite left its failing pools in the registry; the health monitor kept re-creating them for the rest of the run | injected pools closed in `afterAll` |

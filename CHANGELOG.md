@@ -2,7 +2,7 @@
 
 ## [3.1.0] — Unreleased
 
-Theme: security hardening. A red-team pass (a new SQL-text fuzzer, plus hand-written attacks) found five ways for a caller's text to reach SQL unescaped. Each is fixed and has a regression test. **Upgrade if your app passes request input into filters, or builds views from filters.**
+Theme: security hardening, then performance. A red-team pass (a new SQL-text fuzzer, plus hand-written attacks) found five ways for a caller's text to reach SQL unescaped. Each is fixed and has a regression test. **Upgrade if your app passes request input into filters, or builds views from filters.**
 
 ### Security
 
@@ -18,10 +18,14 @@ Theme: security hardening. A red-team pass (a new SQL-text fuzzer, plus hand-wri
 ### Performance
 
 - **IN-list padding.** `$in` / `$nin` lists of up to 1,000 values are sent at power-of-two lengths, repeating the last value (results are identical). Lengths 1–1,000 now map to 11 SQL texts instead of 1,000, so Oracle reuses the parsed cursor. Measured p95: 2–4× lower (700 values: 11.6 → 3.0 ms).
+- **`insertMany()` skips `RETURNING` when it is certain of the IDs.** With the default options, if every document supplies a safe-integer `ID`, the table is in the session's schema, its `ID` is a `NUMBER` with no scale, and no enabled trigger fires on insert, the supplied IDs are reported and no `RETURNING` (one out-bind per row) is sent. Otherwise, including when the dictionary read fails, nothing changes. The check is one dictionary query per pool and table per minute. Default `insertMany` of 1,000 rows: 5.1 → 2.1 ms (2.74× → 1.11× the raw driver). A trigger that rewrites the ID keeps `RETURNING`, so the stored value is reported. An explicit `returning: ["ID"]` always reads back.
+- **`insertMany()` and `bulkUpdateByKeys()`: one round trip, less CPU.** A batch that is one statement (one column set, no `batchErrors`) and not inside a transaction now commits with the execute itself (`autoCommit`) instead of a separate `COMMIT`. A failed batch still commits nothing and is rolled back before the connection goes back to the pool. Binds are built in one pass per column, by position. Against the raw driver running the same SQL, `insertMany` of 1,000 rows went from 1.32× to 1.07×, and Mira's own CPU per 1,000 rows from 347 to 67 µs.
 
 ### Fixed
 
 - A `Buffer` or a ``sql`…` `` statement inside a filter kept its type: the filter-resolution step copied every object field by field.
+- `insertMany()` and `bulkUpdateByKeys()` with a very large batch threw `RangeError: Maximum call stack size exceeded` while sizing the binds (`Math.max(...values)`): on Node from about 125,000 rows, on Bun at 1,000,000. Sized with a loop now.
+- Error messages say "an object", not "a object" (`sanitizeFilter`, `$inSelect`).
 
 ### Supply chain
 
@@ -32,6 +36,8 @@ Theme: security hardening. A red-team pass (a new SQL-text fuzzer, plus hand-wri
 
 - `test/security/fuzz.test.ts` takes about 60 call shapes covering every public builder and sends each through every mutation: each string, key and number replaced by 19 hostile payloads, in both string and `toString()` object form. A SQL lexer, which also reads inside `EXECUTE IMMEDIATE` strings, checks that no payload ever appears as bare SQL.
 - `test/security/hardening.test.ts`: a regression test for each fix above.
+- `test/performance/budgets.test.ts`: bounds that fail on a 2× regression on any machine. SQL-building cost is measured against a fixed calibration workload in the same run; statements per call are exact counts; overhead over the raw driver is a ratio of interleaved medians.
+- The simulation records each stage's time, statement count and time spent in statements (`coverage/sim-stages.json`, and the CI job summary).
 
 ## [3.0.0] — 2026-11-28
 
